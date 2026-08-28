@@ -72,6 +72,95 @@ func TestLinkOverrideRequiresCorrespondingOptionalPool(t *testing.T) {
 	}
 }
 
+func TestRouteAcceptsScalarAndExpandedForms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.json")
+	value := validSpec(t)
+	value.Node.UID.UUID = ""
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["routes"] = map[string]any{
+		"b": []any{"fd41::20/128", map[string]any{"prefix": "fd41::21/128", "metric": 10}},
+	}
+	writeJSON(t, path, raw)
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Routes["b"]; len(got) != 2 || got[0].Prefix != "fd41::20/128" || got[0].Metric != nil || got[1].Metric == nil || *got[1].Metric != 10 {
+		t.Fatalf("decoded routes = %#v", got)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip map[string]any
+	if err := json.Unmarshal(persisted, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	items := roundTrip["routes"].(map[string]any)["b"].([]any)
+	if _, ok := items[0].(string); !ok {
+		t.Fatalf("route shorthand was not preserved: %#v", items[0])
+	}
+	if _, ok := items[1].(map[string]any); !ok {
+		t.Fatalf("expanded route was not preserved: %#v", items[1])
+	}
+}
+
+func TestRouteExpandedFormRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.json")
+	value := validSpec(t)
+	data, _ := json.Marshal(value)
+	var raw map[string]any
+	_ = json.Unmarshal(data, &raw)
+	raw["routes"] = map[string]any{"b": []any{map[string]any{"prefix": "fd41::20/128", "weight": 10}}}
+	writeJSON(t, path, raw)
+	if _, err := Load(path); err == nil {
+		t.Fatal("unknown expanded route field was accepted")
+	}
+}
+
+func TestValidationChecksRoutingOwnershipAndDomains(t *testing.T) {
+	value := validSpec(t)
+	metric := uint32(10)
+	value.Routes = Routes{"missing": {{Prefix: "fd41::20/128"}}}
+	value.Domains = map[string]DomainSpec{
+		"one": {
+			TableID:        DefaultRoutingTableID,
+			SourcePrefixes: []string{"10.10.0.0/16"},
+			Routes:         Routes{"b": {{Prefix: "192.0.2.0/24", Metric: &metric}}},
+			Exceptions:     []string{"192.0.2.0/24"},
+		},
+		"two": {TableID: 20002, SourcePrefixes: []string{"10.10.1.0/24"}},
+	}
+	if err := value.Validate(); err == nil {
+		t.Fatal("invalid route ownership, duplicate table, overlapping domains, and conflicting exception were accepted")
+	}
+}
+
+func TestValidationAcceptsStaticCoreRouting(t *testing.T) {
+	value := validSpec(t)
+	tableID := 21000
+	value.Fabric.RoutingTableID = &tableID
+	value.Routes = Routes{"b": {{Prefix: "fd41::20/128"}}}
+	value.Domains = map[string]DomainSpec{
+		"production": {
+			TableID:        21001,
+			SourcePrefixes: []string{"10.100.1.0/24", "fd10:100:1::/64"},
+			Routes:         Routes{"b": {{Prefix: "192.168.20.0/24"}}},
+			Exceptions:     []string{"10.100.1.0/24"},
+		},
+	}
+	if err := value.Validate(); err != nil {
+		t.Fatalf("valid static Core routing was rejected: %v", err)
+	}
+}
+
 func validSpec(t *testing.T) NodeSpec {
 	t.Helper()
 	privateKey, err := wgtypes.GeneratePrivateKey()

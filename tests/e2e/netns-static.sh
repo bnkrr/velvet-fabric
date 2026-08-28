@@ -13,6 +13,17 @@ runtime=$(mktemp -d /tmp/velvet-e2e.XXXXXXXX)
 pid_a=
 pid_b=
 cleanup() {
+	status=$?
+	if test "${status}" -ne 0; then
+		test ! -f "${runtime}/a.log" || cat "${runtime}/a.log" >&2
+		test ! -f "${runtime}/b.log" || cat "${runtime}/b.log" >&2
+		ip -n "${ns_a}" -details link show 2>/dev/null >&2 || true
+		ip -n "${ns_b}" -details link show 2>/dev/null >&2 || true
+		ip -n "${ns_a}" -6 -details route show table all 2>/dev/null >&2 || true
+		ip -n "${ns_b}" -6 -details route show table all 2>/dev/null >&2 || true
+		ip -n "${ns_a}" -6 -details rule show 2>/dev/null >&2 || true
+		ip -n "${ns_b}" -6 -details rule show 2>/dev/null >&2 || true
+	fi
   test -z "${pid_a}" || kill "${pid_a}" 2>/dev/null || true
   test -z "${pid_b}" || kill "${pid_b}" 2>/dev/null || true
   ip netns del "${ns_a}" 2>/dev/null || true
@@ -128,8 +139,14 @@ test "$(ip -n "${ns_a}" -o -4 addr show dev vl-a-b | wc -l)" -eq 0
 test "$(ip -n "${ns_b}" -o -4 addr show dev vl-b-custom | wc -l)" -eq 0
 test "$(ip -n "${ns_a}" -o -6 addr show dev vl-a-b scope global | wc -l)" -eq 0
 test "$(ip -n "${ns_b}" -o -6 addr show dev vl-b-custom scope global | wc -l)" -eq 0
-ip -n "${ns_a}" -6 route show exact "${b_loop6}/128" dev vl-a-b | grep -q "${b_loop6}"
-ip -n "${ns_b}" -6 route show exact "${a_loop6}/128" dev vl-b-custom | grep -q "${a_loop6}"
+ip -n "${ns_a}" -6 route show table 20000 exact "${b_loop6}/128" dev vl-a-b proto 202 | grep -q "${b_loop6}"
+ip -n "${ns_b}" -6 route show table 20000 exact "${a_loop6}/128" dev vl-b-custom proto 202 | grep -q "${a_loop6}"
+test -z "$(ip -n "${ns_a}" -6 route show table main exact "${b_loop6}/128")"
+test -z "$(ip -n "${ns_b}" -6 route show table main exact "${a_loop6}/128")"
+ip -n "${ns_a}" -6 route show table 20000 exact fd78:1234:5678::/48 type unreachable proto 201 | grep -q fd78:1234:5678::/48
+ip -n "${ns_b}" -6 route show table 20000 exact fd78:1234:5678::/48 type unreachable proto 201 | grep -q fd78:1234:5678::/48
+ip -n "${ns_a}" -6 -details rule show | grep -q 'to fd78:1234:5678::/48 lookup 20000 proto 201'
+ip -n "${ns_b}" -6 -details rule show | grep -q 'to fd78:1234:5678::/48 lookup 20000 proto 201'
 ip netns exec "${ns_a}" ping -6 -c 1 -W 2 "${b_loop6}" >/dev/null
 ip netns exec "${ns_b}" ping -6 -c 1 -W 2 "${a_loop6}" >/dev/null
 test "$(ip netns exec "${ns_a}" wg show vl-a-b dump | awk 'NR == 2 {print $8}')" = "5"

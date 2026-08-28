@@ -20,7 +20,11 @@ CGO_ENABLED=0 GOOS=linux \
 ssh "${ssh_config_args[@]}" -o ControlMaster=no -o ControlPath=none "${ssh_alias}" \
   "mkdir -p '${remote_root}'"
 scp "${ssh_config_args[@]}" -o ControlMaster=no -o ControlPath=none \
-  "${local_binary}" "${repo_root}/tests/e2e/netns-static.sh" \
+  "${local_binary}" \
+  "${repo_root}/tests/e2e/netns-static.sh" \
+  "${repo_root}/tests/e2e/netns-core-crud.sh" \
+  "${repo_root}/tests/e2e/netns-wg-admin-core.sh" \
+  "${repo_root}/tests/e2e/generate-wg-admin-core.py" \
   "${ssh_alias}:${remote_root}/"
 ssh "${ssh_config_args[@]}" -o ControlMaster=no -o ControlPath=none "${ssh_alias}" \
-  "chmod 0700 '${remote_root}/velvetd' '${remote_root}/netns-static.sh' && '${remote_root}/netns-static.sh' '${remote_root}/velvetd'"
+  "chmod 0700 '${remote_root}/velvetd' '${remote_root}/netns-static.sh' '${remote_root}/netns-core-crud.sh' '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/generate-wg-admin-core.py' && '${remote_root}/netns-static.sh' '${remote_root}/velvetd' && '${remote_root}/netns-core-crud.sh' '${remote_root}/velvetd' && '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/velvetd'"
