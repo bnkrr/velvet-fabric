@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -19,9 +21,10 @@ import (
 )
 
 const (
-	APIVersion     = "velvet.io/v1alpha1"
-	Kind           = "NodeSpec"
-	DefaultVFPPort = 58420
+	APIVersion            = "velvet.io/v1alpha1"
+	Kind                  = "NodeSpec"
+	DefaultVFPPort        = 58420
+	DefaultRoutingTableID = 20000
 )
 
 var uidNamePattern = regexp.MustCompile(`^[a-z0-9]{0,5}$`)
@@ -29,11 +32,13 @@ var peerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 var interfacePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 type NodeSpec struct {
-	APIVersion string     `json:"api_version"`
-	Kind       string     `json:"kind"`
-	Fabric     FabricSpec `json:"fabric"`
-	Node       Node       `json:"node"`
-	Peers      []Peer     `json:"peers"`
+	APIVersion string                `json:"api_version"`
+	Kind       string                `json:"kind"`
+	Fabric     FabricSpec            `json:"fabric"`
+	Node       Node                  `json:"node"`
+	Peers      []Peer                `json:"peers"`
+	Routes     Routes                `json:"routes,omitempty"`
+	Domains    map[string]DomainSpec `json:"domains,omitempty"`
 }
 
 type FabricSpec struct {
@@ -42,6 +47,7 @@ type FabricSpec struct {
 	LinkPrefixV6     string `json:"link_prefix_v6,omitempty"`
 	LoopbackPrefixV6 string `json:"loopback_prefix_v6"`
 	VFPPort          *int   `json:"vfp_port,omitempty"`
+	RoutingTableID   *int   `json:"routing_table_id,omitempty"`
 }
 
 type Node struct {
@@ -63,6 +69,59 @@ type Peer struct {
 	LinkAddresses              []string `json:"link_addresses,omitempty"`
 	PersistentKeepaliveSeconds *int     `json:"persistent_keepalive_seconds,omitempty"`
 	InterfaceName              string   `json:"interface_name,omitempty"`
+}
+
+// Routes groups destination routes by the locally configured next-hop Peer.
+type Routes map[string][]Route
+
+// Route accepts either a prefix string or an expanded object with attributes.
+type Route struct {
+	Prefix string  `json:"prefix"`
+	Metric *uint32 `json:"metric,omitempty"`
+}
+
+type DomainSpec struct {
+	TableID        int      `json:"table_id"`
+	SourcePrefixes []string `json:"source_prefixes"`
+	Routes         Routes   `json:"routes,omitempty"`
+	Exceptions     []string `json:"exceptions,omitempty"`
+}
+
+func (r *Route) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("route must be a prefix string or object")
+	}
+	if data[0] == '"' {
+		var prefix string
+		if err := json.Unmarshal(data, &prefix); err != nil {
+			return err
+		}
+		*r = Route{Prefix: prefix}
+		return nil
+	}
+	if data[0] != '{' {
+		return errors.New("route must be a prefix string or object")
+	}
+	type expanded Route
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var value expanded
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	if err := rejectTrailingJSON(decoder); err != nil {
+		return err
+	}
+	*r = Route(value)
+	return nil
+}
+
+func (r Route) MarshalJSON() ([]byte, error) {
+	if r.Metric == nil {
+		return json.Marshal(r.Prefix)
+	}
+	type expanded Route
+	return json.Marshal(expanded(r))
 }
 
 // Load reads and validates a NodeSpec. If node.uid.uuid is absent, Load creates
@@ -116,6 +175,9 @@ func (s *NodeSpec) Validate() error {
 	appendPrefixProblem("loopback_prefix_v6", loopV6Err)
 	if s.Fabric.VFPPort != nil && (*s.Fabric.VFPPort < 1 || *s.Fabric.VFPPort > 65535) {
 		problems = append(problems, "fabric.vfp_port must be between 1 and 65535")
+	}
+	if err := validateTableID(s.Fabric.EffectiveRoutingTableID()); err != nil {
+		problems = append(problems, "fabric.routing_table_id "+err.Error())
 	}
 	if !uidNamePattern.MatchString(s.Node.UID.Name) {
 		problems = append(problems, "node.uid.name must contain at most five lowercase letters or digits")
@@ -215,6 +277,7 @@ func (s *NodeSpec) Validate() error {
 			}
 		}
 	}
+	problems = append(problems, validateRouting(s, names)...)
 	if len(problems) > 0 {
 		return errors.New("invalid NodeSpec: " + strings.Join(problems, "; "))
 	}
@@ -227,6 +290,12 @@ func (f FabricSpec) EffectiveVFPPort() int {
 		return *f.VFPPort
 	}
 	return DefaultVFPPort
+}
+func (f FabricSpec) EffectiveRoutingTableID() int {
+	if f.RoutingTableID != nil {
+		return *f.RoutingTableID
+	}
+	return DefaultRoutingTableID
 }
 func ParseKey(value string) (wgtypes.Key, error) { return wgtypes.ParseKey(strings.TrimSpace(value)) }
 func ParsePSK(value string) ([]byte, error)      { return parseInlineKey(value) }
@@ -363,6 +432,128 @@ func linkBits(addr netip.Addr) int {
 }
 func validUnicast(addr netip.Addr) bool {
 	return addr.IsValid() && !addr.IsUnspecified() && !addr.IsMulticast() && !addr.IsLinkLocalUnicast() && addr.String() != "255.255.255.255"
+}
+
+func validateRouting(s *NodeSpec, peerNames map[string]struct{}) []string {
+	var problems []string
+	tables := map[int]string{s.Fabric.EffectiveRoutingTableID(): "fabric.routing_table_id"}
+	_, routeProblems := validateRoutes("routes", s.Routes, peerNames)
+	problems = append(problems, routeProblems...)
+
+	type sourceOwner struct {
+		domain string
+		prefix netip.Prefix
+	}
+	var sourcePrefixes []sourceOwner
+	domainNames := make([]string, 0, len(s.Domains))
+	for name := range s.Domains {
+		domainNames = append(domainNames, name)
+	}
+	sort.Strings(domainNames)
+	for _, name := range domainNames {
+		domain := s.Domains[name]
+		where := "domains." + name
+		if !peerNamePattern.MatchString(name) {
+			problems = append(problems, where+" name is invalid")
+		}
+		if err := validateTableID(domain.TableID); err != nil {
+			problems = append(problems, where+".table_id "+err.Error())
+		} else if owner, exists := tables[domain.TableID]; exists {
+			problems = append(problems, fmt.Sprintf("%s.table_id duplicates %s", where, owner))
+		} else {
+			tables[domain.TableID] = where + ".table_id"
+		}
+		if len(domain.SourcePrefixes) == 0 {
+			problems = append(problems, where+".source_prefixes must not be empty")
+		}
+		for i, raw := range domain.SourcePrefixes {
+			prefix, err := parseCanonicalPrefix(raw)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("%s.source_prefixes[%d] %v", where, i, err))
+				continue
+			}
+			for _, previous := range sourcePrefixes {
+				if prefixesOverlap(prefix, previous.prefix) {
+					problems = append(problems, fmt.Sprintf("%s.source_prefixes[%d] overlaps domain %q prefix %s", where, i, previous.domain, previous.prefix))
+					break
+				}
+			}
+			sourcePrefixes = append(sourcePrefixes, sourceOwner{domain: name, prefix: prefix})
+		}
+		routes, routeProblems := validateRoutes(where+".routes", domain.Routes, peerNames)
+		problems = append(problems, routeProblems...)
+		seenExceptions := make(map[netip.Prefix]struct{})
+		for i, raw := range domain.Exceptions {
+			prefix, err := parseCanonicalPrefix(raw)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("%s.exceptions[%d] %v", where, i, err))
+				continue
+			}
+			if _, exists := seenExceptions[prefix]; exists {
+				problems = append(problems, fmt.Sprintf("%s.exceptions[%d] duplicates %s", where, i, prefix))
+			}
+			seenExceptions[prefix] = struct{}{}
+			if peer, exists := routes[prefix]; exists {
+				problems = append(problems, fmt.Sprintf("%s.exceptions[%d] conflicts with the same prefix routed through peer %q", where, i, peer))
+			}
+		}
+	}
+	return problems
+}
+
+func validateRoutes(where string, routes Routes, peerNames map[string]struct{}) (map[netip.Prefix]string, []string) {
+	resolved := make(map[netip.Prefix]string)
+	var problems []string
+	names := make([]string, 0, len(routes))
+	for name := range routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, peerName := range names {
+		items := routes[peerName]
+		peerWhere := where + "." + peerName
+		if _, exists := peerNames[peerName]; !exists {
+			problems = append(problems, peerWhere+" references an unknown peer")
+		}
+		if len(items) == 0 {
+			problems = append(problems, peerWhere+" must not be empty")
+		}
+		for i, route := range items {
+			prefix, err := parseCanonicalPrefix(route.Prefix)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("%s[%d].prefix %v", peerWhere, i, err))
+				continue
+			}
+			if previous, exists := resolved[prefix]; exists {
+				problems = append(problems, fmt.Sprintf("%s[%d].prefix duplicates a route through peer %q", peerWhere, i, previous))
+				continue
+			}
+			resolved[prefix] = peerName
+		}
+	}
+	return resolved, problems
+}
+
+func validateTableID(value int) error {
+	if value < 1 {
+		return errors.New("must be positive")
+	}
+	if value == 253 || value == 254 || value == 255 {
+		return errors.New("must not use a reserved Linux routing table")
+	}
+	return nil
+}
+
+func parseCanonicalPrefix(raw string) (netip.Prefix, error) {
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil || prefix != prefix.Masked() {
+		return netip.Prefix{}, errors.New("must be a canonical network prefix")
+	}
+	return prefix, nil
+}
+
+func prefixesOverlap(a, b netip.Prefix) bool {
+	return a.Addr().BitLen() == b.Addr().BitLen() && (a.Contains(b.Addr()) || b.Contains(a.Addr()))
 }
 
 func parsePool(raw string, ipv4 bool, targetBits int) (netip.Prefix, error) {

@@ -37,13 +37,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "velvetctl resolve: %v\n", err)
 		os.Exit(1)
 	}
-	plan, err := reconcile.BuildPlan(nodeSpec)
+	desired, err := reconcile.BuildDesiredState(nodeSpec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "velvetctl resolve: %v\n", err)
 		os.Exit(1)
 	}
-	links := make([]resolvedLink, 0, len(plan.Links))
-	for _, item := range plan.Links {
+	links := make([]resolvedLink, 0, len(desired.Links))
+	for _, item := range desired.Links {
 		role := "listener"
 		if item.Dialer {
 			role = "dialer"
@@ -51,11 +51,12 @@ func main() {
 		links = append(links, resolvedLink{PeerName: item.PeerName, InterfaceName: item.InterfaceName, ListenPort: item.ListenPort, BootstrapAddress: item.BootstrapAddress.String(), BootstrapPeer: item.BootstrapPeer.String(), VFPRole: role, Endpoints: append([]string(nil), item.Endpoints...)})
 	}
 	result := map[string]any{
-		"api_version": spec.APIVersion,
-		"node_uid":    plan.UID,
-		"loopback_v6": plan.LoopbackV6.String(),
-		"vfp_port":    plan.VFPPort,
-		"links":       links,
+		"api_version":     spec.APIVersion,
+		"node_uid":        desired.UID,
+		"loopback_v6":     desired.LoopbackV6.String(),
+		"vfp_port":        desired.VFPPort,
+		"fabric_table_id": desired.FabricTableID,
+		"links":           links,
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(result)
 }

@@ -35,7 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("velvetd: %v", err)
 	}
-	plan, err := reconcile.BuildPlan(nodeSpec)
+	desired, err := reconcile.BuildDesiredState(nodeSpec)
 	if err != nil {
 		log.Fatalf("velvetd: %v", err)
 	}
@@ -43,7 +43,7 @@ func main() {
 	defer cancel()
 	encoder := json.NewEncoder(os.Stdout)
 	var logMu sync.Mutex
-	runner := velvetruntime.Runner{Plan: plan, Reconciler: reconcile.New(linuxbackend.New()), Interval: *interval, Log: func(event velvetruntime.Event) {
+	runner := velvetruntime.Runner{Desired: desired, Reconciler: reconcile.New(linuxbackend.New()), Interval: *interval, Log: func(event velvetruntime.Event) {
 		logMu.Lock()
 		defer logMu.Unlock()
 		_ = encoder.Encode(event)
