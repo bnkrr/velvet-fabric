@@ -4,7 +4,7 @@
 
 Status: Version 1 protocol specification
 Wire version: 1
-Last updated: 2026-08-28
+Last updated: 2026-08-29
 
 ## Abstract
 
@@ -14,14 +14,16 @@ protocol framework for the distributed control operations of the Fabric.
 
 The first implementation phase only needs the information exchange required
 after a statically configured WireGuard Link has been created. Later revisions
-may add dynamic route exchange and dynamic Link establishment to the same
-protocol. Those later functions do not justify separate top-level protocols,
-but they also MUST NOT be predesigned as generic RPC calls or encoded before
-their state machines are understood.
+may add dynamic Link establishment and other Fabric-specific distributed
+control operations. Those later functions MUST NOT be predesigned as generic
+RPC calls or encoded before their state machines are understood. Dynamic route
+exchange is deliberately separate: Velvet uses the standard Babel protocol
+over the Link rather than defining VFP route messages.
 
 This document defines the agreed protocol boundary, framing and parsing model,
 extension rules, error handling, and the initial static-Link message set.
-Route exchange and dynamic-Link messages remain outside the current revision.
+Dynamic-Link messages remain outside the current revision; route exchange is
+outside VFP in every revision covered by this specification.
 
 ## 1. Status and Requirements Language
 
@@ -47,7 +49,6 @@ eventual scope may include:
 - session establishment and peer identity;
 - node resources, including a node loopback address;
 - Link address negotiation and Link state changes;
-- route announcement, withdrawal, and synchronization;
 - control information required to establish a dynamic Link.
 
 This is one protocol with multiple well-bounded exchanges. A Message Type
@@ -63,10 +64,11 @@ VFP is not:
 - a transport for logs, diagnostics, or arbitrary implementation objects;
 - the WireGuard data plane;
 - a serialization of kernel interface names or other local-only state;
-- a routing algorithm by itself.
+- a routing algorithm or a transport for Babel packets.
 
-The dynamic routing algorithm has not been selected. In particular, this
-document does not assume Babel.
+Dynamic routing uses Babel as an independent standard UDP protocol. Babel
+packets are not wrapped in VFP frames, and VFP does not duplicate Babel route,
+neighbour, metric, or sequence-number state.
 
 ### 2.3 Implementation phases
 
@@ -78,7 +80,8 @@ The intended delivery order is:
 4. dynamic Links.
 
 Version 1 defines only phase 1 business messages while keeping the framing
-usable by later phases.
+usable by later Fabric-specific control phases. Phase 3 does not add VFP route
+messages.
 
 ## 3. Terminology
 
@@ -663,8 +666,8 @@ Those values are already known or are local-only configuration.
 
 The first static-route phase does not require route announcements to propagate
 through VFP. Static routes remain local configuration referring to a Peer.
-Domain, plan, and dynamic route data are not part of the current protocol
-schema.
+Domain and Plan configuration are local, while dynamic route exchange uses
+Babel; none of these are VFP messages.
 
 ## 9. Error Handling
 
