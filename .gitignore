@@ -1,0 +1,4 @@
+# Local experiments, research, logs, runtime state, and machine-specific files.
+.local/
+
+AGENTS.md
