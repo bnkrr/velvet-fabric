@@ -130,8 +130,10 @@ a_link_psk=$(ip netns exec "${ns_a}" wg show vl-a-b preshared-keys | awk '{print
 b_link_psk=$(ip netns exec "${ns_b}" wg show vl-b-custom preshared-keys | awk '{print $2}')
 test -n "${a_link_psk}" && test "${a_link_psk}" = "${b_link_psk}" && test "${a_link_psk}" != "${fabric_psk}"
 
-test "$(ip -n "${ns_a}" -o -6 addr show dev vl-a-b scope link | awk '$4 ~ /^fe80::[12]\/64$/ {print $4}' | wc -l)" -eq 1
-test "$(ip -n "${ns_b}" -o -6 addr show dev vl-b-custom scope link | awk '$4 ~ /^fe80::[12]\/64$/ {print $4}' | wc -l)" -eq 1
+a_control6=$(ip -n "${ns_a}" -o -6 addr show dev vl-a-b scope link | awk '$4 ~ /^fe80:/ {print $4}' | cut -d/ -f1)
+b_control6=$(ip -n "${ns_b}" -o -6 addr show dev vl-b-custom scope link | awk '$4 ~ /^fe80:/ {print $4}' | cut -d/ -f1)
+test -n "${a_control6}" && test -n "${b_control6}"
+test "${a_control6}" != "${b_control6}"
 a_loop6=$(ip -n "${ns_a}" -o -6 addr show dev vl-loop scope global | awk '{print $4}' | cut -d/ -f1)
 b_loop6=$(ip -n "${ns_b}" -o -6 addr show dev vl-loop scope global | awk '{print $4}' | cut -d/ -f1)
 test -n "${a_loop6}" && test -n "${b_loop6}"

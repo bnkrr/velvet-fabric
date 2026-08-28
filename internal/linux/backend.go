@@ -690,7 +690,7 @@ func reconcileBootstrapAddress(device netlink.Link, wanted netip.Prefix) error {
 		if !ok || prefix == wanted {
 			continue
 		}
-		if prefix.Bits() == 64 && (prefix.Addr() == netip.MustParseAddr("fe80::1") || prefix.Addr() == netip.MustParseAddr("fe80::2")) {
+		if prefix.Addr().IsLinkLocalUnicast() {
 			if err := netlink.AddrDel(device, &addresses[i]); err != nil {
 				return err
 			}
