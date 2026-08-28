@@ -15,8 +15,7 @@ type resolvedLink struct {
 	InterfaceName    string   `json:"interface_name"`
 	ListenPort       int      `json:"listen_port"`
 	BootstrapAddress string   `json:"bootstrap_address"`
-	BootstrapPeer    string   `json:"bootstrap_peer"`
-	VFPRole          string   `json:"vfp_role"`
+	VFPDiscovery     string   `json:"vfp_discovery"`
 	Endpoints        []string `json:"endpoints"`
 }
 
@@ -44,11 +43,7 @@ func main() {
 	}
 	links := make([]resolvedLink, 0, len(desired.Links))
 	for _, item := range desired.Links {
-		role := "listener"
-		if item.Dialer {
-			role = "dialer"
-		}
-		links = append(links, resolvedLink{PeerName: item.PeerName, InterfaceName: item.InterfaceName, ListenPort: item.ListenPort, BootstrapAddress: item.BootstrapAddress.String(), BootstrapPeer: item.BootstrapPeer.String(), VFPRole: role, Endpoints: append([]string(nil), item.Endpoints...)})
+		links = append(links, resolvedLink{PeerName: item.PeerName, InterfaceName: item.InterfaceName, ListenPort: item.ListenPort, BootstrapAddress: item.BootstrapAddress.String(), VFPDiscovery: "ipv6-link-local-multicast", Endpoints: append([]string(nil), item.Endpoints...)})
 	}
 	result := map[string]any{
 		"api_version":     spec.APIVersion,

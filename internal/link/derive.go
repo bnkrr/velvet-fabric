@@ -21,15 +21,10 @@ const (
 	derivedPortSpan    = 40000
 )
 
-var lowerBootstrap = netip.MustParsePrefix("fe80::1/64")
-var higherBootstrap = netip.MustParsePrefix("fe80::2/64")
-
 type Bootstrap struct {
 	InterfaceName string
 	ListenPort    int
 	LocalAddress  netip.Prefix
-	PeerAddress   netip.Addr
-	Dialer        bool
 	PresharedKey  wgtypes.Key
 }
 
@@ -45,21 +40,19 @@ func DeriveBootstrap(fabricPSK []byte, localPrivate, peerPublic wgtypes.Key, loc
 	if localPublic == peerPublic {
 		return Bootstrap{}, fmt.Errorf("peer WireGuard public key equals local public key")
 	}
-	lower := bytes.Compare(localPublic[:], peerPublic[:]) < 0
-	localAddress, peerAddress := higherBootstrap, lowerBootstrap.Addr()
-	if lower {
-		localAddress, peerAddress = lowerBootstrap, higherBootstrap.Addr()
+	uid, err := uuid.Parse(localUID.UUID)
+	if err != nil || uid == uuid.Nil {
+		return Bootstrap{}, fmt.Errorf("local Node UUID is invalid")
+	}
+	interfaceName := spec.InterfaceName(localUID, peer.Name, peer.PublicKey)
+	if peer.InterfaceName != "" {
+		interfaceName = peer.InterfaceName
 	}
 	portDigest := digest(fabricPSK, []byte("velvet-fabric/wg-listen-port/v1"), localPublic[:], peerPublic[:])
 	result := Bootstrap{
-		InterfaceName: spec.InterfaceName(localUID, peer.Name, peer.PublicKey),
+		InterfaceName: interfaceName,
 		ListenPort:    minimumDerivedPort + int(binary.BigEndian.Uint16(portDigest[:2]))%derivedPortSpan,
-		LocalAddress:  localAddress,
-		PeerAddress:   peerAddress,
-		Dialer:        lower,
-	}
-	if peer.InterfaceName != "" {
-		result.InterfaceName = peer.InterfaceName
+		LocalAddress:  DeriveLinkLocal(fabricPSK, uid, interfaceName),
 	}
 	if peer.ListenPort != nil {
 		result.ListenPort = *peer.ListenPort
@@ -70,6 +63,27 @@ func DeriveBootstrap(fabricPSK []byte, localPrivate, peerPublic wgtypes.Key, loc
 	}
 	result.PresharedKey = key
 	return result, nil
+}
+
+// DeriveLinkLocal returns the node-owned control address used on every one of
+// its point-to-point WireGuard Links. It depends only on local persistent
+// identity and the Fabric PSK; discovering a remote address is deliberately a
+// runtime operation rather than a bilateral address guess.
+func DeriveLinkLocal(fabricPSK []byte, uid uuid.UUID, interfaceName string) netip.Prefix {
+	entropy := digest(fabricPSK, []byte("velvet-fabric/link-local/v1"), uid[:], []byte(interfaceName))
+	var raw [16]byte
+	raw[0], raw[1] = 0xfe, 0x80
+	copy(raw[8:], entropy[:8])
+	// Keep the individual/group bit clear and avoid the all-zero IID.
+	raw[8] &^= 1
+	allZero := true
+	for _, value := range raw[8:] {
+		allZero = allZero && value == 0
+	}
+	if allZero {
+		raw[15] = 1
+	}
+	return netip.PrefixFrom(netip.AddrFrom16(raw), 64)
 }
 
 func DeriveLoopbackV6(fabricPSK []byte, uid uuid.UUID, v6Pool netip.Prefix, overrideV6 string) (netip.Addr, error) {

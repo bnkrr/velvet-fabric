@@ -50,8 +50,6 @@ type LinkPlan struct {
 	Endpoints        []string
 	Keepalive        *time.Duration
 	BootstrapAddress netip.Prefix
-	BootstrapPeer    netip.Addr
-	Dialer           bool
 	LinkOverrides    []string
 }
 
@@ -125,8 +123,8 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 			OwnerAlias: "velvet:link:" + uid.String() + ":" + peer.Name,
 			PrivateKey: privateKey, PeerPublicKey: peerKey, PresharedKey: bootstrap.PresharedKey,
 			ListenPort: bootstrap.ListenPort, Endpoints: append([]string(nil), peer.Endpoints...), Keepalive: keepalive,
-			BootstrapAddress: bootstrap.LocalAddress, BootstrapPeer: bootstrap.PeerAddress, Dialer: bootstrap.Dialer,
-			LinkOverrides: append([]string(nil), peer.LinkAddresses...),
+			BootstrapAddress: bootstrap.LocalAddress,
+			LinkOverrides:    append([]string(nil), peer.LinkAddresses...),
 		}
 		desired.Links = append(desired.Links, item)
 		links[peer.Name] = item

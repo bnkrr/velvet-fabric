@@ -125,14 +125,78 @@ out-of-band configuration. Both endpoints of a Link MUST agree on the effective
 port; the port is not negotiated or carried in VFP.
 
 In the static-Link phase, the TCP connection is made over the already
-configured WireGuard Link using scoped link-local addresses. This allows VFP
-to operate before any routed Fabric path exists.
+configured WireGuard Link using discovered scoped link-local addresses. This
+allows VFP to operate before any routed Fabric path exists. Section 4.2
+specifies the discovery exchange.
 
 A later dynamic-Link phase may signal over an existing routed Fabric path,
 most likely using node loopback reachability. The exact transport selection and
 fallback behavior for that phase are TBD.
 
-### 4.2 Security context
+### 4.2 Static-Link discovery
+
+Before opening VFP/TCP, each endpoint derives and installs a local IPv6
+link-local address. The derivation input is the local persistent Node UUID,
+local effective interface name, and the Fabric PSK; it MUST NOT depend on the
+remote Node UUID or a predicted remote address. Version 1 uses the first 64
+bits of:
+
+```text
+HMAC-SHA-256(Fabric-PSK, 0x00 || "velvet-fabric/link-local/v1" ||
+              0x00 || Node-UUID || 0x00 || UTF8(Interface-Name))
+```
+
+as the interface identifier under `fe80::/64`, clears the group bit of that
+identifier, and substitutes identifier value 1 if all identifier bits are
+zero. Every local Link MUST have a distinct effective interface name and
+therefore independently derives its address. The two endpoints do not need to
+use matching interface names.
+
+Each endpoint opens its TCP listener and sends Discovery Hello datagrams to
+`ff02::1` on the effective VFP port over the Link interface. UDP and TCP use
+the same numeric port but remain separate transport namespaces. A sender MUST
+use hop limit 1. A receiver MUST accept a Hello only when it was received on
+the expected interface and its source is IPv6 link-local.
+
+The Discovery version-1 Hello is exactly eight octets:
+
+```text
+  0                   1                   2                   3
+  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |                 Magic = ASCII "VFPD"                         |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |  Version = 1  | Message Type  |          Length = 8           |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+Message Type 1 is `HELLO`; Message Type 2 is `HELLO_ACK`. Unknown versions or
+Message Types, incorrect lengths, invalid source addresses, and datagrams
+received on another interface are silently ignored. The discovery datagram
+carries no Node UID, WireGuard key, port, or resource. Node identity remains an
+`OPEN` property after TCP is established.
+
+A node sends one Hello immediately and repeats it with jittered exponential
+backoff bounded at two seconds while the interface has no active TCP session.
+Receiving a multicast `HELLO` triggers one unicast `HELLO_ACK` to its actual
+source address on the effective discovery port. A receiver MUST NOT reply to
+`HELLO_ACK`; consequently replies cannot form a loop or Fabric-wide flood.
+Either valid type discovers the sender. Once a TCP session is chosen, both
+Hello send and receive activity for the Link stop. Discovery restarts after
+session failure or interface reactivation.
+
+After learning the actual remote source address, both endpoints compare the
+two IPv6 addresses as unsigned 128-bit integers. The endpoint with the lower
+address initiates TCP and the endpoint with the higher address accepts. Both
+endpoints listen before sending Hello. A node rejects an accepted TCP
+connection until it has received a valid Hello from the same source address.
+Equal addresses are a collision and no VFP session is established. Address
+ordering selects one TCP role only; it is never used to predict an address.
+
+Discovery framing has its own version. Its version changes do not change the
+VFP/TCP frame Version defined in Section 5.
+
+### 4.3 Security context
 
 In the static-Link phase, VFP runs inside a WireGuard Link whose peer public
 key and optional Fabric PSK are already configured. VFP does not add a
@@ -149,7 +213,7 @@ interfaces is outside VFP identity semantics.
 Authentication for a future VFP session reached through a routed path is TBD
 and MUST be designed together with the dynamic-Link threat model.
 
-### 4.3 Protocol state
+### 4.4 Protocol state
 
 Protocol state is local state in the two peers' state machines. It is not
 repeated as a field in every frame.
@@ -578,14 +642,16 @@ The static-phase sequence is therefore:
 2. Each endpoint creates its dedicated point-to-point WireGuard Link. The two
    endpoint public keys on that Link are different; no Fabric-wide public-key
    uniqueness is required by VFP.
-3. Deterministic scoped Link-local addresses permit the peers to create a TCP
-   connection without relying on any Fabric route.
-4. Both endpoints exchange `OPEN`, learning each other's Node UID.
-5. Both endpoints exchange `NODE_STATE`, learning each other's IPv6 node
+3. Each endpoint derives only its local scoped link-local address, opens a TCP
+   listener, and sends Discovery Hello over link-local multicast.
+4. Each endpoint learns the actual remote source address. The lower-address
+   endpoint initiates the single TCP connection; discovery then stops.
+5. Both endpoints exchange `OPEN`, learning each other's Node UID.
+6. Both endpoints exchange `NODE_STATE`, learning each other's IPv6 node
    loopback.
-6. The lower-UUID endpoint sends the initial complete `LINK_PROPOSE`.
-7. The peers exchange counterproposals until one side sends `LINK_ACCEPT`.
-8. Both sides reconcile any accepted Link addresses and the direct `/128`
+7. The lower-UUID endpoint sends the initial complete `LINK_PROPOSE`.
+8. The peers exchange counterproposals until one side sends `LINK_ACCEPT`.
+9. Both sides reconcile any accepted Link addresses and the direct `/128`
    route to the adjacent peer's IPv6 loopback. An empty proposal adds no routed
    address to the Link.
 

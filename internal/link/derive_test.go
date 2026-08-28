@@ -10,26 +10,48 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-func TestBootstrapAgreesAtBothEnds(t *testing.T) {
+func TestBootstrapDerivesLocalOnlyAddressesAndSharedPSK(t *testing.T) {
 	a, _ := wgtypes.GeneratePrivateKey()
 	b, _ := wgtypes.GeneratePrivateKey()
 	psk := bytes.Repeat([]byte{7}, 32)
-	aSide, err := DeriveBootstrap(psk, a, b.PublicKey(), spec.NodeUID{Name: "a", UUID: uuid.NewString()}, spec.Peer{Name: "b", PublicKey: b.PublicKey().String()})
+	aUID, bUID := uuid.New(), uuid.New()
+	aSide, err := DeriveBootstrap(psk, a, b.PublicKey(), spec.NodeUID{Name: "a", UUID: aUID.String()}, spec.Peer{Name: "b", PublicKey: b.PublicKey().String()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	bSide, err := DeriveBootstrap(psk, b, a.PublicKey(), spec.NodeUID{Name: "b", UUID: uuid.NewString()}, spec.Peer{Name: "a", PublicKey: a.PublicKey().String()})
+	bSide, err := DeriveBootstrap(psk, b, a.PublicKey(), spec.NodeUID{Name: "b", UUID: bUID.String()}, spec.Peer{Name: "a", PublicKey: a.PublicKey().String()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if aSide.PresharedKey != bSide.PresharedKey {
 		t.Fatal("per-Link PSKs differ")
 	}
-	if aSide.LocalAddress.Addr() != bSide.PeerAddress || bSide.LocalAddress.Addr() != aSide.PeerAddress {
-		t.Fatal("bootstrap roles disagree")
+	if aSide.LocalAddress != DeriveLinkLocal(psk, aUID, aSide.InterfaceName) || bSide.LocalAddress != DeriveLinkLocal(psk, bUID, bSide.InterfaceName) {
+		t.Fatal("bootstrap address depends on remote state")
 	}
-	if aSide.Dialer == bSide.Dialer {
-		t.Fatal("both sides selected the same TCP role")
+	if aSide.LocalAddress == bSide.LocalAddress {
+		t.Fatal("different Node UUIDs produced the same test address")
+	}
+}
+
+func TestLinkLocalIsUniquePerLocalInterface(t *testing.T) {
+	psk, uid := bytes.Repeat([]byte{3}, 32), uuid.New()
+	a := DeriveLinkLocal(psk, uid, "vl-a-b")
+	b := DeriveLinkLocal(psk, uid, "vl-a-c")
+	if a == b {
+		t.Fatal("different local interfaces share a control address")
+	}
+	if !a.Addr().IsLinkLocalUnicast() || !b.Addr().IsLinkLocalUnicast() {
+		t.Fatalf("derived addresses are not link-local: %s %s", a, b)
+	}
+}
+
+func TestLinkLocalFixedVector(t *testing.T) {
+	uid := uuid.MustParse("10000000-0000-4000-8000-000000000001")
+	got := DeriveLinkLocal(bytes.Repeat([]byte{3}, 32), uid, "vl-a-b")
+	want := netip.MustParsePrefix("fe80::ca74:207a:39ca:6942/64")
+	if got != want {
+		t.Fatalf("DeriveLinkLocal() = %s, want %s", got, want)
 	}
 }
 

@@ -51,11 +51,15 @@ Exactly four groups of optional Link settings are accepted on a peer:
 }
 ```
 
-Velvet derives one node-owned IPv6 `/128` from the required loopback pool. It
-creates each WireGuard interface with only a scoped fixed IPv6 link-local
-bootstrap address, runs VFP over TCP port 58420, and exchanges Node UIDs and
-IPv6 loopbacks. With no Link pools configured, the peers accept an empty
-proposal and the Link remains unnumbered.
+Velvet derives one node-owned IPv6 `/128` from the required loopback pool and
+one stable local IPv6 link-local control address per Link from the node UUID,
+local interface identity, and Fabric PSK. It assigns that scoped address to
+each dedicated WireGuard interface,
+discovers the remote address using link-local UDP multicast, and then runs VFP
+over TCP port 58420. The lower of the two discovered IPv6 addresses initiates
+TCP; neither endpoint configures or predicts the remote address. With no Link
+pools configured, the peers accept an empty proposal and the Link remains
+unnumbered apart from its control address.
 
 `fabric.link_prefix_v4` and `fabric.link_prefix_v6` are independent optional
 infrastructure pools. Configuring either one makes Velvet propose a `/30` or
