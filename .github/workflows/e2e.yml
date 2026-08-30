@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BABEL_RS_REVISION: 323310adfddfc843e53f60fcfb56813f9138b71c
+  BABEL_RS_REVISION: 68f6804dfca041e610b3e6e7981e1e4cee01630b
 
 jobs:
   linux-netns:
