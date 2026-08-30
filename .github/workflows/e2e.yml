@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BABEL_RS_REVISION: 8ad6c2a35e0c84cc9242efc3003a510a1c712858
+  BABEL_RS_REVISION: 8774aac6c901b958983fe2cbb5d3ed02718d9811
 
 jobs:
   linux-netns:
@@ -51,17 +51,17 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o .local/bin/velvetctl ./cmd/velvetctl
       - name: Test static Link establishment
         working-directory: velvet-fabric
-        run: sudo tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"
+        run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"
       - name: Test Core reconciliation
         working-directory: velvet-fabric
-        run: sudo tests/e2e/netns-core-crud.sh "$PWD/.local/bin/velvetd"
+        run: sudo sh tests/e2e/netns-core-crud.sh "$PWD/.local/bin/velvetd"
       - name: Test complex static Core
         working-directory: velvet-fabric
-        run: sudo tests/e2e/netns-wg-admin-core.sh "$PWD/.local/bin/velvetd"
+        run: sudo sh tests/e2e/netns-wg-admin-core.sh "$PWD/.local/bin/velvetd"
       - name: Test dynamic routing milestone
         working-directory: velvet-fabric
         run: >-
-          sudo tests/e2e/netns-dynamic.sh
+          sudo sh tests/e2e/netns-dynamic.sh
           "$PWD/.local/bin/velvetd"
           "$PWD/../babel-rs/target/release/babel-rs"
           "$PWD/.local/bin/velvetctl"
