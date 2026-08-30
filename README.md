@@ -1,9 +1,9 @@
 # Velvet Fabric
 
-This repository implements static point-to-point WireGuard Links plus the Core
-static-routing stage. Velvet reconciles its owned interfaces, routes, and policy
-rules from the current kernel state to the NodeSpec. Access interfaces, NAT, and
-Announcements are outside this repository's current scope.
+This repository implements static point-to-point WireGuard Links and both
+static and Babel-driven Core routing. `velvetd` reconciles interfaces, routes,
+and policy rules from NodeSpec and can manage the independent `babel-rs`
+daemon. Access interfaces and NAT remain outside Velvet Core.
 
 The version-1 inter-node control protocol is specified in
 [docs/protocol/VFP.md](docs/protocol/VFP.md). Informative design references are
@@ -51,7 +51,7 @@ Exactly four groups of optional Link settings are accepted on a peer:
 }
 ```
 
-Velvet derives one node-owned IPv6 `/128` from the required loopback pool and
+Velvet derives one node-owned IPv6 `/128` on `vv-loop` from the required loopback pool and
 one stable local IPv6 link-local control address per Link from the node UUID,
 local interface identity, and Fabric PSK. It assigns that scoped address to
 each dedicated WireGuard interface,
@@ -75,36 +75,41 @@ must remain inside it, and replaces only that address family's derived prefix.
 Velvet also derives the local interface name, listen port, node loopback, and
 the actual WireGuard per-Link PSK. Explicit optional values replace only their
 matching defaults. `fabric.vfp_port` and `node.loopback_address_v6` are optional
-overrides. Multiple endpoint candidates are accepted; the current minimal
-kernel backend applies the first candidate.
+overrides. Multiple endpoint candidates are tried in order. A candidate with
+no fresh WireGuard handshake is rotated after a bounded attempt interval;
+successful handshakes keep the working endpoint.
 
 An omitted field that Velvet defines as derived still contributes that derived
 value to desired state. A parameter left to the kernel, such as an omitted
 route metric or persistent keepalive, is neither written nor compared. Omitted
-`routes` or `domains` means the corresponding Velvet-owned collection is empty,
+`fabric.routes`, Domain routes, or `domains` means the corresponding
+Velvet-owned collection is empty,
 so stale owned entries are removed. Omission does not grant Velvet ownership of
 unrelated kernel state.
 
-## Static Core routing
+## Core routing
 
-`fabric.routing_table_id` is optional and defaults to `20000`. Top-level
-`routes` are installed in that Fabric table and grouped by the locally named
+`fabric.routing_table_id` is optional and defaults to `20000`. Static
+`fabric.routes` are installed in that Fabric table and grouped by the locally named
 next-hop Peer:
 
 ```json
 {
-  "routes": {
-    "b": [
-      "fd78:1234:5678::3/128",
-      {"prefix": "fd78:1234:5678::4/128", "metric": 10}
-    ]
+  "fabric": {
+    "routes": {
+      "b": [
+        "fd78:1234:5678::3/128",
+        {"prefix": "fd78:1234:5678::4/128", "metric": 10}
+      ]
+    }
   }
 }
 ```
 
-Each Domain has its own table. Its source prefixes select the table in both
-directions, its routes are again grouped by next-hop Peer, and its exceptions
-are Linux `throw` routes that continue lookup through later policy rules:
+Each Domain has its own table. Every source prefix installs a `from` rule for
+that table. Static routes are grouped by next-hop Peer; announcements declare
+prefixes delivered locally and are projected as Linux `throw` routes before
+being originated when Babel is enabled:
 
 ```json
 {
@@ -113,26 +118,65 @@ are Linux `throw` routes that continue lookup through later policy rules:
       "table_id": 20001,
       "source_prefixes": ["10.100.1.0/24"],
       "routes": {"b": ["192.168.20.0/24"]},
-      "exceptions": ["10.100.1.0/24"]
+      "announcements": ["0.0.0.0/0"]
     }
   }
 }
 ```
 
-Static routing is local desired state and is not propagated over VFP. Velvet
-does not write these routes to `main`. It marks owned interfaces with a link
-alias, static routes and rules with protocol `201`, and adjacent-node routes
-with protocol `202`. Reconciliation replaces changed owned state and removes
-stale owned state while leaving Access and differently owned kernel state
-untouched. A routing table selected by the current NodeSpec must not already
-contain foreign routes or rules; Velvet fails safely instead of adopting or
-overwriting them.
+Static routing remains local desired state and is not propagated over VFP.
+With `babel.enabled=true`, `velvetd` generates a strict `babel-rs` config,
+starts and supervises the daemon, and automatically originates the local Node
+loopback. Fabric announcements are ordinary Babel routes. For each address
+family, the first source prefix in a Domain is its canonical RFC 9079 source;
+the remaining source prefixes are aliases selecting the same Linux route view.
+
+`babel-rs` uses UDP/6696 and `ff02::1:6` on every configured WG interface. It
+owns dynamic routes with protocol `203`; `velvetd` owns static routes/rules
+with protocol `201` and adjacent routes with protocol `202`. Static and
+dynamic routes share tables, with dynamic metrics placed after the complete
+static metric range. Neither daemon writes learned routes to `main`.
+
+There is one `velvetd` per Linux network namespace and one managed `babel-rs`
+process for all of that node's WireGuard Links. A per-netns lock rejects a
+second daemon. `velvetd` preflights generated Babel configuration, waits for
+the versioned control socket to become ready, verifies the active config
+digest, reloads it online as Link origins change, and restarts an unexpected
+exit with bounded exponential backoff. Parent death terminates the child.
+
+SIGHUP loads and validates a complete NodeSpec candidate. An invalid candidate
+leaves the active generation running. A valid candidate is committed as one
+runtime generation; failure starts the previous generation again. SIGINT,
+SIGTERM, or `velvetctl shutdown` use graceful child shutdown before signal and
+kill fallbacks.
+
+The `babel` section is optional. When present, `enabled` is required and
+`executable` may set an absolute path:
+
+```json
+{"babel": {"enabled": true, "executable": "/usr/local/bin/babel-rs"}}
+```
 
 Use `velvetctl resolve` to inspect non-secret derived state:
 
 ```sh
 go run ./cmd/velvetctl resolve --config node.json
 ```
+
+The same tool queries the local daemon or requests a transactional reload or
+shutdown. Its per-node Unix socket is mode `0600` below `/run/velvet/<uuid>/`:
+
+```sh
+velvetctl status --config node.json
+velvetctl reload --config node.json
+velvetctl shutdown --config node.json
+```
+
+[`packaging/systemd/velvetd.service`](packaging/systemd/velvetd.service) is a
+deployment template with restart-on-failure, runtime/state directories, and a
+minimal capability set. Install the local `babel-rs` binary at the absolute
+path configured in NodeSpec; do not also enable its standalone service for a
+Velvet-managed instance.
 
 ## Tests
 
@@ -143,11 +187,12 @@ go test ./...
 ```
 
 The Linux E2E suite runs in isolated network namespaces on `debsrv`. It covers
-adjacent unnumbered Links, three-node Core routing/CRUD, and an eight-node,
-eight-Link, two-Plan Core topology reproduced from wg-admin's complex real
-deployment test. Access and translated NAT resources in the latter are modeled
-as external attached networks; Velvet manages only the Core paths.
+adjacent unnumbered Links, static Core routing/CRUD, and an eight-node,
+eight-Link, two-Domain Core topology reproduced from wg-admin's complex test.
+The dynamic milestone has no static multi-hop routes: Babel discovers every
+path, all 64 Node-loopback pairs are checked, Domain forwarding is exercised,
+and managed-daemon withdrawal/restart convergence is verified.
 
 ```sh
-tests/e2e/run-on-debsrv.sh
+tests/e2e/run-on-debsrv.sh dynamic
 ```

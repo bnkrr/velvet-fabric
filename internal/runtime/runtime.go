@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/velvet-fabric/velvet-fabric/internal/babel"
 	"github.com/velvet-fabric/velvet-fabric/internal/link"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/discovery"
@@ -32,8 +33,17 @@ type Runner struct {
 	Reconciler *reconcile.Reconciler
 	Interval   time.Duration
 	Log        func(Event)
+	Ready      chan<- error
 	mu         sync.RWMutex
 	states     map[string]materializedState
+	babel      *babel.Manager
+}
+
+type Status struct {
+	NodeUID          string        `json:"node_uid"`
+	ConfiguredLinks  int           `json:"configured_links"`
+	EstablishedLinks int           `json:"established_links"`
+	Babel            *babel.Status `json:"babel,omitempty"`
 }
 
 type materializedState struct {
@@ -44,14 +54,39 @@ type materializedState struct {
 
 func (r *Runner) Run(ctx context.Context, once bool) error {
 	if err := r.Reconciler.Reconcile(ctx, r.Desired); err != nil {
+		r.signalReady(err)
 		return err
 	}
 	r.log(Event{Event: "velvet-reconcile", Status: "success", NodeUID: r.Desired.UUID.String()})
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var babelDone chan struct{}
+	defer func() {
+		cancel()
+		if babelDone != nil {
+			select {
+			case <-babelDone:
+			case <-time.After(6 * time.Second):
+			}
+		}
+	}()
+	if r.Desired.Babel != nil {
+		r.babel = babel.New(r.Desired.Babel, func(event babel.Event) {
+			r.log(Event{Event: "babel-rs", Status: event.Status, NodeUID: r.Desired.UUID.String(), Error: event.Error})
+		})
+		babelDone = make(chan struct{})
+		go func() {
+			defer close(babelDone)
+			r.babel.Run(ctx)
+		}()
+	}
 	r.mu.Lock()
 	r.states = make(map[string]materializedState)
 	r.mu.Unlock()
+	if err := r.waitBabelReady(ctx); err != nil {
+		r.signalReady(err)
+		return err
+	}
+	r.signalReady(nil)
 	established := make(chan struct{}, len(r.Desired.Links))
 	for i := range r.Desired.Links {
 		desired := r.Desired.Links[i]
@@ -72,6 +107,50 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 	}
 	<-ctx.Done()
 	return nil
+}
+
+func (r *Runner) waitBabelReady(ctx context.Context) error {
+	if r.babel == nil {
+		return nil
+	}
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		status := r.babel.Status()
+		if status.State == "running" && status.AttachedInterfaces == len(r.Desired.Links) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("babel-rs did not attach all configured interfaces: %s", status.LastError)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *Runner) signalReady(err error) {
+	if r.Ready != nil {
+		select {
+		case r.Ready <- err:
+		default:
+		}
+	}
+}
+
+func (r *Runner) Status() Status {
+	r.mu.RLock()
+	established := len(r.states)
+	r.mu.RUnlock()
+	status := Status{NodeUID: r.Desired.UUID.String(), ConfiguredLinks: len(r.Desired.Links), EstablishedLinks: established}
+	if r.babel != nil {
+		value := r.babel.Status()
+		status.Babel = &value
+	}
+	return status
 }
 
 func (r *Runner) runLink(ctx context.Context, desired reconcile.LinkPlan, established chan<- struct{}) {
@@ -270,6 +349,9 @@ func (r *Runner) serveSession(ctx context.Context, conn net.Conn, desired reconc
 				peers:   append([]netip.Addr(nil), peerLoopbacks...),
 			}
 			r.mu.Unlock()
+			if r.babel != nil {
+				r.babel.SetLinkPrefixes(desired.InterfaceName, localAddresses)
+			}
 			r.log(Event{Event: "velvet-link-established", Status: "success", NodeUID: r.Desired.UUID.String(), Peer: desired.PeerName, Interface: desired.InterfaceName, RemoteUID: result.RemoteUID.UUID.String()})
 			once.Do(func() { established <- struct{}{} })
 			return nil

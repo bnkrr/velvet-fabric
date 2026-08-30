@@ -6,10 +6,12 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestPrefixIPNetPreservesHostAddress(t *testing.T) {
@@ -25,6 +27,27 @@ func TestPrefixIPNetPreservesHostAddress(t *testing.T) {
 	network, ok := prefixFromIPNet(converted)
 	if !ok || network != prefix.Masked() {
 		t.Fatalf("route prefix round trip = %s, %v; want %s, true", network, ok, prefix.Masked())
+	}
+}
+
+func TestEndpointRotationAndFreshHandshake(t *testing.T) {
+	backend := New()
+	plan := reconcile.LinkPlan{InterfaceName: "vl-a-b", Endpoints: []string{"192.0.2.1:5000", "192.0.2.2:5000"}}
+	device := &wgtypes.Device{}
+	if got, change := backend.endpointChoice(plan, device); got != 0 || !change {
+		t.Fatalf("initial endpoint = %d, want 0", got)
+	}
+	backend.mu.Lock()
+	attempt := backend.attempts[plan.InterfaceName]
+	attempt.since = time.Now().Add(-16 * time.Second)
+	backend.attempts[plan.InterfaceName] = attempt
+	backend.mu.Unlock()
+	if got, change := backend.endpointChoice(plan, device); got != 1 || !change {
+		t.Fatalf("endpoint after timeout = %d, want 1", got)
+	}
+	device.Peers = []wgtypes.Peer{{LastHandshakeTime: time.Now()}}
+	if got, _ := backend.endpointChoice(plan, device); got != 1 {
+		t.Fatalf("fresh handshake changed endpoint to %d", got)
 	}
 }
 

@@ -84,7 +84,8 @@ func TestRouteAcceptsScalarAndExpandedForms(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	raw["routes"] = map[string]any{
+	fabric := raw["fabric"].(map[string]any)
+	fabric["routes"] = map[string]any{
 		"b": []any{"fd41::20/128", map[string]any{"prefix": "fd41::21/128", "metric": 10}},
 	}
 	writeJSON(t, path, raw)
@@ -92,7 +93,7 @@ func TestRouteAcceptsScalarAndExpandedForms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := loaded.Routes["b"]; len(got) != 2 || got[0].Prefix != "fd41::20/128" || got[0].Metric != nil || got[1].Metric == nil || *got[1].Metric != 10 {
+	if got := loaded.Fabric.Routes["b"]; len(got) != 2 || got[0].Prefix != "fd41::20/128" || got[0].Metric != nil || got[1].Metric == nil || *got[1].Metric != 10 {
 		t.Fatalf("decoded routes = %#v", got)
 	}
 	persisted, err := os.ReadFile(path)
@@ -103,7 +104,7 @@ func TestRouteAcceptsScalarAndExpandedForms(t *testing.T) {
 	if err := json.Unmarshal(persisted, &roundTrip); err != nil {
 		t.Fatal(err)
 	}
-	items := roundTrip["routes"].(map[string]any)["b"].([]any)
+	items := roundTrip["fabric"].(map[string]any)["routes"].(map[string]any)["b"].([]any)
 	if _, ok := items[0].(string); !ok {
 		t.Fatalf("route shorthand was not preserved: %#v", items[0])
 	}
@@ -118,7 +119,7 @@ func TestRouteExpandedFormRejectsUnknownFields(t *testing.T) {
 	data, _ := json.Marshal(value)
 	var raw map[string]any
 	_ = json.Unmarshal(data, &raw)
-	raw["routes"] = map[string]any{"b": []any{map[string]any{"prefix": "fd41::20/128", "weight": 10}}}
+	raw["fabric"].(map[string]any)["routes"] = map[string]any{"b": []any{map[string]any{"prefix": "fd41::20/128", "weight": 10}}}
 	writeJSON(t, path, raw)
 	if _, err := Load(path); err == nil {
 		t.Fatal("unknown expanded route field was accepted")
@@ -128,18 +129,18 @@ func TestRouteExpandedFormRejectsUnknownFields(t *testing.T) {
 func TestValidationChecksRoutingOwnershipAndDomains(t *testing.T) {
 	value := validSpec(t)
 	metric := uint32(10)
-	value.Routes = Routes{"missing": {{Prefix: "fd41::20/128"}}}
+	value.Fabric.Routes = Routes{"missing": {{Prefix: "fd41::20/128"}}}
 	value.Domains = map[string]DomainSpec{
 		"one": {
 			TableID:        DefaultRoutingTableID,
 			SourcePrefixes: []string{"10.10.0.0/16"},
 			Routes:         Routes{"b": {{Prefix: "192.0.2.0/24", Metric: &metric}}},
-			Exceptions:     []string{"192.0.2.0/24"},
+			Announcements:  []Announcement{{Prefix: "192.0.2.0/24"}},
 		},
 		"two": {TableID: 20002, SourcePrefixes: []string{"10.10.1.0/24"}},
 	}
 	if err := value.Validate(); err == nil {
-		t.Fatal("invalid route ownership, duplicate table, overlapping domains, and conflicting exception were accepted")
+		t.Fatal("invalid route ownership, duplicate table, overlapping domains, and conflicting announcement were accepted")
 	}
 }
 
@@ -147,17 +148,66 @@ func TestValidationAcceptsStaticCoreRouting(t *testing.T) {
 	value := validSpec(t)
 	tableID := 21000
 	value.Fabric.RoutingTableID = &tableID
-	value.Routes = Routes{"b": {{Prefix: "fd41::20/128"}}}
+	value.Fabric.Routes = Routes{"b": {{Prefix: "fd41::20/128"}}}
 	value.Domains = map[string]DomainSpec{
 		"production": {
 			TableID:        21001,
 			SourcePrefixes: []string{"10.100.1.0/24", "fd10:100:1::/64"},
 			Routes:         Routes{"b": {{Prefix: "192.168.20.0/24"}}},
-			Exceptions:     []string{"10.100.1.0/24"},
+			Announcements:  []Announcement{{Prefix: "0.0.0.0/0"}},
 		},
 	}
 	if err := value.Validate(); err != nil {
 		t.Fatalf("valid static Core routing was rejected: %v", err)
+	}
+}
+
+func TestAnnouncementAcceptsScalarAndExpandedForms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.json")
+	value := validSpec(t)
+	data, _ := json.Marshal(value)
+	var raw map[string]any
+	_ = json.Unmarshal(data, &raw)
+	raw["fabric"].(map[string]any)["announcements"] = []any{
+		"fd30::/64",
+		map[string]any{"prefix": "198.51.100.0/24", "metric": 20},
+	}
+	writeJSON(t, path, raw)
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Fabric.Announcements; len(got) != 2 || got[0].Metric != nil || got[1].Metric == nil || *got[1].Metric != 20 {
+		t.Fatalf("decoded announcements = %#v", got)
+	}
+}
+
+func TestAnnouncementsRequireLocalOwnershipAndDomainFamily(t *testing.T) {
+	value := validSpec(t)
+	value.Fabric.Routes = Routes{"b": {{Prefix: "fd30::/64"}}}
+	value.Fabric.Announcements = []Announcement{{Prefix: "fd30::/64"}}
+	value.Domains = map[string]DomainSpec{
+		"production": {
+			TableID:        20001,
+			SourcePrefixes: []string{"10.100.1.0/24"},
+			Announcements:  []Announcement{{Prefix: "fd40::/64"}},
+		},
+	}
+	if err := value.Validate(); err == nil {
+		t.Fatal("conflicting Fabric ownership and family-less Domain announcement were accepted")
+	}
+}
+
+func TestBabelSectionRequiresEnabledAndAbsoluteExecutable(t *testing.T) {
+	value := validSpec(t)
+	value.Babel = &BabelSpec{Executable: "babel-rs"}
+	if err := value.Validate(); err == nil {
+		t.Fatal("babel section without enabled and with relative executable was accepted")
+	}
+	enabled := true
+	value.Babel = &BabelSpec{Enabled: &enabled, Executable: "/usr/local/bin/babel-rs"}
+	if err := value.Validate(); err != nil {
+		t.Fatalf("valid Babel section rejected: %v", err)
 	}
 }
 

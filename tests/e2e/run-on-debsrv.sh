@@ -7,21 +7,55 @@ ssh_config=${VELVET_SSH_CONFIG:-/home/bnkr/.ssh/config}
 ssh_alias=${VELVET_VM_SSH_ALIAS:-vm-debsrv}
 remote_root=${VELVET_VM_REMOTE_ROOT:-/root/proj/velvet/velvet-fabric/.local/e2e}
 local_binary="${repo_root}/.local/bin/velvetd-linux-amd64"
+local_ctl="${repo_root}/.local/bin/velvetctl-linux-amd64"
+babel_repo="${repo_root}/../babel-rs"
+babel_binary="${babel_repo}/target/release/babel-rs"
 
 mkdir -p "$(dirname "${local_binary}")"
 GOCACHE="${repo_root}/.local/cache/go-build" \
 GOMODCACHE="${repo_root}/.local/cache/go-mod" \
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   "${go_bin}" build -trimpath -o "${local_binary}" ./cmd/velvetd
+GOCACHE="${repo_root}/.local/cache/go-build" \
+GOMODCACHE="${repo_root}/.local/cache/go-mod" \
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  "${go_bin}" build -trimpath -o "${local_ctl}" ./cmd/velvetctl
+
+if [[ ${1:-all} == dynamic || ${1:-all} == all ]]; then
+  CARGO_HOME="${babel_repo}/.local/cargo" RUSTUP_TOOLCHAIN=stable \
+    /home/bnkr/.cargo/bin/cargo build --release --manifest-path "${babel_repo}/Cargo.toml" --package babel-rs
+fi
 
 ssh -F "${ssh_config}" -o ControlMaster=no -o ControlPath=none "${ssh_alias}" \
   "mkdir -p '${remote_root}'"
 scp -F "${ssh_config}" -o ControlMaster=no -o ControlPath=none \
   "${local_binary}" \
+  "${local_ctl}" \
   "${repo_root}/tests/e2e/netns-static.sh" \
   "${repo_root}/tests/e2e/netns-core-crud.sh" \
   "${repo_root}/tests/e2e/netns-wg-admin-core.sh" \
   "${repo_root}/tests/e2e/generate-wg-admin-core.py" \
+  "${repo_root}/tests/e2e/netns-dynamic.sh" \
+  "${repo_root}/tests/e2e/generate-dynamic-core.py" \
+  "${babel_binary}" \
   "${ssh_alias}:${remote_root}/"
+case ${1:-all} in
+  static)
+    remote_tests="'${remote_root}/netns-static.sh' '${remote_root}/velvetd-linux-amd64'"
+    ;;
+  crud)
+    remote_tests="'${remote_root}/netns-core-crud.sh' '${remote_root}/velvetd-linux-amd64'"
+    ;;
+  static-core)
+    remote_tests="'${remote_root}/netns-wg-admin-core.sh' '${remote_root}/velvetd-linux-amd64'"
+    ;;
+  dynamic)
+    remote_tests="'${remote_root}/netns-dynamic.sh' '${remote_root}/velvetd-linux-amd64' '${remote_root}/babel-rs' '${remote_root}/velvetctl-linux-amd64'"
+    ;;
+  all)
+    remote_tests="'${remote_root}/netns-static.sh' '${remote_root}/velvetd-linux-amd64' && '${remote_root}/netns-core-crud.sh' '${remote_root}/velvetd-linux-amd64' && '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/velvetd-linux-amd64' && '${remote_root}/netns-dynamic.sh' '${remote_root}/velvetd-linux-amd64' '${remote_root}/babel-rs' '${remote_root}/velvetctl-linux-amd64'"
+    ;;
+  *) echo "usage: $0 [all|static|crud|static-core|dynamic]" >&2; exit 2 ;;
+esac
 ssh -F "${ssh_config}" -o ControlMaster=no -o ControlPath=none "${ssh_alias}" \
-  "chmod 0700 '${remote_root}/velvetd-linux-amd64' '${remote_root}/netns-static.sh' '${remote_root}/netns-core-crud.sh' '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/generate-wg-admin-core.py' && '${remote_root}/netns-static.sh' '${remote_root}/velvetd-linux-amd64' && '${remote_root}/netns-core-crud.sh' '${remote_root}/velvetd-linux-amd64' && '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/velvetd-linux-amd64'"
+  "chmod 0700 '${remote_root}/velvetd-linux-amd64' '${remote_root}/velvetctl-linux-amd64' '${remote_root}/babel-rs' '${remote_root}/netns-static.sh' '${remote_root}/netns-core-crud.sh' '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/generate-wg-admin-core.py' '${remote_root}/netns-dynamic.sh' '${remote_root}/generate-dynamic-core.py' && ${remote_tests}"

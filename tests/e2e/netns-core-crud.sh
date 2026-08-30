@@ -140,7 +140,8 @@ cat >"${runtime}/a.json" <<EOF
     "link_prefix_v4": "10.240.0.0/16",
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
-    "routing_table_id": 20000
+    "routing_table_id": 20000,
+    "routes": {"b": ["fd78:1234:5678::3/128"]}
   },
   "node": {
     "uid": {"name": "a", "uuid": "10000000-0000-4000-8000-000000000001"},
@@ -154,13 +155,12 @@ cat >"${runtime}/a.json" <<EOF
     "listen_port": 51001,
     "interface_name": "vl-a-b"
   }],
-  "routes": {"b": ["fd78:1234:5678::3/128"]},
   "domains": {
     "production": {
       "table_id": 20001,
       "source_prefixes": ["10.100.1.0/24"],
       "routes": {"b": ["192.168.20.0/24"]},
-      "exceptions": ["10.100.1.0/24"]
+      "announcements": ["10.100.1.0/24"]
     }
   }
 }
@@ -220,7 +220,8 @@ cat >"${runtime}/c.json" <<EOF
     "link_prefix_v4": "10.240.0.0/16",
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
-    "routing_table_id": 20000
+    "routing_table_id": 20000,
+    "routes": {"b": ["fd78:1234:5678::1/128"]}
   },
   "node": {
     "uid": {"name": "c", "uuid": "10000000-0000-4000-8000-000000000003"},
@@ -234,13 +235,12 @@ cat >"${runtime}/c.json" <<EOF
     "listen_port": 51004,
     "interface_name": "vl-c-b"
   }],
-  "routes": {"b": ["fd78:1234:5678::1/128"]},
   "domains": {
     "production": {
       "table_id": 20001,
       "source_prefixes": ["10.100.1.0/24"],
       "routes": {"b": ["10.100.1.0/24"]},
-      "exceptions": ["192.168.20.0/24"]
+      "announcements": ["192.168.20.0/24"]
     }
   }
 }
@@ -263,7 +263,6 @@ fi
 ip -n "${ns_b}" route show table 20001 exact 10.100.1.0/24 dev vl-b-a proto 201 | grep -q 10.100.1.0/24
 ip -n "${ns_c}" route show table 20001 type throw exact 192.168.20.0/24 proto 201 | grep -q 192.168.20.0/24
 ip -n "${ns_b}" -details rule show | grep -q 'from 10.100.1.0/24 lookup 20001 proto 201'
-ip -n "${ns_b}" -details rule show | grep -q 'to 10.100.1.0/24 lookup 20001 proto 201'
 test "$(ip netns exec "${ns_b}" sh -c 'cat /proc/sys/net/ipv4/ip_forward')" = 1
 test "$(ip netns exec "${ns_b}" sh -c 'cat /proc/sys/net/ipv6/conf/all/forwarding')" = 1
 b_link4=$(ip -n "${ns_b}" -o -4 address show dev vl-b-a scope global | awk 'NR == 1 {print $4}' | cut -d/ -f1)
@@ -280,10 +279,11 @@ fi
 ip netns exec "${ns_a}" ping -c 1 -W 3 "${b_link4}" >/dev/null
 ip netns exec "${ns_a}" ping -6 -c 1 -W 3 "${b_link6}" >/dev/null
 ip netns exec "${ns_a}" ping -6 -c 1 -W 3 fd78:1234:5678::3 >/dev/null
+for ns in "${ns_a}" "${ns_b}" "${ns_c}"; do ip -n "${ns}" rule add priority 19999 to 10.100.1.0/24 lookup 20001; done
 ip netns exec "${ns_a}" ping -c 1 -W 3 -I 10.100.1.1 192.168.20.1 >/dev/null
 
-ip -n "${ns_a}" route add blackhole 203.0.113.0/24 table 20000 proto 203
-ip -n "${ns_a}" rule add priority 32000 to 203.0.113.0/24 lookup 20000 protocol 203
+ip -n "${ns_a}" route add blackhole 203.0.113.0/24 table 20000 proto 204
+ip -n "${ns_a}" rule add priority 32000 to 203.0.113.0/24 lookup 20000 protocol 204
 
 cat >"${runtime}/a-updated.json" <<EOF
 {
@@ -294,7 +294,8 @@ cat >"${runtime}/a-updated.json" <<EOF
     "link_prefix_v4": "10.240.0.0/16",
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
-    "routing_table_id": 21000
+    "routing_table_id": 21000,
+    "routes": {"b": ["fd78:1234:5678::3/128"]}
   },
   "node": {
     "uid": {"name": "a", "uuid": "10000000-0000-4000-8000-000000000001"},
@@ -307,8 +308,7 @@ cat >"${runtime}/a-updated.json" <<EOF
     "endpoints": ["192.0.2.2:51002"],
     "listen_port": 51001,
     "interface_name": "vl-a-b-new"
-  }],
-  "routes": {"b": ["fd78:1234:5678::3/128"]}
+  }]
 }
 EOF
 
@@ -325,8 +325,8 @@ test -z "$(ip -n "${ns_a}" route show table 20001 proto 201 2>/dev/null)"
 test -z "$(ip -n "${ns_a}" -6 route show table 20001 proto 201 2>/dev/null)"
 test -z "$(ip -n "${ns_a}" -details rule show | grep 'lookup \(20000\|20001\) proto 201' || true)"
 test -z "$(ip -n "${ns_a}" -6 -details rule show | grep 'lookup \(20000\|20001\) proto 201' || true)"
-ip -n "${ns_a}" route show table 20000 exact 203.0.113.0/24 proto 203 | grep -q 203.0.113.0/24
-ip -n "${ns_a}" -details rule show | grep -q 'to 203.0.113.0/24 lookup 20000 proto 203'
+ip -n "${ns_a}" route show table 20000 exact 203.0.113.0/24 proto 204 | grep -q 203.0.113.0/24
+ip -n "${ns_a}" -details rule show | grep -q 'to 203.0.113.0/24 lookup 20000 proto 204'
 ip -n "${ns_a}" -6 route show table 21000 exact fd78:1234:5678::3/128 dev vl-a-b-new proto 201 | grep -q fd78:1234:5678::3
 ip -n "${ns_a}" link show access0 >/dev/null
 

@@ -56,6 +56,11 @@ ip -n "${ns_b}" addr add 192.0.2.2/24 dev "ub-${suffix}"
 ip -n "${ns_a}" link set "ua-${suffix}" up
 ip -n "${ns_b}" link set "ub-${suffix}" up
 
+# A NodeSpec without Babel must remove state left by a previously managed
+# protocol-203 daemon, while preserving differently owned kernel state.
+ip -n "${ns_a}" -6 route add blackhole 2001:db8:dead::/48 table 20000 proto 203
+ip -n "${ns_a}" -6 rule add priority 32003 to 2001:db8:dead::/48 lookup 20000 protocol 203
+
 cat > "${runtime}/a.json" <<EOF
 {
   "api_version": "velvet.io/v1alpha1",
@@ -123,6 +128,8 @@ grep -q '"uuid": "[0-9a-f-][0-9a-f-]*"' "${runtime}/a.json"
 grep -q '"uuid": "[0-9a-f-][0-9a-f-]*"' "${runtime}/b.json"
 grep -q '"event":"velvet-link-established"' "${runtime}/a.log"
 grep -q '"event":"velvet-link-established"' "${runtime}/b.log"
+test -z "$(ip -n "${ns_a}" -6 route show table 20000 proto 203)"
+test -z "$(ip -n "${ns_a}" -6 -details rule show | grep 'proto 203' || true)"
 
 test "$(ip netns exec "${ns_a}" wg show vl-a-b peers | wc -l)" -eq 1
 test "$(ip netns exec "${ns_b}" wg show vl-b-custom peers | wc -l)" -eq 1
@@ -134,8 +141,8 @@ a_control6=$(ip -n "${ns_a}" -o -6 addr show dev vl-a-b scope link | awk '$4 ~ /
 b_control6=$(ip -n "${ns_b}" -o -6 addr show dev vl-b-custom scope link | awk '$4 ~ /^fe80:/ {print $4}' | cut -d/ -f1)
 test -n "${a_control6}" && test -n "${b_control6}"
 test "${a_control6}" != "${b_control6}"
-a_loop6=$(ip -n "${ns_a}" -o -6 addr show dev vl-loop scope global | awk '{print $4}' | cut -d/ -f1)
-b_loop6=$(ip -n "${ns_b}" -o -6 addr show dev vl-loop scope global | awk '{print $4}' | cut -d/ -f1)
+a_loop6=$(ip -n "${ns_a}" -o -6 addr show dev vv-loop scope global | awk '{print $4}' | cut -d/ -f1)
+b_loop6=$(ip -n "${ns_b}" -o -6 addr show dev vv-loop scope global | awk '{print $4}' | cut -d/ -f1)
 test -n "${a_loop6}" && test -n "${b_loop6}"
 test "$(ip -n "${ns_a}" -o -4 addr show dev vl-a-b | wc -l)" -eq 0
 test "$(ip -n "${ns_b}" -o -4 addr show dev vl-b-custom | wc -l)" -eq 0

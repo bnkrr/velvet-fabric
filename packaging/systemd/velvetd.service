@@ -1,0 +1,27 @@
+[Unit]
+Description=Velvet Fabric node daemon
+Documentation=https://github.com/bnkrr/velvet-fabric
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/velvetd --config /etc/velvet/node.json
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=velvet
+RuntimeDirectoryMode=0700
+StateDirectory=velvet
+StateDirectoryMode=0700
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/velvet
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
