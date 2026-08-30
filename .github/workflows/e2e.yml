@@ -1,0 +1,67 @@
+name: e2e
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BABEL_RS_REVISION: 8ad6c2a35e0c84cc9242efc3003a510a1c712858
+
+jobs:
+  linux-netns:
+    name: Linux netns fabric
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out velvet-fabric
+        uses: actions/checkout@v7
+        with:
+          path: velvet-fabric
+      - name: Check out compatible babel-rs
+        uses: actions/checkout@v7
+        with:
+          repository: bnkrr/babel-rs
+          ref: ${{ env.BABEL_RS_REVISION }}
+          path: babel-rs
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: velvet-fabric/go.mod
+          cache-dependency-path: velvet-fabric/go.sum
+      - name: Install network tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes iproute2 iputils-ping wireguard-tools
+          sudo modprobe wireguard
+      - name: Build babel-rs
+        working-directory: babel-rs
+        run: cargo build --locked --release --package babel-rs
+      - name: Build Velvet binaries
+        working-directory: velvet-fabric
+        run: |
+          mkdir -p .local/bin
+          CGO_ENABLED=0 go build -trimpath -o .local/bin/velvetd ./cmd/velvetd
+          CGO_ENABLED=0 go build -trimpath -o .local/bin/velvetctl ./cmd/velvetctl
+      - name: Test static Link establishment
+        working-directory: velvet-fabric
+        run: sudo tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"
+      - name: Test Core reconciliation
+        working-directory: velvet-fabric
+        run: sudo tests/e2e/netns-core-crud.sh "$PWD/.local/bin/velvetd"
+      - name: Test complex static Core
+        working-directory: velvet-fabric
+        run: sudo tests/e2e/netns-wg-admin-core.sh "$PWD/.local/bin/velvetd"
+      - name: Test dynamic routing milestone
+        working-directory: velvet-fabric
+        run: >-
+          sudo tests/e2e/netns-dynamic.sh
+          "$PWD/.local/bin/velvetd"
+          "$PWD/../babel-rs/target/release/babel-rs"
+          "$PWD/.local/bin/velvetctl"

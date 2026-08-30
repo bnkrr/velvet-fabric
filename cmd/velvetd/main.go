@@ -26,11 +26,11 @@ import (
 )
 
 type daemonStatus struct {
-	Version           string               `json:"version"`
-	Ready             bool                 `json:"ready"`
-	ConfigGeneration  uint64               `json:"config_generation"`
-	LastReloadError   string               `json:"last_reload_error,omitempty"`
-	Runtime           velvetruntime.Status `json:"runtime"`
+	Version          string               `json:"version"`
+	Ready            bool                 `json:"ready"`
+	ConfigGeneration uint64               `json:"config_generation"`
+	LastReloadError  string               `json:"last_reload_error,omitempty"`
+	Runtime          velvetruntime.Status `json:"runtime"`
 }
 
 type running struct {
