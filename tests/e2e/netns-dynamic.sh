@@ -223,7 +223,10 @@ wait_route8() {
     route=$(ip -n "$(namespace ea)" -6 route show table 20000 exact fd78:abcd::8/128 proto 203 2>/dev/null || true)
     if { test "${presence}" = present && test -n "${route}"; } || { test "${presence}" = absent && test -z "${route}"; }; then return; fi
     attempt=$((attempt + 1))
-    test "${attempt}" -lt 50 || { echo "xc route did not become ${presence}" >&2; exit 1; }
+    # A graceful retraction normally converges immediately.  The upper bound
+    # also covers expiry after a lost UDP retraction (3.5 x the 16s Update
+    # interval), which is part of Babel's normal recovery path.
+    test "${attempt}" -lt 70 || { echo "xc route did not become ${presence}" >&2; exit 1; }
     sleep 1
   done
 }
