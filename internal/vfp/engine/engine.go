@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/link"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
@@ -16,16 +17,17 @@ import (
 const maxCounterproposals = 64
 
 type Config struct {
-	LocalUID        message.UID
-	LocalLoopbackV6 netip.Addr
-	LinkPoolV4      netip.Prefix
-	LinkPoolV6      netip.Prefix
-	LoopbackPoolV6  netip.Prefix
-	FabricPSK       []byte
-	LinkOverrides   []string
-	Accept          func(message.UID, link.Proposal) bool
-	Commit          func(Result) error
-	FrameError      func(error)
+	LocalUID             message.UID
+	LocalLoopbackV6      netip.Addr
+	LinkPoolV4           netip.Prefix
+	LinkPoolV6           netip.Prefix
+	LoopbackPoolV6       netip.Prefix
+	FabricPSK            []byte
+	LinkOverrides        []string
+	Accept               func(message.UID, link.Proposal) bool
+	Commit               func(Result) error
+	FrameError           func(error)
+	EstablishmentTimeout time.Duration
 }
 
 type Result struct {
@@ -52,14 +54,17 @@ type writeRequest struct {
 // loop; the reader and writer goroutines only move framed messages.
 func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	reads := make(chan readEvent)
 	writes := make(chan writeRequest)
 	var workers sync.WaitGroup
 	workers.Add(2)
 	go func() { defer workers.Done(); readLoop(ctx, conn, reads) }()
 	go func() { defer workers.Done(); writeLoop(ctx, conn, writes) }()
-	defer func() { _ = conn.Close(); workers.Wait() }()
+	defer func() {
+		cancel()
+		_ = conn.Close()
+		workers.Wait()
+	}()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
 
 	send := func(value message.Message) error {
@@ -76,6 +81,16 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 			return ctx.Err()
 		}
 	}
+	establishmentTimeout := e.config.EstablishmentTimeout
+	if establishmentTimeout <= 0 {
+		establishmentTimeout = 10 * time.Second
+	}
+	if err := conn.SetDeadline(time.Now().Add(establishmentTimeout)); err != nil {
+		return fmt.Errorf("set VFP establishment deadline: %w", err)
+	}
+	establishmentTimer := time.NewTimer(establishmentTimeout)
+	defer establishmentTimer.Stop()
+	establishmentDeadline := establishmentTimer.C
 	if err := send(message.Message{Type: message.Open, UID: &e.config.LocalUID}); err != nil {
 		return err
 	}
@@ -85,6 +100,8 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-establishmentDeadline:
+			return fmt.Errorf("VFP establishment timed out after %s", establishmentTimeout)
 		case event := <-reads:
 			if event.err != nil {
 				if event.frameInvalid {
@@ -120,6 +137,16 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 					}
 				}
 				fsm.markEstablished()
+				if err := conn.SetDeadline(time.Time{}); err != nil {
+					return fmt.Errorf("clear VFP establishment deadline: %w", err)
+				}
+				if !establishmentTimer.Stop() {
+					select {
+					case <-establishmentTimer.C:
+					default:
+					}
+				}
+				establishmentDeadline = nil
 			}
 		}
 	}

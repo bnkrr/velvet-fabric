@@ -60,6 +60,26 @@ func TestTwoEndpointFSMConvergesThroughCounterproposal(t *testing.T) {
 	}
 }
 
+func TestEstablishmentTimeoutInterruptsHungPeer(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+	config := testConfig(
+		uuid.MustParse("10000000-0000-4000-8000-000000000001"),
+		"a",
+		netip.MustParseAddr("fd41::1"),
+		func(message.UID, link.Proposal) bool { return true },
+		make(chan Result, 1),
+	)
+	config.EstablishmentTimeout = 20 * time.Millisecond
+	started := time.Now()
+	if err := New(config).Run(context.Background(), local); err == nil {
+		t.Fatal("hung session did not time out")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("hung session took %s to stop", elapsed)
+	}
+}
+
 func testConfig(id uuid.UUID, name string, v6 netip.Addr, accept func(message.UID, link.Proposal) bool, result chan<- Result) Config {
 	return Config{
 		LocalUID: message.UID{UUID: id, Name: name}, LocalLoopbackV6: v6,

@@ -16,6 +16,13 @@ runtime=$(mktemp -d /tmp/velvet-wg-admin-core.XXXXXXXX)
 nodes="ea eb r1 r2 r3 xa xb xc"
 pids=
 
+add_return_selectors() {
+  ns=$1
+  ip -n "${ns}" rule add priority 19930 to 10.100.30.0/24 lookup 20030
+  ip -n "${ns}" rule add priority 19930 to 10.100.32.0/24 lookup 20030
+  ip -n "${ns}" rule add priority 19931 to 10.100.31.0/24 lookup 20031
+}
+
 namespace() { printf 'vw-%s-%s' "$1" "${suffix}"; }
 
 diagnose() {
@@ -111,6 +118,10 @@ while :; do
 done
 for pid in ${pids}; do wait "${pid}"; done
 pids=
+
+# Return-path selectors are supplied by the external Access integration. They
+# select Velvet's tables but are not part of NodeSpec/Core ownership.
+for node in ${nodes}; do add_return_selectors "$(namespace "${node}")"; done
 
 for item in "ea:2" "eb:2" "r1:3" "r2:4" "r3:2" "xa:1" "xb:1" "xc:1"; do
   node=${item%%:*}

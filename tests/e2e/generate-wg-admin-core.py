@@ -142,18 +142,18 @@ for node, metadata in NODES.items():
         if node not in members:
             continue
         routes: dict[str, list[str]] = {}
-        exceptions: list[str] = []
+        announcements: list[str] = []
         resources = {**plan["sources"], **plan["targets"]}
         for prefix, owner in resources.items():
             if owner == node:
-                exceptions.append(prefix)
+                announcements.append(prefix)
             else:
                 group_route(routes, next_hop(node, owner, members), prefix)
         domains[plan_name] = {
             "table_id": plan["table"],
             "source_prefixes": list(plan["sources"]),
             "routes": routes,
-            "exceptions": exceptions,
+            "announcements": announcements,
         }
 
     value = {
@@ -163,6 +163,7 @@ for node, metadata in NODES.items():
             "psk": fabric_psk,
             "loopback_prefix_v6": "fd78:abcd::/48",
             "routing_table_id": 20000,
+            "routes": fabric_routes,
         },
         "node": {
             "uid": {
@@ -173,7 +174,6 @@ for node, metadata in NODES.items():
             "loopback_address_v6": f"fd78:abcd::{metadata['index']}",
         },
         "peers": peers,
-        "routes": fabric_routes,
         "domains": domains,
     }
     (RUNTIME / f"{node}.json").write_text(

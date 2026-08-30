@@ -37,17 +37,24 @@ type NodeSpec struct {
 	Fabric     FabricSpec            `json:"fabric"`
 	Node       Node                  `json:"node"`
 	Peers      []Peer                `json:"peers"`
-	Routes     Routes                `json:"routes,omitempty"`
+	Babel      *BabelSpec            `json:"babel,omitempty"`
 	Domains    map[string]DomainSpec `json:"domains,omitempty"`
 }
 
 type FabricSpec struct {
-	PSK              string `json:"psk"`
-	LinkPrefixV4     string `json:"link_prefix_v4,omitempty"`
-	LinkPrefixV6     string `json:"link_prefix_v6,omitempty"`
-	LoopbackPrefixV6 string `json:"loopback_prefix_v6"`
-	VFPPort          *int   `json:"vfp_port,omitempty"`
-	RoutingTableID   *int   `json:"routing_table_id,omitempty"`
+	PSK              string         `json:"psk"`
+	LinkPrefixV4     string         `json:"link_prefix_v4,omitempty"`
+	LinkPrefixV6     string         `json:"link_prefix_v6,omitempty"`
+	LoopbackPrefixV6 string         `json:"loopback_prefix_v6"`
+	VFPPort          *int           `json:"vfp_port,omitempty"`
+	RoutingTableID   *int           `json:"routing_table_id,omitempty"`
+	Routes           Routes         `json:"routes,omitempty"`
+	Announcements    []Announcement `json:"announcements,omitempty"`
+}
+
+type BabelSpec struct {
+	Enabled    *bool  `json:"enabled"`
+	Executable string `json:"executable,omitempty"`
 }
 
 type Node struct {
@@ -80,11 +87,18 @@ type Route struct {
 	Metric *uint32 `json:"metric,omitempty"`
 }
 
+// Announcement accepts either a prefix string or an expanded object with an
+// optional Babel origin metric.
+type Announcement struct {
+	Prefix string  `json:"prefix"`
+	Metric *uint32 `json:"metric,omitempty"`
+}
+
 type DomainSpec struct {
-	TableID        int      `json:"table_id"`
-	SourcePrefixes []string `json:"source_prefixes"`
-	Routes         Routes   `json:"routes,omitempty"`
-	Exceptions     []string `json:"exceptions,omitempty"`
+	TableID        int            `json:"table_id"`
+	SourcePrefixes []string       `json:"source_prefixes"`
+	Routes         Routes         `json:"routes,omitempty"`
+	Announcements  []Announcement `json:"announcements,omitempty"`
 }
 
 func (r *Route) UnmarshalJSON(data []byte) error {
@@ -122,6 +136,43 @@ func (r Route) MarshalJSON() ([]byte, error) {
 	}
 	type expanded Route
 	return json.Marshal(expanded(r))
+}
+
+func (a *Announcement) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("announcement must be a prefix string or object")
+	}
+	if data[0] == '"' {
+		var prefix string
+		if err := json.Unmarshal(data, &prefix); err != nil {
+			return err
+		}
+		*a = Announcement{Prefix: prefix}
+		return nil
+	}
+	if data[0] != '{' {
+		return errors.New("announcement must be a prefix string or object")
+	}
+	type expanded Announcement
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var value expanded
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	if err := rejectTrailingJSON(decoder); err != nil {
+		return err
+	}
+	*a = Announcement(value)
+	return nil
+}
+
+func (a Announcement) MarshalJSON() ([]byte, error) {
+	if a.Metric == nil {
+		return json.Marshal(a.Prefix)
+	}
+	type expanded Announcement
+	return json.Marshal(expanded(a))
 }
 
 // Load reads and validates a NodeSpec. If node.uid.uuid is absent, Load creates
@@ -178,6 +229,14 @@ func (s *NodeSpec) Validate() error {
 	}
 	if err := validateTableID(s.Fabric.EffectiveRoutingTableID()); err != nil {
 		problems = append(problems, "fabric.routing_table_id "+err.Error())
+	}
+	if s.Babel != nil {
+		if s.Babel.Enabled == nil {
+			problems = append(problems, "babel.enabled is required when babel is present")
+		}
+		if s.Babel.Executable != "" && !filepath.IsAbs(s.Babel.Executable) {
+			problems = append(problems, "babel.executable must be an absolute path")
+		}
 	}
 	if !uidNamePattern.MatchString(s.Node.UID.Name) {
 		problems = append(problems, "node.uid.name must contain at most five lowercase letters or digits")
@@ -296,6 +355,9 @@ func (f FabricSpec) EffectiveRoutingTableID() int {
 		return *f.RoutingTableID
 	}
 	return DefaultRoutingTableID
+}
+func (s *BabelSpec) IsEnabled() bool {
+	return s != nil && s.Enabled != nil && *s.Enabled
 }
 func ParseKey(value string) (wgtypes.Key, error) { return wgtypes.ParseKey(strings.TrimSpace(value)) }
 func ParsePSK(value string) ([]byte, error)      { return parseInlineKey(value) }
@@ -437,8 +499,15 @@ func validUnicast(addr netip.Addr) bool {
 func validateRouting(s *NodeSpec, peerNames map[string]struct{}) []string {
 	var problems []string
 	tables := map[int]string{s.Fabric.EffectiveRoutingTableID(): "fabric.routing_table_id"}
-	_, routeProblems := validateRoutes("routes", s.Routes, peerNames)
+	fabricRoutes, routeProblems := validateRoutes("fabric.routes", s.Fabric.Routes, peerNames)
 	problems = append(problems, routeProblems...)
+	fabricAnnouncements, announcementProblems := validateAnnouncements("fabric.announcements", s.Fabric.Announcements)
+	problems = append(problems, announcementProblems...)
+	for prefix := range fabricAnnouncements {
+		if peer, exists := fabricRoutes[prefix]; exists {
+			problems = append(problems, fmt.Sprintf("fabric.announcements conflicts at %s with a route through peer %q", prefix, peer))
+		}
+	}
 
 	type sourceOwner struct {
 		domain string
@@ -482,19 +551,14 @@ func validateRouting(s *NodeSpec, peerNames map[string]struct{}) []string {
 		}
 		routes, routeProblems := validateRoutes(where+".routes", domain.Routes, peerNames)
 		problems = append(problems, routeProblems...)
-		seenExceptions := make(map[netip.Prefix]struct{})
-		for i, raw := range domain.Exceptions {
-			prefix, err := parseCanonicalPrefix(raw)
-			if err != nil {
-				problems = append(problems, fmt.Sprintf("%s.exceptions[%d] %v", where, i, err))
-				continue
+		announcements, announcementProblems := validateAnnouncements(where+".announcements", domain.Announcements)
+		problems = append(problems, announcementProblems...)
+		for prefix := range announcements {
+			if !containsFamily(domain.SourcePrefixes, prefix.Addr().Is4()) {
+				problems = append(problems, fmt.Sprintf("%s.announcements prefix %s has no same-family source_prefix", where, prefix))
 			}
-			if _, exists := seenExceptions[prefix]; exists {
-				problems = append(problems, fmt.Sprintf("%s.exceptions[%d] duplicates %s", where, i, prefix))
-			}
-			seenExceptions[prefix] = struct{}{}
 			if peer, exists := routes[prefix]; exists {
-				problems = append(problems, fmt.Sprintf("%s.exceptions[%d] conflicts with the same prefix routed through peer %q", where, i, peer))
+				problems = append(problems, fmt.Sprintf("%s.announcements conflicts at %s with a route through peer %q", where, prefix, peer))
 			}
 		}
 	}
@@ -529,6 +593,29 @@ func validateRoutes(where string, routes Routes, peerNames map[string]struct{}) 
 				continue
 			}
 			resolved[prefix] = peerName
+			if route.Metric != nil && *route.Metric > 65534 {
+				problems = append(problems, fmt.Sprintf("%s[%d].metric must be between 0 and 65534", peerWhere, i))
+			}
+		}
+	}
+	return resolved, problems
+}
+
+func validateAnnouncements(where string, announcements []Announcement) (map[netip.Prefix]struct{}, []string) {
+	resolved := make(map[netip.Prefix]struct{})
+	var problems []string
+	for i, announcement := range announcements {
+		prefix, err := parseCanonicalPrefix(announcement.Prefix)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s[%d].prefix %v", where, i, err))
+			continue
+		}
+		if _, exists := resolved[prefix]; exists {
+			problems = append(problems, fmt.Sprintf("%s[%d].prefix duplicates %s", where, i, prefix))
+		}
+		resolved[prefix] = struct{}{}
+		if announcement.Metric != nil && *announcement.Metric > 65534 {
+			problems = append(problems, fmt.Sprintf("%s[%d].metric must be between 0 and 65534", where, i))
 		}
 	}
 	return resolved, problems
@@ -538,10 +625,23 @@ func validateTableID(value int) error {
 	if value < 1 {
 		return errors.New("must be positive")
 	}
+	if uint64(value) > uint64(^uint32(0)) {
+		return errors.New("must fit a 32-bit Linux routing table ID")
+	}
 	if value == 253 || value == 254 || value == 255 {
 		return errors.New("must not use a reserved Linux routing table")
 	}
 	return nil
+}
+
+func containsFamily(values []string, ipv4 bool) bool {
+	for _, raw := range values {
+		prefix, err := netip.ParsePrefix(raw)
+		if err == nil && prefix.Addr().Is4() == ipv4 {
+			return true
+		}
+	}
+	return false
 }
 
 func parseCanonicalPrefix(raw string) (netip.Prefix, error) {

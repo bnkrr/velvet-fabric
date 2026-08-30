@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/link"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
@@ -30,9 +32,18 @@ type managedRoute struct {
 	metric *uint32
 }
 
-type Backend struct{}
+type Backend struct {
+	mu       sync.Mutex
+	attempts map[string]endpointAttempt
+}
 
-func New() *Backend { return &Backend{} }
+type endpointAttempt struct {
+	index         int
+	since         time.Time
+	lastHandshake time.Time
+}
+
+func New() *Backend { return &Backend{attempts: make(map[string]endpointAttempt)} }
 
 func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState) error {
 	if os.Geteuid() != 0 {
@@ -40,6 +51,11 @@ func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if desired.Babel == nil {
+		if err := cleanupDisabledBabelState(); err != nil {
+			return err
+		}
 	}
 	if err := rejectForeignTableState(desired); err != nil {
 		return err
@@ -75,7 +91,7 @@ func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := applyBootstrapLink(client, item); err != nil {
+		if err := b.applyBootstrapLink(client, item); err != nil {
 			return fmt.Errorf("peer %q: %w", item.PeerName, err)
 		}
 	}
@@ -95,6 +111,28 @@ func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState
 	}
 	if err := cleanupLinkRoutes(desired, desiredLinks); err != nil {
 		return err
+	}
+	return nil
+}
+
+func cleanupDisabledBabelState() error {
+	routes, err := routesByProtocol(netlink.RouteProtocol(reconcile.BabelDynamicProtocol))
+	if err != nil {
+		return err
+	}
+	for i := range routes {
+		if err := netlink.RouteDel(&routes[i]); err != nil {
+			return fmt.Errorf("delete disabled Babel route %s from table %d: %w", routeDestination(routes[i]), routes[i].Table, err)
+		}
+	}
+	rules, err := rulesByProtocol(uint8(reconcile.BabelDynamicProtocol))
+	if err != nil {
+		return err
+	}
+	for i := range rules {
+		if err := netlink.RuleDel(&rules[i]); err != nil {
+			return fmt.Errorf("delete disabled Babel rule priority %d table %d: %w", rules[i].Priority, rules[i].Table, err)
+		}
 	}
 	return nil
 }
@@ -446,19 +484,9 @@ func rejectForeignTableState(desired *reconcile.DesiredState) error {
 			return err
 		}
 		for _, route := range routes {
-			if route.Protocol != StaticProtocol && route.Protocol != LinkProtocol {
+			babelOwned := desired.Babel != nil && route.Protocol == netlink.RouteProtocol(desired.Babel.Protocol)
+			if route.Protocol != StaticProtocol && route.Protocol != LinkProtocol && !babelOwned {
 				return fmt.Errorf("routing table %d contains foreign route %s with protocol %d", table, routeDestination(route), route.Protocol)
-			}
-		}
-	}
-	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		rules, err := netlink.RuleList(family)
-		if err != nil {
-			return fmt.Errorf("list family %d rules: %w", family, err)
-		}
-		for _, rule := range rules {
-			if _, managed := tables[rule.Table]; managed && rule.Protocol != uint8(StaticProtocol) {
-				return fmt.Errorf("routing table %d is selected by foreign rule priority %d protocol %d", rule.Table, rule.Priority, rule.Protocol)
 			}
 		}
 	}
@@ -747,7 +775,7 @@ func deleteLegacyMainPeerRoutes(linkIndex int, loopbackPool netip.Prefix, wanted
 	return nil
 }
 
-func applyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) error {
+func (b *Backend) applyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) error {
 	device, err := ensureOwnedWireGuardInterface(desired.InterfaceName, desired.OwnerAlias)
 	if err != nil {
 		return err
@@ -758,10 +786,6 @@ func applyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) error
 	if err := netlink.LinkSetUp(device); err != nil {
 		return fmt.Errorf("set interface up: %w", err)
 	}
-	endpoint, err := net.ResolveUDPAddr("udp", desired.Endpoints[0])
-	if err != nil {
-		return fmt.Errorf("resolve endpoint %q: %w", desired.Endpoints[0], err)
-	}
 	current, err := client.Device(desired.InterfaceName)
 	if err != nil {
 		return fmt.Errorf("read current WireGuard device: %w", err)
@@ -770,6 +794,14 @@ func applyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) error
 	for _, existing := range current.Peers {
 		if existing.PublicKey != desired.PeerPublicKey {
 			peers = append(peers, wgtypes.PeerConfig{PublicKey: existing.PublicKey, Remove: true})
+		}
+	}
+	endpointIndex, changeEndpoint := b.endpointChoice(desired, current)
+	var endpoint *net.UDPAddr
+	if changeEndpoint {
+		endpoint, err = net.ResolveUDPAddr("udp", desired.Endpoints[endpointIndex])
+		if err != nil {
+			return fmt.Errorf("resolve endpoint %q: %w", desired.Endpoints[endpointIndex], err)
 		}
 	}
 	peer := wgtypes.PeerConfig{PublicKey: desired.PeerPublicKey, PresharedKey: &desired.PresharedKey, Endpoint: endpoint, ReplaceAllowedIPs: true, AllowedIPs: defaultAllowedIPs()}
@@ -782,6 +814,57 @@ func applyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) error
 		return fmt.Errorf("configure WireGuard device: %w", err)
 	}
 	return nil
+}
+
+func (b *Backend) endpointChoice(desired reconcile.LinkPlan, current *wgtypes.Device) (int, bool) {
+	now := time.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	attempt, exists := b.attempts[desired.InterfaceName]
+	currentMatches := len(current.Peers) == 1 && current.Peers[0].PublicKey == desired.PeerPublicKey
+	changeEndpoint := !currentMatches || current.Peers[0].Endpoint == nil
+	if !exists || attempt.index >= len(desired.Endpoints) {
+		attempt = endpointAttempt{since: now}
+		if currentMatches && current.Peers[0].Endpoint != nil {
+			matched := false
+			for index, raw := range desired.Endpoints {
+				resolved, err := net.ResolveUDPAddr("udp", raw)
+				if err == nil && resolved.String() == current.Peers[0].Endpoint.String() {
+					attempt.index = index
+					matched = true
+					break
+				}
+			}
+			// A fresh endpoint outside the configured list may be WireGuard's
+			// authenticated endpoint roaming. Preserve it rather than resetting
+			// every reconciliation pass.
+			if !matched && !current.Peers[0].LastHandshakeTime.IsZero() && now.Sub(current.Peers[0].LastHandshakeTime) < 3*time.Minute {
+				changeEndpoint = false
+			} else if !matched {
+				changeEndpoint = true
+			}
+		}
+	}
+	if currentMatches {
+		handshake := current.Peers[0].LastHandshakeTime
+		if handshake.After(attempt.lastHandshake) {
+			attempt.lastHandshake = handshake
+			attempt.since = now
+		}
+	}
+	attemptThreshold := 15 * time.Second
+	staleThreshold := 3 * time.Minute
+	if desired.Keepalive != nil && *desired.Keepalive*3 > staleThreshold {
+		staleThreshold = *desired.Keepalive * 3
+	}
+	stale := attempt.lastHandshake.IsZero() || now.Sub(attempt.lastHandshake) >= staleThreshold
+	if len(desired.Endpoints) > 1 && now.Sub(attempt.since) >= attemptThreshold && stale {
+		attempt.index = (attempt.index + 1) % len(desired.Endpoints)
+		attempt.since = now
+		changeEndpoint = true
+	}
+	b.attempts[desired.InterfaceName] = attempt
+	return attempt.index, changeEndpoint
 }
 
 func verifyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) error {
