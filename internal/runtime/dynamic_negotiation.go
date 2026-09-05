@@ -2,9 +2,12 @@ package runtime
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net/netip"
 	"time"
 
+	"github.com/velvet-fabric/velvet-fabric/internal/inference"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/engine"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
@@ -12,11 +15,11 @@ import (
 )
 
 func (d *dynamicRuntime) startOutbound(session *engine.Session) error {
-	attempt, observation, err := d.prepareOutbound(session)
+	attempt, candidate, err := d.prepareOutbound(session)
 	if err != nil || attempt == nil {
 		return err
 	}
-	if err := session.Send(dynamicLinkMessage(message.DynamicLinkPropose, attempt, observation)); err != nil {
+	if err := session.Send(dynamicLinkMessage(message.DynamicLinkPropose, attempt, candidate)); err != nil {
 		d.abortAttempt(attempt, "send Proposal failed")
 		return err
 	}
@@ -33,8 +36,19 @@ func (d *dynamicRuntime) startOutbound(session *engine.Session) error {
 }
 
 func (d *dynamicRuntime) prepareOutbound(session *engine.Session) (*dynamicAttempt, netip.AddrPort, error) {
+	d.resourceMu.Lock()
+	defer d.resourceMu.Unlock()
+	var cleanup *reconcile.LinkPlan
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	defer func() {
+		d.mu.Unlock()
+		if cleanup != nil {
+			d.removeInterface(*cleanup, "candidate inference failed")
+		}
+	}()
+	if d.stopped || d.ctx.Err() != nil {
+		return nil, netip.AddrPort{}, context.Canceled
+	}
 	remoteID := session.RemoteUID.UUID
 	remoteLoopback := session.RemoteLoopbackV6
 	// Reaching operational state completes UID binding. The Dynamic Link
@@ -53,8 +67,7 @@ func (d *dynamicRuntime) prepareOutbound(session *engine.Session) (*dynamicAttem
 		d.runner.log(Event{Event: "velvet-dynamic-attempt", Status: "failed", RemoteUID: remoteID.String(), Error: "dynamic Link limit reached"})
 		return nil, netip.AddrPort{}, nil
 	}
-	observation, ok := d.firstEvidenceLocked()
-	if !ok {
+	if len(d.evidence) == 0 {
 		d.runner.log(Event{Event: "velvet-dynamic-attempt", Status: "failed", RemoteUID: remoteID.String(), Error: "no Endpoint Observation"})
 		return nil, netip.AddrPort{}, nil
 	}
@@ -67,12 +80,17 @@ func (d *dynamicRuntime) prepareOutbound(session *engine.Session) (*dynamicAttem
 		d.runner.log(Event{Event: "velvet-dynamic-attempt", Status: "failed", RemoteUID: remoteID.String(), Error: err.Error()})
 		return nil, netip.AddrPort{}, nil
 	}
+	candidate, ok := inference.Baseline(d.evidence, plan.ListenPort)
+	if !ok {
+		cleanup = &plan
+		return nil, netip.AddrPort{}, errors.New("cannot infer Candidate from Endpoint Evidence")
+	}
 	attempt := &dynamicAttempt{
 		remote: remoteID, operationID: operationID, localProposal: true,
 		plan: plan, session: session, state: dynamicProposing,
 	}
 	d.attempts[remoteID] = attempt
-	return attempt, observation, nil
+	return attempt, candidate, nil
 }
 
 func (d *dynamicRuntime) handleRoutedMessage(session *engine.Session, value message.Message) error {
@@ -88,11 +106,11 @@ func (d *dynamicRuntime) handleRoutedMessage(session *engine.Session, value mess
 }
 
 func (d *dynamicRuntime) handleProposal(session *engine.Session, value message.Message) error {
-	attempt, observation := d.prepareInbound(session, value)
+	attempt, candidate := d.prepareInbound(session, value)
 	if attempt == nil {
 		return session.Send(message.Message{Type: message.DynamicLinkDecline, OperationID: value.OperationID})
 	}
-	if err := session.Send(dynamicLinkMessage(message.DynamicLinkAccept, attempt, observation)); err != nil {
+	if err := session.Send(dynamicLinkMessage(message.DynamicLinkAccept, attempt, candidate)); err != nil {
 		d.abortAttempt(attempt, "send Accept failed")
 		return err
 	}
@@ -106,6 +124,8 @@ func (d *dynamicRuntime) handleProposal(session *engine.Session, value message.M
 }
 
 func (d *dynamicRuntime) prepareInbound(session *engine.Session, value message.Message) (*dynamicAttempt, netip.AddrPort) {
+	d.resourceMu.Lock()
+	defer d.resourceMu.Unlock()
 	var cleanup *reconcile.LinkPlan
 	d.mu.Lock()
 	defer func() {
@@ -115,7 +135,7 @@ func (d *dynamicRuntime) prepareInbound(session *engine.Session, value message.M
 		}
 	}()
 	remoteID := session.RemoteUID.UUID
-	if !d.allowsInbound() || !d.candidateAllowed(value.Endpoint) || d.runner.hasDirectLink(remoteID) {
+	if d.stopped || d.ctx.Err() != nil || !d.allowsInbound() || !d.candidateAllowed(value.Endpoint) || d.runner.hasDirectLink(remoteID) {
 		return nil, netip.AddrPort{}
 	}
 	current := d.attempts[remoteID]
@@ -123,8 +143,7 @@ func (d *dynamicRuntime) prepareInbound(session *engine.Session, value message.M
 	if current == nil && !pending && len(d.attempts)+len(d.pendingCleanups) >= maxDynamicLinks {
 		return nil, netip.AddrPort{}
 	}
-	observation, ok := d.firstEvidenceLocked()
-	if !ok {
+	if len(d.evidence) == 0 {
 		return nil, netip.AddrPort{}
 	}
 
@@ -132,11 +151,14 @@ func (d *dynamicRuntime) prepareInbound(session *engine.Session, value message.M
 	if current != nil {
 		// In simultaneous proposals the smaller UUID wins. The other side keeps
 		// its reserved interface so the winning operation can reuse its ifindex.
-		if !current.localProposal || bytes.Compare(d.runner.Desired.UUID[:], remoteID[:]) < 0 {
+		if current.state != dynamicProposing || !current.localProposal || bytes.Compare(d.runner.Desired.UUID[:], remoteID[:]) < 0 {
 			return nil, netip.AddrPort{}
 		}
 		plan = current.plan
 		d.discardAttemptLocked(remoteID, current)
+	}
+	if cleanup := d.pendingCleanups[remoteID]; cleanup != nil && plan.InterfaceName == "" {
+		plan = cleanup.plan
 	}
 	d.cancelDeferredCleanupLocked(remoteID)
 	if plan.InterfaceName == "" {
@@ -145,6 +167,11 @@ func (d *dynamicRuntime) prepareInbound(session *engine.Session, value message.M
 		if err != nil {
 			return nil, netip.AddrPort{}
 		}
+	}
+	candidate, ok := inference.Baseline(d.evidence, plan.ListenPort)
+	if !ok {
+		cleanup = &plan
+		return nil, netip.AddrPort{}
 	}
 	configured, err := d.runner.Reconciler.ConfigureDynamic(
 		d.ctx, d.runner.Desired, plan, wgtypes.Key(value.WGPublicKey), value.Endpoint,
@@ -158,10 +185,12 @@ func (d *dynamicRuntime) prepareInbound(session *engine.Session, value message.M
 		plan: configured, session: session, state: dynamicAttempting,
 	}
 	d.attempts[remoteID] = attempt
-	return attempt, observation
+	return attempt, candidate
 }
 
 func (d *dynamicRuntime) handleAccept(session *engine.Session, value message.Message) error {
+	d.resourceMu.Lock()
+	defer d.resourceMu.Unlock()
 	var cleanup *reconcile.LinkPlan
 	var cleanupReason string
 	d.mu.Lock()
@@ -228,6 +257,8 @@ func (d *dynamicRuntime) isCurrentAttemptLocked(attempt *dynamicAttempt) bool {
 }
 
 func (d *dynamicRuntime) abortAttempt(attempt *dynamicAttempt, reason string) {
+	d.resourceMu.Lock()
+	defer d.resourceMu.Unlock()
 	d.mu.Lock()
 	current := d.isCurrentAttemptLocked(attempt)
 	if current {
@@ -239,10 +270,10 @@ func (d *dynamicRuntime) abortAttempt(attempt *dynamicAttempt, reason string) {
 	}
 }
 
-func dynamicLinkMessage(kind message.Type, attempt *dynamicAttempt, observation netip.AddrPort) message.Message {
+func dynamicLinkMessage(kind message.Type, attempt *dynamicAttempt, candidate netip.AddrPort) message.Message {
 	return message.Message{
 		Type: kind, OperationID: attempt.operationID,
 		WGPublicKey: [32]byte(attempt.plan.PrivateKey.PublicKey()),
-		Endpoint:    netip.AddrPortFrom(observation.Addr(), uint16(attempt.plan.ListenPort)),
+		Endpoint:    candidate,
 	}
 }

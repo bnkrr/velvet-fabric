@@ -15,12 +15,12 @@ import (
 )
 
 func (r *Runner) serveSession(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, once *sync.Once, established chan<- struct{}) error {
-	return r.serveLinkSession(ctx, conn, desired, false, 0, func(engine.Result) {
+	return r.serveLinkSession(ctx, conn, desired, nil, 0, func(engine.Result) {
 		once.Do(func() { established <- struct{}{} })
 	})
 }
 
-func (r *Runner) serveLinkSession(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, dynamic bool, timeout time.Duration, onCommit func(engine.Result)) error {
+func (r *Runner) serveLinkSession(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, attempt *dynamicAttempt, timeout time.Duration, onCommit func(engine.Result)) error {
 	protocol := engine.New(engine.Config{
 		Context:         engine.LinkBoundSession,
 		LocalUID:        message.UID{UUID: r.Desired.UUID, Name: r.Desired.UID.Name},
@@ -38,14 +38,17 @@ func (r *Runner) serveLinkSession(ctx context.Context, conn net.Conn, desired re
 			return r.Reconciler.ProposalAvailable(ctx, desired, proposal, localAddresses)
 		},
 		Commit: func(result engine.Result) error {
-			return r.commitLink(ctx, desired, dynamic, result, onCommit)
+			if attempt != nil {
+				return r.dynamic.commitLink(ctx, attempt, result)
+			}
+			return r.commitLink(ctx, desired, false, result, onCommit)
 		},
 		Operational: func(session *engine.Session) error {
 			return r.startEndpointObserver(session, desired.InterfaceName)
 		},
 		OperationalMessage: func(_ *engine.Session, value message.Message) error {
 			if value.Type == message.EndpointObservation {
-				r.dynamic.setEvidence(desired.InterfaceName, value.Endpoint)
+				return r.recordEndpointEvidence(ctx, desired.InterfaceName, value.Endpoint)
 			}
 			return nil
 		},
@@ -55,6 +58,19 @@ func (r *Runner) serveLinkSession(ctx context.Context, conn net.Conn, desired re
 		EstablishmentTimeout: timeout,
 	})
 	return protocol.Run(ctx, conn)
+}
+
+func (r *Runner) recordEndpointEvidence(ctx context.Context, interfaceName string, endpoint netip.AddrPort) error {
+	r.dynamic.resourceMu.Lock()
+	defer r.dynamic.resourceMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	port, err := r.Reconciler.ListenPort(ctx, interfaceName)
+	if err != nil {
+		return err
+	}
+	return r.dynamic.setEvidence(interfaceName, port, endpoint)
 }
 
 func (r *Runner) commitLink(ctx context.Context, desired reconcile.LinkPlan, dynamic bool, result engine.Result, onCommit func(engine.Result)) error {

@@ -182,14 +182,24 @@ func TestDynamicPolicyEvidenceAndReservation(t *testing.T) {
 	if !dynamic.candidateAllowed(netip.MustParseAddrPort("198.51.100.7:5000")) || dynamic.candidateAllowed(netip.MustParseAddrPort("203.0.113.7:5000")) {
 		t.Fatal("candidate policy returned the wrong result")
 	}
-	dynamic.setEvidence("vl-a", netip.MustParseAddrPort("198.51.100.1:1"))
-	dynamic.setEvidence("vl-b", netip.MustParseAddrPort("198.51.100.2:2"))
-	dynamic.setEvidence("vl-a", netip.MustParseAddrPort("198.51.100.3:3"))
+	for _, item := range []struct {
+		link      string
+		localPort int
+		observed  netip.AddrPort
+	}{
+		{"vl-a", 51001, netip.MustParseAddrPort("198.51.100.1:1")},
+		{"vl-b", 51002, netip.MustParseAddrPort("198.51.100.2:2")},
+		{"vl-a", 51003, netip.MustParseAddrPort("198.51.100.3:3")},
+	} {
+		if err := dynamic.setEvidence(item.link, item.localPort, item.observed); err != nil {
+			t.Fatal(err)
+		}
+	}
 	dynamic.mu.Lock()
-	first, ok := dynamic.firstEvidenceLocked()
+	first := dynamic.evidence[0]
 	dynamic.mu.Unlock()
-	if !ok || first != netip.MustParseAddrPort("198.51.100.3:3") {
-		t.Fatalf("first evidence = %s, %v", first, ok)
+	if first.Link != "vl-a" || first.LocalListenPort != 51003 || first.ObservedEndpoint != netip.MustParseAddrPort("198.51.100.3:3") {
+		t.Fatalf("first evidence = %#v", first)
 	}
 	dynamic.mu.Lock()
 	dynamic.removeEvidenceLocked("vl-a")
@@ -212,16 +222,20 @@ func TestDynamicPolicyEvidenceAndReservation(t *testing.T) {
 func TestDynamicAttemptCommitAndUtilities(t *testing.T) {
 	remote := uuid.MustParse("20000000-0000-4000-8000-000000000002")
 	var events []Event
-	runner := &Runner{Desired: &reconcile.DesiredState{}, Log: func(event Event) { events = append(events, event) }}
+	runner := &Runner{Desired: &reconcile.DesiredState{}, Reconciler: reconcile.New(&runtimeBackend{}), states: make(map[string]materializedState), Log: func(event Event) { events = append(events, event) }}
 	dynamic := newDynamicRuntime(runner)
 	attempt := &dynamicAttempt{remote: remote, state: dynamicAttempting}
 	dynamic.attempts[remote] = attempt
-	dynamic.commitAttempt(attempt, engine.Result{RemoteUID: message.UID{UUID: remote}})
-	if attempt.state != dynamicUp || len(events) != 1 || events[0].Status != "up" {
+	if err := dynamic.commitLink(context.Background(), attempt, engine.Result{RemoteUID: message.UID{UUID: remote}}); err != nil {
+		t.Fatal(err)
+	}
+	if attempt.state != dynamicUp || len(events) != 2 || events[1].Status != "up" {
 		t.Fatalf("first commit: attempt=%#v events=%#v", attempt, events)
 	}
 	attempt.state = dynamicRecovering
-	dynamic.commitAttempt(attempt, engine.Result{RemoteUID: message.UID{UUID: remote}})
+	if err := dynamic.commitLink(context.Background(), attempt, engine.Result{RemoteUID: message.UID{UUID: remote}}); err != nil {
+		t.Fatal(err)
+	}
 	if events[len(events)-1].Status != "recovered" {
 		t.Fatalf("recovery event = %#v", events[len(events)-1])
 	}
@@ -299,6 +313,12 @@ func TestRunnerSignalsAndWaits(t *testing.T) {
 }
 
 type runtimeBackend struct {
+	prepared      int
+	configured    int
+	listenPort    int
+	listenPortErr error
+	prepareCalled chan struct{}
+
 	reachable      []netip.Addr
 	removed        []reconcile.LinkPlan
 	reconciles     int
@@ -325,9 +345,20 @@ func (b *runtimeBackend) Materialize(context.Context, *reconcile.DesiredState, r
 	return b.materializeErr
 }
 func (b *runtimeBackend) PrepareDynamic(_ context.Context, plan reconcile.LinkPlan) (reconcile.LinkPlan, error) {
+	b.prepared++
+	if b.prepareCalled != nil {
+		b.prepareCalled <- struct{}{}
+	}
+	plan.ListenPort = 53000
 	return plan, nil
 }
-func (b *runtimeBackend) ConfigureDynamic(context.Context, reconcile.LinkPlan) error { return nil }
+func (b *runtimeBackend) ConfigureDynamic(context.Context, reconcile.LinkPlan) error {
+	b.configured++
+	return nil
+}
+func (b *runtimeBackend) ListenPort(context.Context, string) (int, error) {
+	return b.listenPort, b.listenPortErr
+}
 func (b *runtimeBackend) RemoveDynamic(_ context.Context, plan reconcile.LinkPlan) error {
 	if b.removeStarted != nil {
 		close(b.removeStarted)

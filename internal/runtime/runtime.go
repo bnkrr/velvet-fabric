@@ -78,18 +78,23 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		r.signalReady(err)
 		return err
 	}
-	defer r.dynamic.stop()
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		workers.Wait()
+		r.dynamic.stop()
+	}()
 	r.signalReady(nil)
 
 	established := make(chan struct{}, len(r.Desired.Links))
 	for _, plan := range r.Desired.Links {
-		go r.runLink(ctx, plan, established)
+		workers.Go(func() { r.runLink(ctx, plan, established) })
 	}
 	if once {
 		return waitForLinks(ctx, established, len(r.Desired.Links))
 	}
 	if r.Interval > 0 {
-		go r.maintain(ctx)
+		workers.Go(func() { r.maintain(ctx) })
 	}
 	select {
 	case <-ctx.Done():
@@ -202,11 +207,18 @@ func (r *Runner) maintain(ctx context.Context) {
 				r.log(Event{Event: "velvet-reconcile", Status: "failed", NodeUID: r.Desired.UUID.String(), Error: err.Error()})
 				continue
 			}
-			for _, state := range r.materializedStates() {
-				if err := r.Reconciler.Materialize(ctx, r.Desired, state.desired, state.local, state.peers); err != nil {
-					r.log(Event{Event: "velvet-reconcile", Status: "failed", Peer: state.desired.PeerName, Interface: state.desired.InterfaceName, Error: err.Error()})
-				}
-			}
+			r.maintainMaterialized(ctx)
+		}
+	}
+}
+
+func (r *Runner) maintainMaterialized(ctx context.Context) {
+	// A snapshot must not outlive Dynamic-Link deletion and interface reuse.
+	r.dynamic.resourceMu.Lock()
+	defer r.dynamic.resourceMu.Unlock()
+	for _, state := range r.materializedStates() {
+		if err := r.Reconciler.Materialize(ctx, r.Desired, state.desired, state.local, state.peers); err != nil {
+			r.log(Event{Event: "velvet-reconcile", Status: "failed", Peer: state.desired.PeerName, Interface: state.desired.InterfaceName, Error: err.Error()})
 		}
 	}
 }

@@ -19,6 +19,7 @@ type Backend interface {
 	ConfigureDynamic(context.Context, LinkPlan) error
 	RemoveDynamic(context.Context, LinkPlan) error
 	ObservedEndpoint(context.Context, string) (netip.AddrPort, bool, error)
+	ListenPort(context.Context, string) (int, error)
 	ReachableLoopbacks(context.Context, int, netip.Prefix) ([]netip.Addr, error)
 }
 
@@ -86,6 +87,10 @@ func (r *Reconciler) RemoveDynamic(ctx context.Context, plan LinkPlan) error {
 
 func (r *Reconciler) ObservedEndpoint(ctx context.Context, interfaceName string) (netip.AddrPort, bool, error) {
 	return r.backend.ObservedEndpoint(ctx, interfaceName)
+}
+
+func (r *Reconciler) ListenPort(ctx context.Context, interfaceName string) (int, error) {
+	return r.backend.ListenPort(ctx, interfaceName)
 }
 
 func (r *Reconciler) ReachableLoopbacks(ctx context.Context, state *DesiredState) ([]netip.Addr, error) {

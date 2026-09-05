@@ -275,13 +275,14 @@ omitting the section is equivalent to `off`. The allow-list checks only the IP
 of the Candidate supplied by the remote node.
 
 For each target, the current implementation makes one attempt per effective
-configuration generation. It takes the IP from the first available Endpoint
-Observation, substitutes the ephemeral listen port reserved for the new
-WireGuard interface, and exchanges both endpoints and public keys over routed
-VFP. The tentative Link is committed only after the regular link-local VFP
-establishment succeeds. Failure deletes tentative state and leaves the existing
-routed path in service; this release does not retry automatically or implement
-general NAT traversal.
+configuration generation. Evidence records the carrying Link's actual local
+WireGuard listen port together with the endpoint observed by its peer. The
+baseline inference profile takes the IP from the first available Evidence,
+substitutes the ephemeral listen port reserved for the new WireGuard interface,
+and exchanges both endpoints and public keys over routed VFP. The tentative
+Link is committed only after the regular link-local VFP establishment succeeds.
+Failure deletes tentative state and leaves the existing routed path in service;
+this release does not retry automatically or implement general NAT traversal.
 
 Dynamic interfaces are locally named `vdl-<remote-name>-<uuid-prefix4>` (or
 `vdl-<uuid-prefix4>` without a remote name). They are runtime state, survive an

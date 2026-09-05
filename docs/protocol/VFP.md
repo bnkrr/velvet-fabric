@@ -800,10 +800,13 @@ the current value again. A receiver synchronously replaces the Evidence entry
 for the carrying Link before processing a later frame. An inability to retain
 that fixed-size entry fails the session.
 
-Evidence is keyed by the direct Link, not the transient TCP session. Session
-failure does not expire it; deleting the Link deletes its Evidence. A stale
-Observation is only an input to inference, and direct connectivity validation
-remains authoritative.
+Evidence is keyed by the direct Link, not the transient TCP session. Each
+entry associates the received Observation with the actual local WireGuard
+listen port of that carrying Link at receipt time, forming the local mapping
+`(Link, Local Listen Port, Observed Endpoint)`. The listen port is already
+known locally and is not carried in the Observation. Session failure does not
+expire Evidence; deleting the Link deletes it. A stale Observation is only an
+input to inference, and direct connectivity validation remains authoritative.
 
 ### 8.11 Baseline discovery, selection, and inference
 
@@ -826,9 +829,10 @@ Version 1's baseline Endpoint Inference algorithm chooses the first locally
 available Endpoint Observation in stable Evidence-store order. Given
 Observation `A:old_port` and the actual listen port `P` reserved for the new
 WireGuard interface, it returns exactly one Candidate `A:P`. It preserves the
-observed IP address and discards the observed port. With no Observation it
-cannot propose or accept an Attempt. The protocol carries no Candidate
-priority, confidence, source, or NAT classification.
+observed IP address and does not use either port from the Evidence mapping.
+The complete mapping remains available to other inference profiles. With no
+Evidence it cannot propose or accept an Attempt. The protocol carries no
+Candidate priority, confidence, source, or NAT classification.
 
 The current automatic profile is one-shot after Node UID binding: an active
 node makes at most one Dynamic-Link decision for each reachable remote `/128`
