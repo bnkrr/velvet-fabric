@@ -10,6 +10,7 @@ import sys
 
 RUNTIME = Path(sys.argv[1])
 BABEL_RS = sys.argv[2]
+DYNAMIC_LINKS = len(sys.argv) > 3 and sys.argv[3] == "dynamic-links"
 
 NODES = {
     "ea": {"index": 1, "underlay": "192.0.2.11"},
@@ -134,6 +135,14 @@ for node, metadata in NODES.items():
         "babel": {"enabled": True, "executable": BABEL_RS},
         "domains": domains,
     }
+    if DYNAMIC_LINKS:
+        value["dynamic_links"] = {
+            # Keep one node passive: all seven active peers must still create
+            # their half of its Links, while active/active pairs exercise the
+            # simultaneous-Proposal arbitration path.
+            "mode": "passive" if node == "xc" else "active",
+            "allow_candidate_prefixes": ["192.0.2.0/24"],
+        }
     (RUNTIME / f"{node}.json").write_text(
         json.dumps(value, indent=2) + "\n", encoding="utf-8"
     )

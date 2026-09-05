@@ -211,6 +211,55 @@ func TestBabelSectionRequiresEnabledAndAbsoluteExecutable(t *testing.T) {
 	}
 }
 
+func TestDynamicLinksSectionValidation(t *testing.T) {
+	value := validSpec(t)
+	value.DynamicLinks = &DynamicLinksSpec{}
+	if err := value.Validate(); err == nil {
+		t.Fatal("dynamic_links without mode was accepted")
+	}
+	value.DynamicLinks.Mode = DynamicLinksActive
+	if err := value.Validate(); err == nil {
+		t.Fatal("active dynamic_links without candidate prefixes was accepted")
+	}
+	value.DynamicLinks.AllowCandidatePrefixes = []string{"0.0.0.0/0", "::/0"}
+	if err := value.Validate(); err != nil {
+		t.Fatalf("valid active dynamic_links rejected: %v", err)
+	}
+	value.DynamicLinks.Mode = DynamicLinksPassive
+	if err := value.Validate(); err != nil {
+		t.Fatalf("valid passive dynamic_links rejected: %v", err)
+	}
+	value.DynamicLinks = &DynamicLinksSpec{Mode: DynamicLinksOff}
+	if err := value.Validate(); err != nil {
+		t.Fatalf("off dynamic_links rejected: %v", err)
+	}
+	value.DynamicLinks = &DynamicLinksSpec{Mode: "automatic", AllowCandidatePrefixes: []string{"192.0.2.1/24"}}
+	if err := value.Validate(); err == nil {
+		t.Fatal("invalid mode and non-canonical candidate prefix were accepted")
+	}
+}
+
+func TestDomainTableMustFollowFabricDestinationRules(t *testing.T) {
+	value := validSpec(t)
+	value.Domains = map[string]DomainSpec{
+		"production": {TableID: 19000, SourcePrefixes: []string{"10.0.0.0/8"}},
+	}
+	if err := value.Validate(); err == nil {
+		t.Fatal("domain table before Fabric table was accepted")
+	}
+}
+
+func TestDynamicInterfaceName(t *testing.T) {
+	withName := NodeUID{Name: "srv1", UUID: "a13f0000-0000-4000-8000-000000000001"}
+	if got := DynamicInterfaceName(withName); got != "vdl-srv1-a13f" {
+		t.Fatalf("dynamic interface name = %q", got)
+	}
+	withName.Name = ""
+	if got := DynamicInterfaceName(withName); got != "vdl-a13f" {
+		t.Fatalf("unnamed dynamic interface name = %q", got)
+	}
+}
+
 func validSpec(t *testing.T) NodeSpec {
 	t.Helper()
 	privateKey, err := wgtypes.GeneratePrivateKey()

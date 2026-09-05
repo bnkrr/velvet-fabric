@@ -172,6 +172,10 @@ func deriveWGLinkPSK(fabricPSK []byte, a, b wgtypes.Key) (wgtypes.Key, error) {
 	return result, nil
 }
 
+func DeriveWGLinkPSK(fabricPSK []byte, a, b wgtypes.Key) (wgtypes.Key, error) {
+	return deriveWGLinkPSK(fabricPSK, a, b)
+}
+
 func digest(key []byte, values ...[]byte) [32]byte {
 	mac := hmac.New(sha256.New, key)
 	for _, value := range values {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -103,7 +104,7 @@ func main() {
 		statusMu.RUnlock()
 		if active != nil {
 			value.Runtime = active.runner.Status()
-			if value.Runtime.EstablishedLinks != value.Runtime.ConfiguredLinks || (value.Runtime.Babel != nil && (value.Runtime.Babel.State != "running" || value.Runtime.Babel.AttachedInterfaces != value.Runtime.ConfiguredLinks)) {
+			if value.Runtime.EstablishedLinks != value.Runtime.ConfiguredLinks || (value.Runtime.Babel != nil && value.Runtime.Babel.State != "running") {
 				value.Ready = false
 			}
 		}
@@ -241,6 +242,10 @@ func reload(ctx context.Context, path string, active *running, interval time.Dur
 		err = errors.New("node.uid.uuid cannot change during reload")
 		setStatus(func(value *daemonStatus) { value.LastReloadError = err.Error() })
 		return active, err
+	}
+	if reflect.DeepEqual(candidate, active.desired) {
+		setStatus(func(value *daemonStatus) { value.LastReloadError = "" })
+		return active, nil
 	}
 	setStatus(func(value *daemonStatus) { value.Ready = false })
 	stopRunner(active)

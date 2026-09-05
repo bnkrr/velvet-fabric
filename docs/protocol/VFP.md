@@ -4,7 +4,7 @@
 
 Status: Version 1 protocol specification
 Wire version: 1
-Last updated: 2026-08-29
+Last updated: 2026-09-05
 
 ## Abstract
 
@@ -12,18 +12,16 @@ The Velvet Fabric Protocol (VFP) is the inter-node control protocol used by
 `velvetd` instances belonging to one Fabric. It provides one extensible
 protocol framework for the distributed control operations of the Fabric.
 
-The first implementation phase only needs the information exchange required
-after a statically configured WireGuard Link has been created. Later revisions
-may add dynamic Link establishment and other Fabric-specific distributed
-control operations. Those later functions MUST NOT be predesigned as generic
-RPC calls or encoded before their state machines are understood. Dynamic route
-exchange is deliberately separate: Velvet uses the standard Babel protocol
-over the Link rather than defining VFP route messages.
+Version 1 supports both the information exchange required after a statically
+configured WireGuard Link has been created and the establishment of additional
+Dynamic Links over an already routed Fabric. New functions MUST NOT be
+predesigned as generic RPC calls or encoded before their state machines are
+understood. Dynamic route exchange is deliberately separate: Velvet uses the
+standard Babel protocol over the Link rather than defining VFP route messages.
 
 This document defines the agreed protocol boundary, framing and parsing model,
-extension rules, error handling, and the initial static-Link message set.
-Dynamic-Link messages remain outside the current revision; route exchange is
-outside VFP in every revision covered by this specification.
+extension rules, error handling, static-Link establishment, Endpoint
+Observation, and Dynamic-Link establishment. Route exchange is outside VFP.
 
 ## 1. Status and Requirements Language
 
@@ -43,13 +41,13 @@ Multi-octet integers use network byte order.
 
 ### 2.1 Protocol purpose
 
-VFP carries distributed control information between `velvetd` nodes. Its
-eventual scope may include:
+VFP carries distributed control information between `velvetd` nodes. Version
+1 includes:
 
 - session establishment and peer identity;
 - node resources, including a node loopback address;
 - Link address negotiation and Link state changes;
-- control information required to establish a dynamic Link.
+- control information required to establish a Dynamic Link.
 
 This is one protocol with multiple well-bounded exchanges. A Message Type
 identifies a protocol action or state-machine event. TLVs carry the data needed
@@ -79,9 +77,8 @@ The intended delivery order is:
 3. dynamic routes;
 4. dynamic Links.
 
-Version 1 defines only phase 1 business messages while keeping the framing
-usable by later Fabric-specific control phases. Phase 3 does not add VFP route
-messages.
+Version 1 defines phases 1 and 4 business messages. Phases 2 and 3 do not add
+VFP route messages.
 
 ## 3. Terminology
 
@@ -112,6 +109,24 @@ messages.
 **TLV**
 : A typed value carried in a frame body.
 
+**Dynamic Link**
+: A Link created at runtime by the Dynamic-Link procedure rather than declared
+  as a static Peer in local configuration.
+
+**Endpoint Evidence**
+: Locally held information from which an Endpoint Candidate can be inferred.
+  Evidence does not assert that the resulting endpoint is reachable.
+
+**Endpoint Observation**
+: Endpoint Evidence reported by a direct peer that observed the receiving
+  node's WireGuard underlay endpoint on their existing Link.
+
+**Endpoint Candidate**
+: An underlay UDP endpoint proposed for one side of a Link Attempt.
+
+**Link Attempt**
+: One finite attempt by a pair of nodes to establish a Dynamic Link.
+
 **Schema**
 : The rules for a Message Type in a particular protocol state: which TLVs are
   understood, their cardinality, and how selected values are interpreted.
@@ -132,9 +147,11 @@ configured WireGuard Link using discovered scoped link-local addresses. This
 allows VFP to operate before any routed Fabric path exists. Section 4.2
 specifies the discovery exchange.
 
-A later dynamic-Link phase may signal over an existing routed Fabric path,
-most likely using node loopback reachability. The exact transport selection and
-fallback behavior for that phase are TBD.
+Dynamic-Link signalling uses a routed VFP session: TCP is opened from the local
+node loopback to the target node loopback through an already working Fabric
+path. A routed session uses the same effective VFP port and common framing as a
+link-bound session. The transport context, rather than a wire field,
+distinguishes the two session kinds.
 
 ### 4.2 Static-Link discovery
 
@@ -191,10 +208,13 @@ session failure or interface reactivation.
 After learning the actual remote source address, both endpoints compare the
 two IPv6 addresses as unsigned 128-bit integers. The endpoint with the lower
 address initiates TCP and the endpoint with the higher address accepts. Both
-endpoints listen before sending Hello. A node rejects an accepted TCP
-connection until it has received a valid Hello from the same source address.
-Equal addresses are a collision and no VFP session is established. Address
-ordering selects one TCP role only; it is never used to predict an address.
+endpoints listen before sending Hello. A node accepts TCP only when its source
+is an IPv6 link-local address scoped to the expected Link and address ordering
+assigns the remote endpoint the dialling role. Receipt of the peer's Hello need
+not win a scheduling race with TCP accept: the scoped link-local source is
+sufficient return-address evidence on this point-to-point Link. Equal
+addresses are a collision and no VFP session is established. Address ordering
+selects one TCP role only; it is never used to predict an address.
 
 Discovery framing has its own version. Its version changes do not change the
 VFP/TCP frame Version defined in Section 5.
@@ -213,8 +233,12 @@ different WireGuard public keys, as required for WireGuard to configure each
 endpoint's remote peer. Reusing a public key on different dedicated Link
 interfaces is outside VFP identity semantics.
 
-Authentication for a future VFP session reached through a routed path is TBD
-and MUST be designed together with the dynamic-Link threat model.
+Version 1 treats all Fabric nodes as mutually trusted. A routed VFP session is
+protected hop by hop by the existing Fabric Links, but VFP adds no end-to-end
+authentication, confidentiality, integrity, or replay protection. Matching the
+peer's `NODE_STATE` loopback to the routed target is an internal consistency
+check, not cryptographic authentication. Deployments that do not trust every
+Fabric member MUST NOT enable version-1 Dynamic Links.
 
 ### 4.4 Protocol state
 
@@ -401,8 +425,8 @@ receiver MUST NOT depend on TLV order except when selecting the first
 
 ## 8. Protocol Fields and Business Messages
 
-This section defines the version-1 static-Link business messages and their
-numeric code points.
+This section defines all version-1 business messages and their numeric code
+points.
 
 ### 8.1 Message Type registry
 
@@ -412,11 +436,16 @@ numeric code points.
 | `0x02` | `NODE_STATE` | Publish the sending node's IPv6 loopback |
 | `0x03` | `LINK_PROPOSE` | Propose a complete replacement Link-address set |
 | `0x04` | `LINK_ACCEPT` | Accept the one currently outstanding Link proposal |
+| `0x05` | `ENDPOINT_OBSERVATION` | Report the receiving node's endpoint as observed on a direct Link |
+| `0x06` | `DYNAMIC_LINK_PROPOSE` | Propose one Dynamic-Link operation and the initiator's parameters |
+| `0x07` | `DYNAMIC_LINK_ACCEPT` | Accept an operation and return the acceptor's parameters |
+| `0x08` | `DYNAMIC_LINK_DECLINE` | Decline participation in one Dynamic-Link operation |
 
-There is no `OPEN_ACK`, `LINK_REJECT`, generic result, or generic error Message
-Type. A valid peer `OPEN` completes the opening exchange. A counterproposal
-implicitly rejects and replaces the previous proposal. `LINK_ACCEPT` refers to
-the single outstanding proposal held by session state.
+There is no `OPEN_ACK`, `LINK_REJECT`, Dynamic-Link success/failure, generic
+result, or generic error Message Type. A valid peer `OPEN` completes the
+opening exchange. A static counterproposal implicitly rejects and replaces the
+previous proposal. `LINK_ACCEPT` refers to the single outstanding static
+proposal held by session state.
 
 ### 8.2 TLV Type registry
 
@@ -427,6 +456,10 @@ the single outstanding proposal held by session state.
 | `0x0003` | `LOOPBACK_V6` | 16 | Node-owned IPv6 loopback address; `/128` is implicit |
 | `0x0004` | `LINK_PREFIX_V4` | 4 | Network address of a proposed point-to-point IPv4 `/30` |
 | `0x0005` | `LINK_PREFIX_V6` | 16 | Network address of a proposed point-to-point IPv6 `/126` |
+| `0x0006` | `OPERATION_ID` | 16 | Opaque identifier correlating one operation's messages |
+| `0x0007` | `WG_PUBLIC_KEY` | 32 | Sender's WireGuard public key for one Link Attempt |
+| `0x0008` | `WG_ENDPOINT` | 8 or 20 | A WireGuard underlay endpoint whose role is defined by the Message Type |
+| `0x0009` | Reserved | — | Not used by version 1 |
 
 The following subsections define the complete value syntax. Addresses are
 encoded as network-order octets without text, address-family, or prefix-length
@@ -458,8 +491,10 @@ participate in UUID equality or ordering. Changing only the name does not
 change Node identity.
 
 A node normally generates and persists its own UUID. Peer configuration does
-not contain an expected remote UUID. The remote UID is learned from `OPEN`
-inside the already authenticated WireGuard Link.
+not contain an expected remote UUID. The remote UID is learned from `OPEN`.
+On a link-bound session, the surrounding configured WireGuard Link provides
+the security context. On a routed session, version 1 accepts the assertion
+under the all-Fabric-members-trusted model in Section 4.3.
 
 #### 8.2.2 `LOOPBACK_V6`
 
@@ -493,6 +528,50 @@ network address plus two. The prefix itself MUST be contained by the
 configured Fabric IPv6 Link prefix. An endpoint with no configured IPv6 Link
 prefix does not propose an automatically derived IPv6 prefix.
 
+#### 8.2.5 `OPERATION_ID`
+
+The value is exactly 16 opaque octets. It is not required to be a UUID and
+carries no time, sequence, or operation-type semantics. An initiator MUST use a
+value distinct from its other operations that may still be active. A responder
+compares the value for equality and copies it unchanged into its response.
+
+A Dynamic Link Attempt is identified by the initiator Node UID and
+`OPERATION_ID`. The field is carried only by Message Types whose operation
+requires correlation; it is not part of the common header.
+
+#### 8.2.6 `WG_PUBLIC_KEY`
+
+The value is exactly 32 octets containing a non-zero WireGuard Curve25519
+public key. The sender MUST possess the corresponding private key. VFP does not
+require whether the key pair is per-site, per-Link, or temporary. The field is
+a parameter of the current Link Attempt, not Node identity.
+
+The two public keys selected for one Link MUST differ. Equal keys cannot form a
+WireGuard peer relationship and cause the Attempt to be declined or fail.
+
+#### 8.2.7 `WG_ENDPOINT`
+
+`WG_ENDPOINT` has this value syntax:
+
+```text
+Address Family (16 bits) | Port (16 bits) | Address (4 or 16 octets)
+```
+
+All integers use network byte order. Address Family uses IANA Address Family
+Numbers: IPv4 is `1` and makes an eight-octet value; IPv6 is `2` and makes a
+20-octet value. Port MUST be in `1..65535`. The address MUST be unicast and
+MUST NOT be unspecified, multicast, IPv4-mapped IPv6, IPv4 limited broadcast,
+or scoped IPv6 link-local. Private IPv4 and IPv6 ULA addresses remain valid.
+The value contains no DNS name, scope identifier, priority, NAT type, or
+inference metadata.
+
+The enclosing Message Type defines the endpoint's role. In
+`ENDPOINT_OBSERVATION`, it is the receiver endpoint observed by the sender. In
+`DYNAMIC_LINK_PROPOSE` or `DYNAMIC_LINK_ACCEPT`, it is the sender's Candidate
+that the receiver is asked to try for the current Attempt. Observation and
+Candidate remain distinct protocol concepts but do not require distinct wire
+types.
+
 ### 8.3 `OPEN`
 
 `OPEN` is the first Message Type sent by each endpoint after TCP establishment.
@@ -519,8 +598,8 @@ equal and do not affect this check.
 ### 8.4 `NODE_STATE`
 
 `NODE_STATE` publishes the sender's node-owned IPv6 loopback for the current
-session. It is sent after the opening exchange completes and before Link
-address negotiation begins.
+session. It is sent after the opening exchange completes. A link-bound session
+then begins Link-address negotiation; a routed session becomes operational.
 
 | TLV | Cardinality | Meaning |
 |---|---:|---|
@@ -529,7 +608,7 @@ address negotiation begins.
 The canonical body contains exactly one `LOOPBACK_V6`. Version 1 does not
 publish an IPv4 node loopback and defines no loopback-collision exchange.
 
-The initial static phase sends one `NODE_STATE` per session. A second
+Version 1 sends one `NODE_STATE` per session. A second
 `NODE_STATE` is invalid in the current state; future live resource updates
 require an explicitly specified state transition rather than treating this
 message as an unconstrained update container.
@@ -669,6 +748,199 @@ through VFP. Static routes remain local configuration referring to a Peer.
 Domain and Plan configuration are local, while dynamic route exchange uses
 Babel; none of these are VFP messages.
 
+### 8.9 Session contexts and operational messages
+
+Every VFP/TCP session first exchanges `OPEN` and `NODE_STATE`. The transport
+path assigns one of two local contexts; no `SESSION_TYPE` field is sent:
+
+- A **link-bound session** is established by Section 4.2 on a known direct
+  WireGuard interface. It then performs Sections 8.5 through 8.7 and, after
+  commit, accepts only `ENDPOINT_OBSERVATION` as an operational message.
+- A **routed session** is opened from one node loopback to another through an
+  already routed Fabric path. After `NODE_STATE`, it immediately becomes
+  operational and accepts only `DYNAMIC_LINK_PROPOSE`,
+  `DYNAMIC_LINK_ACCEPT`, and `DYNAMIC_LINK_DECLINE`.
+
+The initiator of a routed session MUST require the peer's `LOOPBACK_V6` to
+equal the destination loopback used for that TCP connection. Both session
+contexts reject a remote loopback outside the configured Fabric loopback
+prefix. These are consistency and scope checks, not cryptographic identity
+proofs.
+
+An operational routed session can carry Link Attempts as independent
+operations correlated by `OPERATION_ID`; the session is not placed into one
+monolithic per-Attempt state. Version 1 nevertheless permits at most one
+active Link Attempt for a given Node pair.
+
+### 8.10 `ENDPOINT_OBSERVATION`
+
+`ENDPOINT_OBSERVATION` is valid only on an operational link-bound session. It
+reports the WireGuard endpoint at which the sender currently observes the
+receiver on the Link carrying that session.
+
+| TLV | Cardinality | Meaning |
+|---|---:|---|
+| `WG_ENDPOINT` | `1` | Receiver endpoint observed by the sender |
+
+The canonical body contains exactly one `WG_ENDPOINT`. The message does
+not carry Node UID, Link ID, operation ID, timestamp, lease, or expiry: the
+established session identifies both nodes and its carrying Link.
+
+Upon entering operational state, each endpoint MUST read the carrying
+WireGuard interface's current peer endpoint. If present, it MUST immediately
+send one Observation. If absent, the initial sending obligation remains until
+the endpoint first becomes available. While the session remains operational,
+the sender MUST send a new Observation whenever the endpoint value changes and
+MUST NOT periodically repeat an unchanged value. Every replacement
+link-bound session creates a new initial sending obligation.
+
+Observation has no acknowledgement or response Message. TCP supplies reliable
+ordered delivery; a send failure fails the session, and its replacement sends
+the current value again. A receiver synchronously replaces the Evidence entry
+for the carrying Link before processing a later frame. An inability to retain
+that fixed-size entry fails the session.
+
+Evidence is keyed by the direct Link, not the transient TCP session. Session
+failure does not expire it; deleting the Link deletes its Evidence. A stale
+Observation is only an input to inference, and direct connectivity validation
+remains authoritative.
+
+### 8.11 Baseline discovery, selection, and inference
+
+Dynamic Link is an optimization over an existing routed path. VFP neither
+distributes nor computes loopback routes. Given a reachable node loopback `L`,
+a node discovers its target by connecting TCP to `[L]:VFP_PORT`, exchanging
+`OPEN` and `NODE_STATE`, and requiring the returned `LOOPBACK_V6` to equal `L`.
+The resulting Node UID identifies the peer for the lifetime of that routed
+session. A local cache MAY retain the binding as a hint, but MUST NOT replace
+the session exchange and has no protocol lease.
+
+Link selection is distributed. Local policy conceptually supplies
+`want_link(peer)`, `allow_link_from(peer)`, and
+`allow_candidate(candidate)`. Either endpoint MAY initiate. A receiver
+participates when it wants the Link or permits inbound creation, accepts the
+initiator's Candidate, has no existing direct Link to that Node, and can
+reserve the required local resources.
+
+Version 1's baseline Endpoint Inference algorithm chooses the first locally
+available Endpoint Observation in stable Evidence-store order. Given
+Observation `A:old_port` and the actual listen port `P` reserved for the new
+WireGuard interface, it returns exactly one Candidate `A:P`. It preserves the
+observed IP address and discards the observed port. With no Observation it
+cannot propose or accept an Attempt. The protocol carries no Candidate
+priority, confidence, source, or NAT classification.
+
+The current automatic profile is one-shot: an active node considers each
+reachable remote `/128` in the Fabric loopback prefix once per configuration
+generation, excluding itself and existing direct peers. Failure or Decline
+retains the routed path but creates no automatic retry in that generation.
+Passive nodes only respond; disabled nodes still send Observations on their
+existing Links but neither propose nor accept Dynamic Links.
+
+### 8.12 Dynamic-Link messages
+
+`DYNAMIC_LINK_PROPOSE` starts one Link Attempt on an operational routed
+session. Before sending it, the initiator MUST reserve its tentative
+WireGuard interface and actual listen port, freeze its local public key and
+Candidate, and choose a fresh active-operation `OPERATION_ID`.
+
+| TLV | Cardinality | Meaning |
+|---|---:|---|
+| `OPERATION_ID` | `1` | Identifier chosen by the initiator |
+| `WG_PUBLIC_KEY` | `1` | Initiator's key for this Attempt |
+| `WG_ENDPOINT` | `1` | Initiator Candidate to be tried by the acceptor |
+
+`DYNAMIC_LINK_ACCEPT` accepts the complete Proposal and supplies the
+acceptor's frozen parameters:
+
+| TLV | Cardinality | Meaning |
+|---|---:|---|
+| `OPERATION_ID` | `1` | Exact value copied from the Proposal |
+| `WG_PUBLIC_KEY` | `1` | Acceptor's key for this Attempt |
+| `WG_ENDPOINT` | `1` | Acceptor Candidate to be tried by the initiator |
+
+`DYNAMIC_LINK_DECLINE` states only that the receiver will not participate in
+this Attempt:
+
+| TLV | Cardinality | Meaning |
+|---|---:|---|
+| `OPERATION_ID` | `1` | Exact value copied from the declined Proposal |
+
+Decline carries no reason, retry delay, policy detail, or NAT classification.
+It ends the initiator's wait without closing a routed session that may carry
+other operations. A receiver sends Decline if local participation or Candidate
+policy rejects the Proposal, a direct Link already exists, resources or a
+complete local Candidate are unavailable, or the two WireGuard keys are
+equal. If an initiator rejects the Candidate returned in an otherwise valid
+Accept, it locally fails the Attempt; version 1 defines no second response.
+
+Accept and Decline MUST be sent on the routed session that carried the
+Proposal. A response whose `OPERATION_ID` is unknown, ended, or belongs to a
+different session is frame-invalid. Each Message's canonical encoding lists
+its TLVs in ascending Type order.
+
+### 8.13 Link Attempt procedure
+
+After Accept is sent or received, each endpoint configures the peer public key
+and Candidate on its tentative WireGuard interface. The Link PSK, if used, is
+derived outside VFP from Fabric state and both public keys. Link-local address
+derivation remains Section 4.2 and is not carried in Dynamic-Link messages.
+
+The tentative Link then runs the standard link-bound procedure: Discovery,
+TCP, `OPEN`, `NODE_STATE`, `LINK_PROPOSE`, and `LINK_ACCEPT`. The Attempt is
+committed only when that new link-bound session reaches operational state and
+its remote Node UID equals the routed-session target. This is both the
+WireGuard connectivity test and the bidirectional VFP test; no additional
+success Message is sent.
+
+The initiator starts a ten-second Response Timeout after completely writing
+Proposal. Receipt of its corresponding Accept or Decline stops that timer.
+The acceptor starts a 30-second Connectivity Deadline after completely
+writing Accept; the initiator starts the same deadline after validating
+Accept. These values are version-1 constants, not negotiated configuration.
+
+Before Accept completes, loss of the routed session fails the associated
+Attempt. After Accept completes, routed-session lifetime no longer controls
+it. If standard Link establishment becomes operational first, the endpoint
+cancels its deadline and commits. If the deadline wins, it removes tentative
+state and ignores a late completion. The existing routed path remains present
+throughout and therefore needs no rollback or fallback Message.
+
+Either node may initiate. If both initiate concurrently, both retain the
+Attempt whose initiator Node UUID is lexicographically smaller; the larger
+UUID node supersedes its own Attempt and participates in the smaller UUID
+node's Attempt. The losing Proposal receives Decline. Implementations MUST
+permit the winning Attempt to reuse already reserved local resources even when
+Decline and the countervailing Proposal arrive in either order.
+
+The minimal state progression is:
+
+```text
+IDLE -> PROPOSING -> ATTEMPTING -> UP
+          |              |
+          +--------------+-----> IDLE (fail, cleanup, routed path retained)
+```
+
+Version 1 sends no retransmitted Proposal on one session and defines no
+cancel, success, failure, rollback, or generic error Message. A future
+continuous `want_link` policy MAY apply bounded backoff locally, but it must
+not alter these wire messages or cause a tight retry loop.
+
+### 8.14 Dynamic-Link local resources
+
+VFP does not encode interface names. A conforming implementation MUST ensure
+that a tentative interface is not confused with another Node pair and that
+cleanup of a superseded Attempt cannot delete resources already reused by the
+winning Attempt. Dynamic Links are runtime state: preserving them across an
+effectively unchanged local configuration is permitted, while a changed
+configuration MAY cancel, remove, and relearn them from the surviving routed
+Fabric.
+
+Routing protocols may observe a tentative interface before VFP commit. Such a
+protocol forms no useful adjacency until the Link carries packets and must
+withdraw its state if the interface is removed. This does not change the VFP
+success condition and does not put routing messages inside VFP.
+
 ## 9. Error Handling
 
 VFP has exactly three generic error dispositions. There is no fourth generic
@@ -689,7 +961,7 @@ or valid session cannot be maintained. Current cases are:
 - the frame Version is unsupported;
 - the first `OPEN` cannot pass its complete schema and semantic validation;
 - the peer's `OPEN` declares the same Node UUID as the local node;
-- Link negotiation cannot progress because a peer repeats a proposal or the
+- static Link negotiation cannot progress because a peer repeats a proposal or the
   local endpoint has no acceptable counterproposal.
 
 Closing the connection is the entire wire-visible behavior. No VFP error frame
@@ -706,7 +978,9 @@ state, and continues the established session. Current cases are:
 - a TLV occurs fewer than its schema's `min_occurs`;
 - a selected known TLV has an invalid length or value;
 - the Message Type is invalid in the current state;
-- the Message Type is unknown in an established session.
+- the Message Type is unknown in an established session;
+- a Dynamic-Link response references an unknown, ended, or different-session
+  operation.
 
 The receiver does not send a generic diagnostic or unsupported-message reply.
 
@@ -723,14 +997,15 @@ The field's declared length must still fit within the frame. Otherwise Section
 
 ### 9.4 Business rejection is not a parser error
 
-A structurally valid proposal may be semantically unacceptable—for example, a
-proposed Link prefix may conflict locally. The receiver sends a complete
-counterproposal as specified in Section 8.5. This implicitly rejects the old
-proposal and is not a fourth parser error category.
+A structurally valid proposal may be semantically unacceptable. A static Link
+prefix conflict causes the receiver to send a complete counterproposal as
+specified in Section 8.5. A Dynamic-Link policy or resource rejection causes
+the receiver to send `DYNAMIC_LINK_DECLINE` as specified in Section 8.12.
+Neither is a fourth parser error category.
 
-Likewise, route-specific recovery such as ignoring, replacing, or withdrawing
-a route must be specified by the future route protocol semantics rather than by
-this generic error framework.
+Route-specific recovery such as ignoring, replacing, or withdrawing a route is
+specified by the independent route protocol rather than by this generic error
+framework.
 
 Local logging is an implementation matter and has no wire semantics.
 
@@ -775,11 +1050,27 @@ An implementation MUST:
 - avoid side effects until full-frame validation succeeds;
 - treat peer values as untrusted even when the transport is WireGuard;
 - ensure retries or duplicate delivery cannot create unintended kernel state;
+- limit active Link Attempts and tentative interfaces per Node pair;
+- validate every remote Candidate against local admission policy before using
+  it as a WireGuard endpoint;
+- enforce the Response Timeout and Connectivity Deadline so an unresponsive
+  peer cannot retain tentative resources indefinitely;
+- bind Dynamic-Link commit to the Node UID confirmed by the new link-bound
+  session;
 - keep local configuration and kernel object names out of the wire format.
 
 The protocol aims to be tolerant of explicitly ignorable extensions while
 remaining strict about frame boundaries, selected field syntax, peer identity,
 and state transitions. “Ignore unknown” does not mean “guess malformed input.”
+
+Version 1 routed VFP and its Dynamic-Link parameters are safe only within the
+all-Fabric-members-trusted model of Section 4.3. Hop-by-hop WireGuard does not
+prevent an on-path Fabric node from reading, changing, replaying, or
+impersonating routed VFP traffic. Candidate allow-lists reduce accidental or
+policy-forbidden endpoint use but are not Node authentication. An extension
+that supports mutually untrusted Fabric members requires an authenticated
+binding between Node UID and a long-term identity plus end-to-end integrity,
+replay protection, and downgrade rules.
 
 ## 12. References
 

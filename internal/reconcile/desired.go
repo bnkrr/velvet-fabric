@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,6 +42,13 @@ type DesiredState struct {
 	Routes             []RoutePlan
 	Rules              []RulePlan
 	Babel              *BabelPlan
+	DynamicLinks       *DynamicLinksPlan
+	PrivateKey         wgtypes.Key
+}
+
+type DynamicLinksPlan struct {
+	Mode                   string
+	AllowCandidatePrefixes []netip.Prefix
 }
 
 type LinkPlan struct {
@@ -126,6 +134,14 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 		FabricTableID:      nodeSpec.Fabric.EffectiveRoutingTableID(),
 		LoopbackOwnerAlias: "velvet:loopback:" + uid.String(),
 		Forwarding:         len(nodeSpec.Fabric.Routes) > 0 || len(nodeSpec.Domains) > 0 || nodeSpec.Babel.IsEnabled(),
+		PrivateKey:         privateKey,
+	}
+	if nodeSpec.DynamicLinks != nil {
+		dynamic := &DynamicLinksPlan{Mode: nodeSpec.DynamicLinks.Mode}
+		for _, raw := range nodeSpec.DynamicLinks.AllowCandidatePrefixes {
+			dynamic.AllowCandidatePrefixes = append(dynamic.AllowCandidatePrefixes, netip.MustParsePrefix(raw))
+		}
+		desired.DynamicLinks = dynamic
 	}
 	ports := map[int]string{}
 	links := make(map[string]LinkPlan, len(nodeSpec.Peers))
@@ -252,10 +268,13 @@ func compileBabel(desired *DesiredState, nodeSpec *spec.NodeSpec) *BabelPlan {
 		ControlPath: filepath.Join(runtimeRoot, "babel-rs.ctl"),
 		StatePath:   filepath.Join(stateRoot, "babel-rs-state.toml"),
 		Protocol:    BabelDynamicProtocol, DeviceOnly: true, ManageRules: false,
-		Views: []BabelView{{TableID: desired.FabricTableID}},
+		Views:      []BabelView{{TableID: desired.FabricTableID}},
+		Interfaces: []string{"vl-*", "vdl-*"},
 	}
 	for _, link := range desired.Links {
-		plan.Interfaces = append(plan.Interfaces, link.InterfaceName)
+		if !strings.HasPrefix(link.InterfaceName, "vl-") {
+			plan.Interfaces = append(plan.Interfaces, link.InterfaceName)
+		}
 	}
 	plan.Origins = append(plan.Origins, BabelOrigin{Destination: netip.PrefixFrom(desired.LoopbackV6, 128)})
 	for _, announcement := range nodeSpec.Fabric.Announcements {

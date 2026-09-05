@@ -91,6 +91,9 @@ func TestBuildDesiredStateCompilesManagedBabel(t *testing.T) {
 	if desired.Babel == nil || desired.Babel.ManageRules || !desired.Babel.DeviceOnly || desired.Babel.Protocol != BabelDynamicProtocol {
 		t.Fatalf("managed Babel plan = %#v", desired.Babel)
 	}
+	if len(desired.Babel.Interfaces) != 2 || desired.Babel.Interfaces[0] != "vl-*" || desired.Babel.Interfaces[1] != "vdl-*" {
+		t.Fatalf("managed Babel interfaces = %#v", desired.Babel.Interfaces)
+	}
 	if len(desired.Babel.Views) != 3 {
 		t.Fatalf("views = %#v, want Fabric plus one canonical source per family", desired.Babel.Views)
 	}
@@ -99,5 +102,26 @@ func TestBuildDesiredStateCompilesManagedBabel(t *testing.T) {
 	}
 	if len(desired.Rules) != 5 {
 		t.Fatalf("rules = %#v, want Fabric selectors and every Domain source alias", desired.Rules)
+	}
+}
+
+func TestBuildDesiredStateAddsExplicitStaticInterfaceToBabelPatterns(t *testing.T) {
+	local, _ := wgtypes.GeneratePrivateKey()
+	peer, _ := wgtypes.GeneratePrivateKey()
+	psk, _ := wgtypes.GenerateKey()
+	enabled := true
+	value := &spec.NodeSpec{
+		APIVersion: spec.APIVersion, Kind: spec.Kind,
+		Fabric: spec.FabricSpec{PSK: psk.String(), LoopbackPrefixV6: "fd41::/48"},
+		Node:   spec.Node{UID: spec.NodeUID{Name: "a", UUID: uuid.NewString()}, PrivateKey: local.String()},
+		Peers:  []spec.Peer{{Name: "b", PublicKey: peer.PublicKey().String(), Endpoints: []string{"192.0.2.2:51002"}, InterfaceName: "mesh0"}},
+		Babel:  &spec.BabelSpec{Enabled: &enabled, Executable: "/usr/local/bin/babel-rs"},
+	}
+	desired, err := BuildDesiredState(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := desired.Babel.Interfaces; len(got) != 3 || got[2] != "mesh0" {
+		t.Fatalf("managed Babel interfaces = %#v", got)
 	}
 }

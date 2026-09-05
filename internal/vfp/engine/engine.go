@@ -17,18 +17,41 @@ import (
 const maxCounterproposals = 64
 
 type Config struct {
-	LocalUID             message.UID
-	LocalLoopbackV6      netip.Addr
-	LinkPoolV4           netip.Prefix
-	LinkPoolV6           netip.Prefix
-	LoopbackPoolV6       netip.Prefix
-	FabricPSK            []byte
-	LinkOverrides        []string
-	Accept               func(message.UID, link.Proposal) bool
-	Commit               func(Result) error
-	FrameError           func(error)
-	EstablishmentTimeout time.Duration
+	Context                  SessionContext
+	LocalUID                 message.UID
+	LocalLoopbackV6          netip.Addr
+	ExpectedRemoteLoopbackV6 netip.Addr
+	LinkPoolV4               netip.Prefix
+	LinkPoolV6               netip.Prefix
+	LoopbackPoolV6           netip.Prefix
+	FabricPSK                []byte
+	LinkOverrides            []string
+	Accept                   func(message.UID, link.Proposal) bool
+	Commit                   func(Result) error
+	FrameError               func(error)
+	Operational              func(*Session) error
+	OperationalMessage       func(*Session, message.Message) error
+	EstablishmentTimeout     time.Duration
 }
+
+type SessionContext uint8
+
+const (
+	LinkBoundSession SessionContext = iota
+	RoutedSession
+)
+
+type Session struct {
+	Context          context.Context
+	Kind             SessionContext
+	RemoteUID        message.UID
+	RemoteLoopbackV6 netip.Addr
+	send             func(message.Message) error
+	close            func() error
+}
+
+func (s *Session) Send(value message.Message) error { return s.send(value) }
+func (s *Session) Close() error                     { return s.close() }
 
 type Result struct {
 	RemoteUID        message.UID
@@ -96,6 +119,8 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 	}
 
 	fsm := sessionFSM{config: e.config}
+	var operationalSession *Session
+	operationalNotified := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -114,6 +139,20 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 					continue
 				}
 				return event.err
+			}
+			if fsm.operational {
+				if !validOperationalMessage(e.config.Context, event.message.Type) {
+					if e.config.FrameError != nil {
+						e.config.FrameError(fmt.Errorf("message %d is invalid in operational session context", event.message.Type))
+					}
+					continue
+				}
+				if e.config.OperationalMessage != nil {
+					if err := e.config.OperationalMessage(operationalSession, event.message); err != nil {
+						return fmt.Errorf("process operational VFP message: %w", err)
+					}
+				}
+				continue
 			}
 			outbound, disposition, err := fsm.handle(event.message)
 			if err != nil {
@@ -147,6 +186,28 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 					}
 				}
 				establishmentDeadline = nil
+			}
+			if fsm.operational && !operationalNotified {
+				operationalSession = &Session{
+					Context: ctx, Kind: e.config.Context, RemoteUID: fsm.remoteUID,
+					RemoteLoopbackV6: fsm.remoteLoopbackV6(), send: send, close: conn.Close,
+				}
+				operationalNotified = true
+				if err := conn.SetDeadline(time.Time{}); err != nil {
+					return fmt.Errorf("clear VFP establishment deadline: %w", err)
+				}
+				if !establishmentTimer.Stop() {
+					select {
+					case <-establishmentTimer.C:
+					default:
+					}
+				}
+				establishmentDeadline = nil
+				if e.config.Operational != nil {
+					if err := e.config.Operational(operationalSession); err != nil {
+						return fmt.Errorf("enter operational VFP state: %w", err)
+					}
+				}
 			}
 		}
 	}
@@ -208,7 +269,9 @@ type sessionFSM struct {
 	opened        bool
 	stateReceived bool
 	remoteUID     message.UID
+	remoteV6      netip.Addr
 	link          *staticLinkFSM
+	operational   bool
 }
 
 type staticLinkFSM struct {
@@ -230,9 +293,6 @@ func (s *sessionFSM) handle(in message.Message) (*message.Message, disposition, 
 	}
 	if !s.stateReceived {
 		return s.handleNodeState(in)
-	}
-	if s.link.established {
-		return nil, discardFrame, fmt.Errorf("message %d is invalid after establishment", in.Type)
 	}
 	return s.link.handle(in)
 }
@@ -281,6 +341,14 @@ func (s *sessionFSM) handleNodeState(in message.Message) (*message.Message, disp
 		return nil, discardFrame, errors.New("remote loopback is outside Fabric prefix")
 	}
 	s.stateReceived = true
+	s.remoteV6 = in.LoopbackV6
+	if s.config.Context == RoutedSession {
+		if s.config.ExpectedRemoteLoopbackV6.IsValid() && in.LoopbackV6 != s.config.ExpectedRemoteLoopbackV6 {
+			return nil, closeConnection, errors.New("remote loopback does not match routed session target")
+		}
+		s.operational = true
+		return nil, discardFrame, nil
+	}
 	s.link = &staticLinkFSM{
 		config: s.config, remoteUID: s.remoteUID,
 		remoteV6: in.LoopbackV6,
@@ -369,7 +437,21 @@ func (s *sessionFSM) takeCommit() *Result {
 	return result
 }
 
-func (s *sessionFSM) markEstablished() { s.link.established = true }
+func (s *sessionFSM) markEstablished() {
+	s.link.established = true
+	s.operational = true
+}
+
+func (s *sessionFSM) remoteLoopbackV6() netip.Addr {
+	return s.remoteV6
+}
+
+func validOperationalMessage(context SessionContext, kind message.Type) bool {
+	if context == RoutedSession {
+		return kind == message.DynamicLinkPropose || kind == message.DynamicLinkAccept || kind == message.DynamicLinkDecline
+	}
+	return kind == message.EndpointObservation
+}
 
 func proposalMessage(p link.Proposal) message.Message {
 	return message.Message{Type: message.LinkPropose, LinkPrefixV4: p.V4, LinkPrefixV6: p.V6}

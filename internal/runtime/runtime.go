@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/velvet-fabric/velvet-fabric/internal/babel"
 	"github.com/velvet-fabric/velvet-fabric/internal/link"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
@@ -37,12 +38,14 @@ type Runner struct {
 	mu         sync.RWMutex
 	states     map[string]materializedState
 	babel      *babel.Manager
+	dynamic    *dynamicRuntime
 }
 
 type Status struct {
 	NodeUID          string        `json:"node_uid"`
 	ConfiguredLinks  int           `json:"configured_links"`
 	EstablishedLinks int           `json:"established_links"`
+	DynamicLinks     int           `json:"dynamic_links"`
 	Babel            *babel.Status `json:"babel,omitempty"`
 }
 
@@ -50,6 +53,8 @@ type materializedState struct {
 	desired reconcile.LinkPlan
 	local   []netip.Prefix
 	peers   []netip.Addr
+	remote  message.UID
+	dynamic bool
 }
 
 func (r *Runner) Run(ctx context.Context, once bool) error {
@@ -86,6 +91,12 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		r.signalReady(err)
 		return err
 	}
+	r.dynamic = newDynamicRuntime(r)
+	if err := r.dynamic.start(ctx); err != nil {
+		r.signalReady(err)
+		return err
+	}
+	defer r.dynamic.stop()
 	r.signalReady(nil)
 	established := make(chan struct{}, len(r.Desired.Links))
 	for i := range r.Desired.Links {
@@ -105,8 +116,12 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 	if r.Interval > 0 {
 		go r.maintain(ctx)
 	}
-	<-ctx.Done()
-	return nil
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-r.dynamic.errors:
+		return err
+	}
 }
 
 func (r *Runner) waitBabelReady(ctx context.Context) error {
@@ -119,7 +134,7 @@ func (r *Runner) waitBabelReady(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		status := r.babel.Status()
-		if status.State == "running" && status.AttachedInterfaces == len(r.Desired.Links) {
+		if status.State == "running" {
 			return nil
 		}
 		select {
@@ -143,9 +158,16 @@ func (r *Runner) signalReady(err error) {
 
 func (r *Runner) Status() Status {
 	r.mu.RLock()
-	established := len(r.states)
+	var established, dynamic int
+	for _, state := range r.states {
+		if state.dynamic {
+			dynamic++
+		} else {
+			established++
+		}
+	}
 	r.mu.RUnlock()
-	status := Status{NodeUID: r.Desired.UUID.String(), ConfiguredLinks: len(r.Desired.Links), EstablishedLinks: established}
+	status := Status{NodeUID: r.Desired.UUID.String(), ConfiguredLinks: len(r.Desired.Links), EstablishedLinks: established, DynamicLinks: dynamic}
 	if r.babel != nil {
 		value := r.babel.Status()
 		status.Babel = &value
@@ -278,7 +300,11 @@ func (r *Runner) discoverPeer(ctx context.Context, desired reconcile.LinkPlan) (
 				return nil, fmt.Errorf("accept VFP: %w", result.err)
 			}
 			acceptedRemote, ok := tcpRemoteAddress(result.conn)
-			if !ok || !remoteAddress.IsValid() || acceptedRemote != remoteAddress || shouldDial(localAddress, remoteAddress) {
+			// The listener and connection are scoped to this WireGuard interface.
+			// Do not require the reverse UDP Hello to win a scheduling race before
+			// TCP accept: the peer's link-local TCP source already identifies the
+			// return address on this point-to-point Link.
+			if !ok || !shouldAcceptDiscovered(localAddress, acceptedRemote) {
 				_ = result.conn.Close()
 				continue
 			}
@@ -307,6 +333,10 @@ func dialVFP(ctx context.Context, interfaceName string, local, remote netip.Addr
 
 func shouldDial(local, remote netip.Addr) bool { return local.Compare(remote) < 0 }
 
+func shouldAcceptDiscovered(local, remote netip.Addr) bool {
+	return remote.Is6() && remote.IsLinkLocalUnicast() && remote != local && !shouldDial(local, remote)
+}
+
 func tcpRemoteAddress(conn *net.TCPConn) (netip.Addr, bool) {
 	remote, ok := conn.RemoteAddr().(*net.TCPAddr)
 	if !ok {
@@ -322,8 +352,15 @@ func configureTCP(conn *net.TCPConn) {
 }
 
 func (r *Runner) serveSession(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, once *sync.Once, established chan<- struct{}) error {
+	return r.serveLinkSession(ctx, conn, desired, false, 0, func(engine.Result) {
+		once.Do(func() { established <- struct{}{} })
+	})
+}
+
+func (r *Runner) serveLinkSession(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, dynamic bool, timeout time.Duration, onCommit func(engine.Result)) error {
 	localUID := message.UID{UUID: r.Desired.UUID, Name: r.Desired.UID.Name}
 	protocol := engine.New(engine.Config{
+		Context:         engine.LinkBoundSession,
 		LocalUID:        localUID,
 		LocalLoopbackV6: r.Desired.LoopbackV6,
 		LinkPoolV4:      r.Desired.LinkPoolV4, LinkPoolV6: r.Desired.LinkPoolV6,
@@ -347,20 +384,99 @@ func (r *Runner) serveSession(ctx context.Context, conn net.Conn, desired reconc
 				desired: desired,
 				local:   append([]netip.Prefix(nil), localAddresses...),
 				peers:   append([]netip.Addr(nil), peerLoopbacks...),
+				remote:  result.RemoteUID,
+				dynamic: dynamic,
 			}
 			r.mu.Unlock()
 			if r.babel != nil {
 				r.babel.SetLinkPrefixes(desired.InterfaceName, localAddresses)
 			}
-			r.log(Event{Event: "velvet-link-established", Status: "success", NodeUID: r.Desired.UUID.String(), Peer: desired.PeerName, Interface: desired.InterfaceName, RemoteUID: result.RemoteUID.UUID.String()})
-			once.Do(func() { established <- struct{}{} })
+			event := "velvet-link-established"
+			if dynamic {
+				event = "velvet-dynamic-link-established"
+			}
+			r.log(Event{Event: event, Status: "success", NodeUID: r.Desired.UUID.String(), Peer: desired.PeerName, Interface: desired.InterfaceName, RemoteUID: result.RemoteUID.UUID.String()})
+			if onCommit != nil {
+				onCommit(result)
+			}
+			return nil
+		},
+		Operational: func(session *engine.Session) error {
+			return r.startEndpointObserver(session, desired.InterfaceName)
+		},
+		OperationalMessage: func(_ *engine.Session, value message.Message) error {
+			if value.Type == message.EndpointObservation {
+				r.dynamic.setEvidence(desired.InterfaceName, value.Endpoint)
+			}
 			return nil
 		},
 		FrameError: func(err error) {
 			r.log(Event{Event: "velvet-frame", Status: "discarded", Peer: desired.PeerName, Error: err.Error()})
-		},
+		}, EstablishmentTimeout: timeout,
 	})
 	return protocol.Run(ctx, conn)
+}
+
+func (r *Runner) startEndpointObserver(session *engine.Session, interfaceName string) error {
+	var last netip.AddrPort
+	if endpoint, ok, err := r.Reconciler.ObservedEndpoint(session.Context, interfaceName); err != nil {
+		return err
+	} else if ok {
+		if err := session.Send(message.Message{Type: message.EndpointObservation, Endpoint: endpoint}); err != nil {
+			return err
+		}
+		last = endpoint
+	}
+	go func() {
+		ticker := time.NewTicker(endpointObservationInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-session.Context.Done():
+				return
+			case <-ticker.C:
+				endpoint, ok, err := r.Reconciler.ObservedEndpoint(session.Context, interfaceName)
+				if err != nil {
+					r.log(Event{Event: "velvet-endpoint-observation", Status: "failed", Interface: interfaceName, Error: err.Error()})
+					_ = session.Close()
+					return
+				}
+				if !ok || endpoint == last {
+					continue
+				}
+				if err := session.Send(message.Message{Type: message.EndpointObservation, Endpoint: endpoint}); err != nil {
+					_ = session.Close()
+					return
+				}
+				last = endpoint
+			}
+		}
+	}()
+	return nil
+}
+
+func (r *Runner) hasDirectLink(remote uuid.UUID) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, state := range r.states {
+		if state.remote.UUID == remote {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runner) hasDirectLinkToLoopback(loopback netip.Addr) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, state := range r.states {
+		for _, peer := range state.peers {
+			if peer == loopback {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (r *Runner) maintain(ctx context.Context) {
@@ -371,7 +487,7 @@ func (r *Runner) maintain(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := r.Reconciler.Reconcile(ctx, r.Desired); err != nil {
+			if err := r.Reconciler.Maintain(ctx, r.Desired); err != nil {
 				r.log(Event{Event: "velvet-reconcile", Status: "failed", NodeUID: r.Desired.UUID.String(), Error: err.Error()})
 				continue
 			}

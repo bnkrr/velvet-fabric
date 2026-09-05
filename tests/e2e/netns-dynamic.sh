@@ -35,11 +35,10 @@ loopback_index() {
 diagnose() {
   for node in ${nodes}; do
     ns=$(namespace "${node}")
-    test ! -f "${runtime}/${node}.log" || tail -n 160 "${runtime}/${node}.log" >&2
-    ip -n "${ns}" -details rule show >&2 2>/dev/null || true
-    ip -n "${ns}" -6 -details rule show >&2 2>/dev/null || true
-    ip -n "${ns}" -details route show table all >&2 2>/dev/null || true
-    ip -n "${ns}" -6 -details route show table all >&2 2>/dev/null || true
+    echo "--- ${node}: status and Dynamic Link events ---" >&2
+    test ! -f "${runtime}/${node}.dynamic-status" || cat "${runtime}/${node}.dynamic-status" >&2
+    test ! -f "${runtime}/${node}.log" || grep -E 'velvet-dynamic|panic|no such device|counterproposal' "${runtime}/${node}.log" | tail -n 100 >&2 || true
+    ip netns exec "${ns}" wg show >&2 2>/dev/null || true
   done
 }
 cleanup() {
@@ -155,7 +154,7 @@ for node in ${nodes}; do
 done
 
 # Invalid NodeSpec reload is rejected without disturbing the active generation;
-# restoring the complete candidate then commits a new generation.
+# reloading an equivalent effective config preserves the same generation.
 cp "${runtime}/ea.json" "${runtime}/ea.valid.json"
 printf '{ invalid json\n' >"${runtime}/ea.json"
 if ip netns exec "$(namespace ea)" "${velvetctl}" reload --config "${runtime}/ea.valid.json" >"${runtime}/invalid-reload.log" 2>&1; then
@@ -166,7 +165,7 @@ grep -q 'reload_rejected' "${runtime}/invalid-reload.log"
 cp "${runtime}/ea.valid.json" "${runtime}/ea.json.new"
 mv "${runtime}/ea.json.new" "${runtime}/ea.json"
 ip netns exec "$(namespace ea)" "${velvetctl}" reload --config "${runtime}/ea.json" >"${runtime}/valid-reload.log"
-ip netns exec "$(namespace ea)" "${velvetctl}" status --config "${runtime}/ea.json" | grep -q '"config_generation":2'
+ip netns exec "$(namespace ea)" "${velvetctl}" status --config "${runtime}/ea.json" | grep -q '"config_generation":1'
 wait_ping6 ea fd78:abcd::8
 
 # Killing only the managed child must produce a non-zero exit, supervisor
@@ -180,7 +179,7 @@ test -n "${child_ea}" || { echo "ea babel-rs child was not found" >&2; exit 1; }
 kill -KILL "${child_ea}"
 attempt=0
 running_count=$(grep -c '"event":"babel-rs","status":"running"' "${runtime}/ea.log" || true)
-while test "${running_count}" -lt 3; do
+while test "${running_count}" -lt 2; do
   attempt=$((attempt + 1)); test "${attempt}" -lt 45 || { echo "babel-rs child was not restarted" >&2; exit 1; }; sleep 1
   running_count=$(grep -c '"event":"babel-rs","status":"running"' "${runtime}/ea.log" || true)
 done
@@ -244,4 +243,115 @@ pids="${pids} ${pid_xc}"
 wait_route8 present
 wait_ping6 ea fd78:abcd::8
 
-echo "velvet managed babel-rs dynamic multi-Plan Core E2E: PASS"
+# Restart the same sparse Core with Dynamic Link enabled. No static multi-hop
+# route is added: routed VFP discovers each remote Node UID, observations from
+# the existing Links provide the underlay candidate, and every missing pair
+# must become a directly connected runtime Link.
+for node in ${nodes}; do
+  pid=$(cat "${runtime}/${node}.pid")
+  kill -TERM "${pid}"
+done
+for node in ${nodes}; do
+  pid=$(cat "${runtime}/${node}.pid")
+  wait "${pid}" || true
+done
+pids=
+python3 "${generator}" "${runtime}" "${babel_rs}" dynamic-links
+if grep -q '"routes"' "${runtime}"/*.json; then
+  echo "Dynamic Link NodeSpec unexpectedly contains static routes" >&2
+  exit 1
+fi
+for node in ${nodes}; do
+  ns=$(namespace "${node}")
+  ip netns exec "${ns}" "${velvetd}" --config "${runtime}/${node}.json" --reconcile-interval 5s >>"${runtime}/${node}.log" 2>&1 &
+  pid=$!
+  printf '%s\n' "${pid}" >"${runtime}/${node}.pid"
+  pids="${pids} ${pid}"
+done
+
+expected_dynamic_links() {
+  case $1 in
+    ea|eb) echo 5;;
+    r1) echo 4;;
+    r2) echo 3;;
+    r3) echo 5;;
+    xa|xb|xc) echo 6;;
+  esac
+}
+wait_dynamic_links() {
+  node=$1; expected=$(expected_dynamic_links "${node}"); attempt=0
+  while :; do
+    ip netns exec "$(namespace "${node}")" "${velvetctl}" status --config "${runtime}/${node}.json" >"${runtime}/${node}.dynamic-status" 2>/dev/null || true
+    grep -q "\"dynamic_links\":${expected}" "${runtime}/${node}.dynamic-status" 2>/dev/null && return
+    attempt=$((attempt + 1))
+    test "${attempt}" -lt 120 || { echo "${node}: expected ${expected} dynamic Links" >&2; exit 1; }
+    sleep 1
+  done
+}
+for node in ${nodes}; do wait_dynamic_links "${node}"; done
+
+# xc is passive in the generated NodeSpec: active peers must build all six
+# missing Links toward it, while xc must never originate a Proposal itself.
+if grep -q '"event":"velvet-dynamic-attempt","status":"proposed"' "${runtime}/xc.log"; then
+  echo "xc: passive Dynamic Link mode originated a Proposal" >&2
+  exit 1
+fi
+grep -q '"event":"velvet-dynamic-attempt","status":"accepted"' "${runtime}/xc.log"
+
+# A complete eight-node mesh has seven Babel interfaces at every node: its
+# original static neighbors plus all complementary Dynamic Links. Interface
+# glob reconciliation is asynchronous with respect to VFP Link commit.
+wait_babel_mesh() {
+  node=$1; attempt=0
+  while :; do
+    ip netns exec "$(namespace "${node}")" "${velvetctl}" status --config "${runtime}/${node}.json" >"${runtime}/${node}.dynamic-status"
+    grep -q '"attached_interfaces":7' "${runtime}/${node}.dynamic-status" && return
+    attempt=$((attempt + 1))
+    test "${attempt}" -lt 60 || { echo "${node}: babel-rs did not attach all seven mesh interfaces" >&2; exit 1; }
+    sleep 1
+  done
+}
+for node in ${nodes}; do
+  wait_babel_mesh "${node}"
+  status="${runtime}/${node}.dynamic-status"
+  ip -n "$(namespace "${node}")" -o link show | grep -q 'vdl-'
+done
+
+# The Dynamic Link contributes an adjacent loopback route, and Babel exports
+# domain reachability over that new interface. End-to-end loopback and Plan
+# traffic must remain converged after the topology changes from sparse to mesh.
+wait_route_device() {
+  family=$1; table=$2; prefix=$3; protocol=$4; device=$5; attempt=0
+  while :; do
+    route=$(ip -n "$(namespace ea)" "${family}" route show table "${table}" exact "${prefix}" proto "${protocol}")
+    echo "${route}" | grep -q "dev ${device}" && return
+    attempt=$((attempt + 1))
+    test "${attempt}" -lt 60 || {
+      echo "ea: ${prefix} did not converge to ${device}: ${route}" >&2
+      exit 1
+    }
+    sleep 1
+  done
+}
+wait_route_device -6 20000 fd78:abcd::8/128 202 vdl-xc-2000
+wait_route_device -4 20030 10.60.2.0/24 203 vdl-xb-2000
+echo "Dynamic Link mesh routes: PASS"
+for source in ${nodes}; do
+  for index in 1 2 3 4 5 6 7 8; do wait_ping6 "${source}" "fd78:abcd::${index}"; done
+done
+wait_ping4 ea 10.100.30.1 10.60.2.1
+wait_ping4 eb 10.100.31.1 10.60.3.1
+echo "Dynamic Link mesh connectivity: PASS"
+
+# An equivalent effective reload is a no-op and therefore preserves learned
+# Dynamic Links rather than deleting and relearning them.
+before=$(ip -n "$(namespace ea)" -o link show vdl-xc-2000 | awk -F: '{print $1}')
+ip netns exec "$(namespace ea)" "${velvetctl}" reload --config "${runtime}/ea.json" >"${runtime}/dynamic-reload.log"
+ip netns exec "$(namespace ea)" "${velvetctl}" status --config "${runtime}/ea.json" >"${runtime}/ea.dynamic-status"
+grep -q '"config_generation":1' "${runtime}/ea.dynamic-status"
+grep -q '"dynamic_links":5' "${runtime}/ea.dynamic-status"
+after=$(ip -n "$(namespace ea)" -o link show vdl-xc-2000 | awk -F: '{print $1}')
+test "${before}" = "${after}"
+echo "Dynamic Link equivalent reload preservation: PASS"
+
+echo "velvet managed babel-rs dynamic routing and Dynamic Link mesh E2E: PASS"

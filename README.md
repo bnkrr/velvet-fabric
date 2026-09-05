@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Velvet Fabric builds and maintains a routed network core from preconfigured
+Velvet Fabric builds and maintains a routed network core from an initial set of
 point-to-point WireGuard adjacencies. Each node runs one `velvetd`, described by
 a local NodeSpec. The daemon creates a dedicated WireGuard interface for every
-configured Peer, gives the node a stable IPv6 loopback, and reconciles the
-interfaces, routes, and policy rules owned by that NodeSpec.
+configured Peer, gives the node a stable IPv6 loopback, reconciles its network
+state, and can add runtime Dynamic Links between already routed nodes.
 
 Velvet supports both local static routing and optional distributed dynamic
 routing. For dynamic routing, `velvetd` manages one independent
@@ -27,13 +27,16 @@ The current release provides:
   rules;
 - static Core routes and source-selected Domain routing tables;
 - optional multi-hop route discovery through a supervised `babel-rs` daemon;
+- optional distributed Dynamic-Link creation using routed VFP and endpoint
+  observations from existing Links;
 - transactional reload, local status, and graceful shutdown.
 
-It does not currently discover arbitrary peers, exchange WireGuard keys, or
-create dynamic Links. Access interfaces, access tunnels, and NAT are also
-outside Velvet Core. An announcement asserts that a prefix is already
-delivered locally by external access configuration; it does not create that
-configuration.
+Dynamic Link currently uses a deliberately small one-Candidate inference
+profile rather than general NAT traversal: it reuses an externally observed IP
+with the new Link's actual WireGuard listen port and makes one bounded attempt.
+Access interfaces, access tunnels, and NAT are outside Velvet Core. An
+announcement asserts that a prefix is already delivered locally by external
+access configuration; it does not create that configuration.
 
 The daemon and its reconciler currently target Linux. There is one `velvetd`
 per Linux network namespace.
@@ -47,6 +50,7 @@ NodeSpec
 velvetd
    |-- WireGuard Links and stable node loopback
    |-- VFP over link-local TCP: adjacent-Link control and address negotiation
+   |-- VFP over routed loopbacks: node discovery and Dynamic-Link signalling
    |-- static Core routes and policy rules
    `-- optional managed babel-rs
           `-- standard Babel over link-local UDP: dynamic route propagation
@@ -54,8 +58,9 @@ velvetd
 
 WireGuard is the data plane. VFP is Velvet's inter-node control protocol and
 does not transport routes. Babel is the dynamic routing protocol and does not
-create WireGuard Links. Static routes remain local desired state and are not
-propagated over VFP.
+create WireGuard Links. Dynamic Links reuse the normal link-bound VFP
+establishment procedure for final connectivity validation. Static routes
+remain local desired state and are not propagated over VFP.
 
 The version-1 VFP specification is
 [docs/protocol/VFP.md](docs/protocol/VFP.md). Informative design references are
@@ -243,6 +248,41 @@ rules with protocol `201` and adjacent routes with protocol `202`. Static and
 dynamic routes share tables, with dynamic priorities placed after the complete
 static metric range. Neither daemon writes learned routes to `main`.
 
+## Dynamic Links
+
+Dynamic Links are optional and require routed reachability between node
+loopbacks; Babel is one way to provide that reachability, but the VFP procedure
+does not depend on how the route was learned. The initial static Peers also
+provide Endpoint Observations used by the baseline inference algorithm:
+
+```json
+{
+  "dynamic_links": {
+    "mode": "active",
+    "allow_candidate_prefixes": ["192.0.2.0/24"]
+  }
+}
+```
+
+`active` discovers reachable non-adjacent nodes, proposes Links, and accepts
+allowed proposals. `passive` only accepts proposals, while `off` disables both;
+omitting the section is equivalent to `off`. The allow-list checks only the IP
+of the Candidate supplied by the remote node.
+
+For each target, the current implementation makes one attempt per effective
+configuration generation. It takes the IP from the first available Endpoint
+Observation, substitutes the ephemeral listen port reserved for the new
+WireGuard interface, and exchanges both endpoints and public keys over routed
+VFP. The tentative Link is committed only after the regular link-local VFP
+establishment succeeds. Failure deletes tentative state and leaves the existing
+routed path in service; this release does not retry automatically or implement
+general NAT traversal.
+
+Dynamic interfaces are locally named `vdl-<remote-name>-<uuid-prefix4>` (or
+`vdl-<uuid-prefix4>` without a remote name). They are runtime state, survive an
+effectively unchanged reload, and are discarded and relearned after an
+effective configuration change.
+
 ## Operations
 
 There is one `velvetd` and one optional managed `babel-rs` process per network
@@ -277,7 +317,9 @@ go test ./...
 
 The privileged Linux E2E suite under `tests/e2e/` creates disposable network
 namespaces. It covers adjacent unnumbered Links, static Core reconciliation and
-CRUD, and an eight-node, eight-Link, two-Domain topology. The dynamic test uses
-no static multi-hop routes: Babel discovers the paths, all node loopbacks are
-checked, Domain forwarding is exercised, and child withdrawal and restart
-convergence are verified. The same suite runs in GitHub Actions.
+CRUD, and an eight-node, eight-Link, two-Domain topology. The dynamic test first
+uses no static multi-hop routes and verifies Babel convergence, then restarts
+the same sparse Core with Dynamic Links enabled and requires a complete
+eight-node mesh. It checks all node loopbacks, Domain forwarding, route
+selection over the new direct Links, child withdrawal/restart, and reload
+preservation. The same suite runs in GitHub Actions.
