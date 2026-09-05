@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/velvet-fabric/velvet-fabric/internal/linejson"
 )
 
 const controlAPIVersion = 1
@@ -106,12 +108,5 @@ func controlRequest(ctx context.Context, socket, command string, result any) err
 }
 
 func readControlJSON(reader *bufio.Reader, value any) error {
-	data, err := reader.ReadBytes('\n')
-	if err != nil {
-		return err
-	}
-	if len(data) > maxControlFrame {
-		return errors.New("control frame exceeds one MiB")
-	}
-	return json.Unmarshal(data, value)
+	return linejson.Read(reader, maxControlFrame, value)
 }

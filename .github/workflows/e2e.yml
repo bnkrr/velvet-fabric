@@ -33,7 +33,7 @@ jobs:
           path: babel-rs
       - uses: actions/setup-go@v7
         with:
-          go-version-file: velvet-fabric/go.mod
+          go-version: 1.27.1
           cache-dependency-path: velvet-fabric/go.sum
       - name: Install network tools
         run: |

@@ -113,7 +113,10 @@ bin/velvetctl resolve --config node.json
 ```
 
 If `node.uid.uuid` is absent, this first load generates a UUIDv4 and atomically
-writes it back to the same JSON file. Start the daemon and query its status:
+writes it back to the same JSON file. Because NodeSpec embeds the Fabric PSK
+and node private key, Velvet requires a regular, non-symlink config file with
+no group or other permissions (for example, mode `0600`). Start the daemon and
+query its status:
 
 ```sh
 sudo bin/velvetd --config node.json
@@ -246,7 +249,9 @@ backoff. Parent death terminates the child.
 It owns dynamic routes with protocol `203`; `velvetd` owns static routes and
 rules with protocol `201` and adjacent routes with protocol `202`. Static and
 dynamic routes share tables, with dynamic priorities placed after the complete
-static metric range. Neither daemon writes learned routes to `main`.
+static metric range. Protocol values 201–203 are a Velvet-controlled ownership
+namespace and must not be used by unrelated route managers in these tables.
+Neither daemon writes learned routes to `main`.
 
 ## Dynamic Links
 

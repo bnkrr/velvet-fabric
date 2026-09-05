@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/velvet-fabric/velvet-fabric/internal/linejson"
 )
 
 const APIVersion = 1
@@ -170,14 +172,7 @@ func Request(ctx context.Context, path, command string, result any) error {
 }
 
 func readJSON(reader *bufio.Reader, value any) error {
-	data, err := reader.ReadBytes('\n')
-	if err != nil {
-		return err
-	}
-	if len(data) > maxFrame {
-		return errors.New("control frame exceeds one MiB")
-	}
-	return json.Unmarshal(data, value)
+	return linejson.Read(reader, maxFrame, value)
 }
 
 func writeJSON(writer net.Conn, value any) error {

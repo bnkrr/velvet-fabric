@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/google/uuid"
@@ -28,6 +29,54 @@ func TestLoadGeneratesAndAtomicallyPersistsUUID(t *testing.T) {
 	}
 	if loadedAgain.Node.UID.UUID != loaded.Node.UID.UUID {
 		t.Fatal("persisted UUID changed")
+	}
+}
+
+func TestLoadRejectsInsecurePermissionsAndSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "node.json")
+	writeJSON(t, path, validSpec(t))
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("group-readable config was accepted")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "node-link.json")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(link); err == nil {
+		t.Fatal("symlink config was accepted")
+	}
+}
+
+func TestUUIDRewritePreservesModeAndOwnership(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.json")
+	value := validSpec(t)
+	value.Node.UID.UUID = ""
+	writeJSON(t, path, value)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode().Perm() != after.Mode().Perm() {
+		t.Fatalf("mode changed from %04o to %04o", before.Mode().Perm(), after.Mode().Perm())
+	}
+	beforeStat, beforeOK := before.Sys().(*syscall.Stat_t)
+	afterStat, afterOK := after.Sys().(*syscall.Stat_t)
+	if !beforeOK || !afterOK || beforeStat.Uid != afterStat.Uid || beforeStat.Gid != afterStat.Gid {
+		t.Fatal("ownership changed during atomic rewrite")
 	}
 }
 
