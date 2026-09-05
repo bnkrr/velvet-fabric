@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/velvet-fabric/velvet-fabric/internal/inference"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 	"github.com/velvet-fabric/velvet-fabric/internal/spec"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/engine"
@@ -37,11 +38,18 @@ const (
 )
 
 type dynamicRuntime struct {
-	runner *Runner
-	ctx    context.Context
+	runner  *Runner
+	ctx     context.Context
+	cancel  context.CancelFunc
+	workers sync.WaitGroup
+
+	// Resource operations take resourceMu before mu. Keep it across removal
+	// and reuse of an interface, while releasing mu during kernel cleanup.
+	resourceMu sync.Mutex
+	stopped    bool
 
 	mu               sync.Mutex
-	evidence         []endpointEvidence
+	evidence         []inference.Evidence
 	targets          map[netip.Addr]*dynamicTarget
 	attempts         map[uuid.UUID]*dynamicAttempt
 	pendingCleanups  map[uuid.UUID]*dynamicCleanup
@@ -49,11 +57,6 @@ type dynamicRuntime struct {
 	errors           chan error
 	inboundSessions  chan struct{}
 	outboundSessions chan struct{}
-}
-
-type endpointEvidence struct {
-	interfaceName string
-	endpoint      netip.AddrPort
 }
 
 type dynamicTarget struct {
@@ -71,6 +74,7 @@ type dynamicAttempt struct {
 	state         dynamicAttemptState
 	responseTimer *time.Timer
 	deadlineTimer *time.Timer
+	deadlineEpoch uint64
 	cancel        context.CancelFunc
 }
 
@@ -92,29 +96,36 @@ func newDynamicRuntime(runner *Runner) *dynamicRuntime {
 }
 
 func (d *dynamicRuntime) start(ctx context.Context) error {
+	ctx, d.cancel = context.WithCancel(ctx)
 	d.ctx = ctx
 	address := &net.TCPAddr{IP: net.IP(d.runner.Desired.LoopbackV6.AsSlice()), Port: d.runner.Desired.VFPPort}
 	listener, err := net.ListenTCP("tcp6", address)
 	if err != nil {
+		d.cancel()
 		return fmt.Errorf("listen for routed VFP on %s: %w", address, err)
 	}
 	d.listener = listener
-	go func() {
+	d.workers.Go(func() {
 		<-ctx.Done()
 		_ = listener.Close()
-	}()
-	go d.acceptRouted(ctx)
+	})
+	d.workers.Go(func() { d.acceptRouted(ctx) })
 	if d.active() {
-		go d.discoverLoopbacks(ctx)
+		d.workers.Go(func() { d.discoverLoopbacks(ctx) })
 	}
 	return nil
 }
 
 func (d *dynamicRuntime) stop() {
+	if d.cancel != nil {
+		d.cancel()
+	}
 	if d.listener != nil {
 		_ = d.listener.Close()
 	}
+	d.resourceMu.Lock()
 	d.mu.Lock()
+	d.stopped = true
 	plans := make([]reconcile.LinkPlan, 0, len(d.attempts)+len(d.pendingCleanups))
 	for _, attempt := range d.attempts {
 		stopAttempt(attempt)
@@ -127,6 +138,10 @@ func (d *dynamicRuntime) stop() {
 	clear(d.attempts)
 	clear(d.pendingCleanups)
 	d.mu.Unlock()
+	d.resourceMu.Unlock()
+	d.workers.Wait()
+	d.resourceMu.Lock()
+	defer d.resourceMu.Unlock()
 	for _, plan := range plans {
 		d.removeInterface(plan, "dynamic runtime stopped")
 	}

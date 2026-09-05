@@ -171,6 +171,25 @@ func (b *Backend) ObservedEndpoint(ctx context.Context, interfaceName string) (n
 	return netip.AddrPortFrom(addr.Unmap(), uint16(device.Peers[0].Endpoint.Port)), true, nil
 }
 
+func (b *Backend) ListenPort(ctx context.Context, interfaceName string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	client, err := wgctrl.New()
+	if err != nil {
+		return 0, fmt.Errorf("open WireGuard control client: %w", err)
+	}
+	defer client.Close()
+	device, err := client.Device(interfaceName)
+	if err != nil {
+		return 0, fmt.Errorf("read WireGuard device %q: %w", interfaceName, err)
+	}
+	if device.ListenPort < 1 || device.ListenPort > 65535 {
+		return 0, errors.New("WireGuard reported an invalid local listen port")
+	}
+	return device.ListenPort, nil
+}
+
 func (b *Backend) ReachableLoopbacks(ctx context.Context, table int, pool netip.Prefix) ([]netip.Addr, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

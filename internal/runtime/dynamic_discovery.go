@@ -24,10 +24,10 @@ func (d *dynamicRuntime) acceptRouted(ctx context.Context) {
 		configureTCP(conn)
 		select {
 		case d.inboundSessions <- struct{}{}:
-			go func() {
+			d.workers.Go(func() {
 				defer func() { <-d.inboundSessions }()
 				d.serveRouted(ctx, conn, netip.Addr{})
-			}()
+			})
 		default:
 			d.runner.log(Event{Event: "velvet-routed-session", Status: "rejected", Error: "inbound session limit reached"})
 			_ = conn.Close()
@@ -50,7 +50,7 @@ func (d *dynamicRuntime) discoverLoopbacks(ctx context.Context) {
 
 func (d *dynamicRuntime) scanLoopbacks(ctx context.Context) {
 	d.mu.Lock()
-	_, hasEvidence := d.firstEvidenceLocked()
+	hasEvidence := len(d.evidence) != 0
 	d.mu.Unlock()
 	if !hasEvidence {
 		return
@@ -66,10 +66,10 @@ func (d *dynamicRuntime) scanLoopbacks(ctx context.Context) {
 		if !d.reserveDial(target) {
 			continue
 		}
-		go func() {
+		d.workers.Go(func() {
 			defer func() { <-d.outboundSessions }()
 			d.dialRouted(ctx, target)
-		}()
+		})
 	}
 }
 

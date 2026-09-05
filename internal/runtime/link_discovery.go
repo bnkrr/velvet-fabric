@@ -116,7 +116,7 @@ func (r *Runner) discoverPeer(ctx context.Context, desired reconcile.LinkPlan) (
 }
 
 func acceptConnections(ctx context.Context, listener *net.TCPListener) <-chan acceptedConnection {
-	result := make(chan acceptedConnection, 1)
+	result := make(chan acceptedConnection)
 	go func() {
 		for {
 			conn, err := listener.AcceptTCP()
