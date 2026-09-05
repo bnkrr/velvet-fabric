@@ -45,6 +45,8 @@ type reloadRequest struct {
 	reply chan error
 }
 
+var errRunnerDidNotStop = errors.New("runtime did not stop after cancellation")
+
 func main() {
 	configPath := flag.String("config", "", "path to a NodeSpec JSON file")
 	controlPath := flag.String("control-socket", "", "Unix control socket (default: per-node runtime directory)")
@@ -64,11 +66,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "velvetd: --reconcile-interval must be positive")
 		os.Exit(2)
 	}
-	nodeSpec, desired, err := loadDesired(*configPath)
+	desired, err := loadDesired(*configPath)
 	if err != nil {
 		log.Fatalf("velvetd: %v", err)
 	}
-	_ = nodeSpec
 	lock, err := acquireSingleton()
 	if err != nil {
 		log.Fatalf("velvetd: %v", err)
@@ -149,7 +150,9 @@ func main() {
 	for {
 		select {
 		case <-rootCtx.Done():
-			stopRunner(active)
+			if err := stopRunner(active); err != nil {
+				log.Printf("velvetd: %v", err)
+			}
 			return
 		case err := <-active.done:
 			if *once && err == nil {
@@ -184,13 +187,12 @@ func main() {
 	}
 }
 
-func loadDesired(path string) (*spec.NodeSpec, *reconcile.DesiredState, error) {
+func loadDesired(path string) (*reconcile.DesiredState, error) {
 	nodeSpec, err := spec.Load(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	desired, err := reconcile.BuildDesiredState(nodeSpec)
-	return nodeSpec, desired, err
+	return reconcile.BuildDesiredState(nodeSpec)
 }
 
 func startRunner(ctx context.Context, desired *reconcile.DesiredState, interval time.Duration, once bool, logEvent func(velvetruntime.Event)) (*running, error) {
@@ -202,7 +204,9 @@ func startRunner(ctx context.Context, desired *reconcile.DesiredState, interval 
 	select {
 	case err := <-ready:
 		if err != nil {
-			cancel()
+			if stopErr := cancelAndWait(cancel, done, 10*time.Second); stopErr != nil {
+				return nil, fmt.Errorf("%w after startup error: %v", stopErr, err)
+			}
 			return nil, err
 		}
 		return &running{desired: desired, runner: runner, cancel: cancel, done: done}, nil
@@ -213,27 +217,39 @@ func startRunner(ctx context.Context, desired *reconcile.DesiredState, interval 
 		}
 		return nil, err
 	case <-time.After(30 * time.Second):
-		cancel()
+		if err := cancelAndWait(cancel, done, 10*time.Second); err != nil {
+			return nil, err
+		}
 		return nil, errors.New("runtime did not become ready within 30s")
 	case <-ctx.Done():
-		cancel()
+		if err := cancelAndWait(cancel, done, 10*time.Second); err != nil {
+			return nil, err
+		}
 		return nil, ctx.Err()
 	}
 }
 
-func stopRunner(value *running) {
+func stopRunner(value *running) error {
 	if value == nil {
-		return
+		return nil
 	}
-	value.cancel()
+	return cancelAndWait(value.cancel, value.done, 10*time.Second)
+}
+
+func cancelAndWait(cancel context.CancelFunc, done <-chan error, timeout time.Duration) error {
+	cancel()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
-	case <-value.done:
-	case <-time.After(10 * time.Second):
+	case <-done:
+		return nil
+	case <-timer.C:
+		return errRunnerDidNotStop
 	}
 }
 
 func reload(ctx context.Context, path string, active *running, interval time.Duration, once bool, logEvent func(velvetruntime.Event), setStatus func(func(*daemonStatus))) (*running, error) {
-	_, candidate, err := loadDesired(path)
+	candidate, err := loadDesired(path)
 	if err != nil {
 		setStatus(func(value *daemonStatus) { value.LastReloadError = err.Error() })
 		return active, err
@@ -248,9 +264,15 @@ func reload(ctx context.Context, path string, active *running, interval time.Dur
 		return active, nil
 	}
 	setStatus(func(value *daemonStatus) { value.Ready = false })
-	stopRunner(active)
+	if err := stopRunner(active); err != nil {
+		setStatus(func(value *daemonStatus) { value.LastReloadError = err.Error() })
+		return nil, err
+	}
 	next, startErr := startRunner(ctx, candidate, interval, once, logEvent)
 	if startErr != nil {
+		if errors.Is(startErr, errRunnerDidNotStop) {
+			return nil, fmt.Errorf("candidate failed without stopping cleanly: %w", startErr)
+		}
 		rollback, rollbackErr := startRunner(ctx, active.desired, interval, once, logEvent)
 		if rollbackErr != nil {
 			return nil, fmt.Errorf("candidate failed: %v; rollback failed: %w", startErr, rollbackErr)

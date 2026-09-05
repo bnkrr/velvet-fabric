@@ -32,6 +32,7 @@ type Config struct {
 	Operational              func(*Session) error
 	OperationalMessage       func(*Session, message.Message) error
 	EstablishmentTimeout     time.Duration
+	WriteTimeout             time.Duration
 }
 
 type SessionContext uint8
@@ -71,6 +72,7 @@ type readEvent struct {
 type writeRequest struct {
 	message message.Message
 	done    chan error
+	timeout time.Duration
 }
 
 // Run drives one VFP TCP session. All protocol state is owned by this event
@@ -79,9 +81,17 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 	ctx, cancel := context.WithCancel(ctx)
 	reads := make(chan readEvent)
 	writes := make(chan writeRequest)
+	establishmentTimeout := e.config.EstablishmentTimeout
+	if establishmentTimeout <= 0 {
+		establishmentTimeout = 10 * time.Second
+	}
 	var workers sync.WaitGroup
 	workers.Add(2)
 	go func() { defer workers.Done(); readLoop(ctx, conn, reads) }()
+	writeTimeout := e.config.WriteTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = 10 * time.Second
+	}
 	go func() { defer workers.Done(); writeLoop(ctx, conn, writes) }()
 	defer func() {
 		cancel()
@@ -90,10 +100,11 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 	}()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
 
+	currentWriteTimeout := min(writeTimeout, establishmentTimeout)
 	send := func(value message.Message) error {
 		done := make(chan error, 1)
 		select {
-		case writes <- writeRequest{message: value, done: done}:
+		case writes <- writeRequest{message: value, done: done, timeout: currentWriteTimeout}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -103,10 +114,6 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	}
-	establishmentTimeout := e.config.EstablishmentTimeout
-	if establishmentTimeout <= 0 {
-		establishmentTimeout = 10 * time.Second
 	}
 	if err := conn.SetDeadline(time.Now().Add(establishmentTimeout)); err != nil {
 		return fmt.Errorf("set VFP establishment deadline: %w", err)
@@ -188,6 +195,7 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 				establishmentDeadline = nil
 			}
 			if fsm.operational && !operationalNotified {
+				currentWriteTimeout = writeTimeout
 				operationalSession = &Session{
 					Context: ctx, Kind: e.config.Context, RemoteUID: fsm.remoteUID,
 					RemoteLoopbackV6: fsm.remoteLoopbackV6(), send: send, close: conn.Close,
@@ -248,7 +256,13 @@ func writeLoop(ctx context.Context, conn net.Conn, input <-chan writeRequest) {
 		case <-ctx.Done():
 			return
 		case request := <-input:
-			err := message.Write(conn, request.message)
+			err := conn.SetWriteDeadline(time.Now().Add(request.timeout))
+			if err == nil {
+				err = message.Write(conn, request.message)
+			}
+			if clearErr := conn.SetWriteDeadline(time.Time{}); err == nil {
+				err = clearErr
+			}
 			request.done <- err
 			if err != nil {
 				return

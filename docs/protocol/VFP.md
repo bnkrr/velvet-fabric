@@ -830,12 +830,18 @@ observed IP address and discards the observed port. With no Observation it
 cannot propose or accept an Attempt. The protocol carries no Candidate
 priority, confidence, source, or NAT classification.
 
-The current automatic profile is one-shot: an active node considers each
-reachable remote `/128` in the Fabric loopback prefix once per configuration
-generation, excluding itself and existing direct peers. Failure or Decline
-retains the routed path but creates no automatic retry in that generation.
-Passive nodes only respond; disabled nodes still send Observations on their
-existing Links but neither propose nor accept Dynamic Links.
+The current automatic profile is one-shot after Node UID binding: an active
+node makes at most one Dynamic-Link decision for each reachable remote `/128`
+in the Fabric loopback prefix per configuration generation, excluding itself
+and existing direct peers. Establishing the routed VFP session used for UID
+binding MAY use up to three total connection attempts to tolerate transient
+route or TCP convergence; failure after that bound exhausts the target for the
+generation.
+Once that routed session reaches operational state, policy refusal, resource
+failure, failed Proposal, or Decline retains the routed path but creates no
+automatic retry in that generation. Passive nodes only respond; disabled nodes
+still send Observations on their existing Links but neither propose nor accept
+Dynamic Links.
 
 ### 8.12 Dynamic-Link messages
 
@@ -916,10 +922,19 @@ Decline and the countervailing Proposal arrive in either order.
 The minimal state progression is:
 
 ```text
-IDLE -> PROPOSING -> ATTEMPTING -> UP
-          |              |
-          +--------------+-----> IDLE (fail, cleanup, routed path retained)
+IDLE -> PROPOSING -> ATTEMPTING -> UP -> RECOVERING -> UP
+          |              |                 |
+          +--------------+-----------------+-> IDLE
+                                      (deadline, cleanup, routed path retained)
 ```
+
+Loss of the operational link-bound session after commit moves the local
+Attempt to `RECOVERING`; it does not create a new routed Proposal. The endpoint
+reruns the standard link-bound establishment procedure over the committed
+WireGuard interface with a fresh 30-second Connectivity Deadline. Reaching
+operational state with the same remote Node UID returns to `UP`. If the
+deadline wins, the endpoint removes the Dynamic Link and its materialized
+routing state. This recovery is local behavior and adds no wire Message.
 
 Version 1 sends no retransmitted Proposal on one session and defines no
 cancel, success, failure, rollback, or generic error Message. A future

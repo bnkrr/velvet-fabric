@@ -15,8 +15,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -190,7 +192,7 @@ func (a Announcement) MarshalJSON() ([]byte, error) {
 // Load reads and validates a NodeSpec. If node.uid.uuid is absent, Load creates
 // a UUIDv4 and atomically writes the complete config back to the same path.
 func Load(path string) (*NodeSpec, error) {
-	contents, mode, err := readConfig(path)
+	contents, metadata, err := readConfig(path)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +209,7 @@ func Load(path string) (*NodeSpec, error) {
 		return nil, err
 	}
 	if generated {
-		if err := writeAtomic(path, mode, nodeSpec); err != nil {
+		if err := writeAtomic(path, metadata, nodeSpec); err != nil {
 			return nil, fmt.Errorf("persist generated node UUID: %w", err)
 		}
 	}
@@ -396,12 +398,6 @@ func (f FabricSpec) EffectiveRoutingTableID() int {
 func (s *BabelSpec) IsEnabled() bool {
 	return s != nil && s.Enabled != nil && *s.Enabled
 }
-func (s *DynamicLinksSpec) IsActive() bool {
-	return s != nil && s.Mode == DynamicLinksActive
-}
-func (s *DynamicLinksSpec) AllowsInbound() bool {
-	return s != nil && (s.Mode == DynamicLinksActive || s.Mode == DynamicLinksPassive)
-}
 func ParseKey(value string) (wgtypes.Key, error) { return wgtypes.ParseKey(strings.TrimSpace(value)) }
 func ParsePSK(value string) ([]byte, error)      { return parseInlineKey(value) }
 
@@ -446,16 +442,38 @@ func DynamicInterfaceName(remote NodeUID) string {
 	return "vdl-" + remote.Name + "-" + suffix
 }
 
-func readConfig(path string) ([]byte, os.FileMode, error) {
-	info, err := os.Stat(path)
+type configMetadata struct {
+	mode os.FileMode
+	uid  int
+	gid  int
+}
+
+func readConfig(path string) ([]byte, configMetadata, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return nil, 0, fmt.Errorf("stat config: %w", err)
+		return nil, configMetadata{}, fmt.Errorf("open config: %w", err)
 	}
-	contents, err := os.ReadFile(path)
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
-		return nil, 0, fmt.Errorf("read config: %w", err)
+		return nil, configMetadata{}, fmt.Errorf("stat config: %w", err)
 	}
-	return contents, info.Mode().Perm(), nil
+	if !info.Mode().IsRegular() {
+		return nil, configMetadata{}, errors.New("config must be a regular file, not a symlink or special file")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, configMetadata{}, fmt.Errorf("config permissions %04o expose embedded key material; group and other permissions must be zero", info.Mode().Perm())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, configMetadata{}, errors.New("read config ownership")
+	}
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		return nil, configMetadata{}, fmt.Errorf("read config: %w", err)
+	}
+	return contents, configMetadata{mode: info.Mode().Perm(), uid: int(stat.Uid), gid: int(stat.Gid)}, nil
 }
 
 func decode(contents []byte) (*NodeSpec, error) {
@@ -471,7 +489,7 @@ func decode(contents []byte) (*NodeSpec, error) {
 	return &result, nil
 }
 
-func writeAtomic(path string, mode os.FileMode, value any) (err error) {
+func writeAtomic(path string, metadata configMetadata, value any) (err error) {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
@@ -484,7 +502,10 @@ func writeAtomic(path string, mode os.FileMode, value any) (err error) {
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
-	if err = tmp.Chmod(mode); err == nil {
+	if err = tmp.Chmod(metadata.mode); err == nil {
+		err = tmp.Chown(metadata.uid, metadata.gid)
+	}
+	if err == nil {
 		_, err = tmp.Write(data)
 	}
 	if err == nil {

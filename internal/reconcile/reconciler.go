@@ -17,7 +17,7 @@ type Backend interface {
 	Materialize(context.Context, *DesiredState, LinkPlan, []netip.Prefix, []netip.Addr) error
 	PrepareDynamic(context.Context, LinkPlan) (LinkPlan, error)
 	ConfigureDynamic(context.Context, LinkPlan) error
-	RemoveDynamic(context.Context, string) error
+	RemoveDynamic(context.Context, LinkPlan) error
 	ObservedEndpoint(context.Context, string) (netip.AddrPort, bool, error)
 	ReachableLoopbacks(context.Context, int, netip.Prefix) ([]netip.Addr, error)
 }
@@ -80,8 +80,8 @@ func (r *Reconciler) ConfigureDynamic(ctx context.Context, state *DesiredState, 
 	return plan, r.backend.ConfigureDynamic(ctx, plan)
 }
 
-func (r *Reconciler) RemoveDynamic(ctx context.Context, interfaceName string) error {
-	return r.backend.RemoveDynamic(ctx, interfaceName)
+func (r *Reconciler) RemoveDynamic(ctx context.Context, plan LinkPlan) error {
+	return r.backend.RemoveDynamic(ctx, plan)
 }
 
 func (r *Reconciler) ObservedEndpoint(ctx context.Context, interfaceName string) (netip.AddrPort, bool, error) {

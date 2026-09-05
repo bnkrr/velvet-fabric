@@ -80,6 +80,35 @@ func TestEstablishmentTimeoutInterruptsHungPeer(t *testing.T) {
 	}
 }
 
+func TestWriteLoopBoundsBlockedWrite(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := make(chan writeRequest, 1)
+	done := make(chan struct{})
+	go func() {
+		writeLoop(ctx, local, requests)
+		close(done)
+	}()
+	result := make(chan error, 1)
+	requests <- writeRequest{message: message.Message{Type: message.Open, UID: &message.UID{UUID: uuid.New()}}, done: result, timeout: 20 * time.Millisecond}
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("blocked write unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked write did not respect its deadline")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not stop after a write error")
+	}
+}
+
 func TestRoutedSessionCarriesDynamicOperation(t *testing.T) {
 	aID := uuid.MustParse("10000000-0000-4000-8000-000000000001")
 	bID := uuid.MustParse("20000000-0000-4000-8000-000000000002")
