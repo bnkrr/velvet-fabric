@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type managedRoute struct {
 type Backend struct {
 	mu       sync.Mutex
 	attempts map[string]endpointAttempt
+	kernelMu sync.Mutex
 }
 
 type endpointAttempt struct {
@@ -45,7 +47,9 @@ type endpointAttempt struct {
 
 func New() *Backend { return &Backend{attempts: make(map[string]endpointAttempt)} }
 
-func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState) error {
+func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState, preserveRuntimeLinks bool) error {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
 	if os.Geteuid() != 0 {
 		return errors.New("velvetd must run as root or with equivalent network capabilities")
 	}
@@ -75,6 +79,11 @@ func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState
 	desiredLinks[reconcile.LoopbackInterface] = struct{}{}
 	for _, item := range desired.Links {
 		desiredLinks[item.InterfaceName] = struct{}{}
+	}
+	if preserveRuntimeLinks {
+		if err := retainOwnedLinkNames(desiredLinks); err != nil {
+			return err
+		}
 	}
 	// A renamed WireGuard interface may retain the same listen port. Remove stale
 	// owned interfaces before creating replacements so the port can be rebound.
@@ -181,6 +190,8 @@ func (b *Backend) Verify(ctx context.Context, desired *reconcile.DesiredState) e
 }
 
 func (b *Backend) ProposalAvailable(ctx context.Context, desired reconcile.LinkPlan, proposal link.Proposal, local []netip.Prefix) bool {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
 	if ctx.Err() != nil {
 		return false
 	}
@@ -234,6 +245,8 @@ func (b *Backend) ProposalAvailable(ctx context.Context, desired reconcile.LinkP
 }
 
 func (b *Backend) Materialize(ctx context.Context, state *reconcile.DesiredState, desired reconcile.LinkPlan, local []netip.Prefix, peerLoopbacks []netip.Addr) error {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -311,6 +324,132 @@ func (b *Backend) Materialize(ctx context.Context, state *reconcile.DesiredState
 		return err
 	}
 	return nil
+}
+
+func (b *Backend) PrepareDynamic(ctx context.Context, desired reconcile.LinkPlan) (reconcile.LinkPlan, error) {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return reconcile.LinkPlan{}, err
+	}
+	device, err := ensureOwnedWireGuardInterface(desired.InterfaceName, desired.OwnerAlias)
+	if err != nil {
+		return reconcile.LinkPlan{}, err
+	}
+	if err := reconcileBootstrapAddress(device, desired.BootstrapAddress); err != nil {
+		return reconcile.LinkPlan{}, fmt.Errorf("assign dynamic bootstrap address: %w", err)
+	}
+	if err := netlink.LinkSetUp(device); err != nil {
+		return reconcile.LinkPlan{}, fmt.Errorf("set dynamic interface up: %w", err)
+	}
+	client, err := wgctrl.New()
+	if err != nil {
+		return reconcile.LinkPlan{}, fmt.Errorf("open WireGuard control client: %w", err)
+	}
+	defer client.Close()
+	listenPort := 0
+	privateKey := desired.PrivateKey
+	if err := client.ConfigureDevice(desired.InterfaceName, wgtypes.Config{
+		PrivateKey: &privateKey, ListenPort: &listenPort, ReplacePeers: true,
+	}); err != nil {
+		return reconcile.LinkPlan{}, fmt.Errorf("reserve dynamic WireGuard endpoint: %w", err)
+	}
+	configured, err := client.Device(desired.InterfaceName)
+	if err != nil {
+		return reconcile.LinkPlan{}, fmt.Errorf("read dynamic WireGuard endpoint: %w", err)
+	}
+	if configured.ListenPort < 1 || configured.ListenPort > 65535 {
+		return reconcile.LinkPlan{}, errors.New("kernel did not allocate a dynamic WireGuard listen port")
+	}
+	desired.ListenPort = configured.ListenPort
+	return desired, nil
+}
+
+func (b *Backend) ConfigureDynamic(ctx context.Context, desired reconcile.LinkPlan) error {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	client, err := wgctrl.New()
+	if err != nil {
+		return fmt.Errorf("open WireGuard control client: %w", err)
+	}
+	defer client.Close()
+	return b.applyBootstrapLink(client, desired)
+}
+
+func (b *Backend) RemoveDynamic(ctx context.Context, interfaceName string) error {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	device, err := netlink.LinkByName(interfaceName)
+	if isLinkNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("look up dynamic interface %q: %w", interfaceName, err)
+	}
+	if device.Type() != "wireguard" || !strings.HasPrefix(device.Attrs().Alias, ownerPrefix) {
+		return fmt.Errorf("interface %q is not an owned WireGuard interface", interfaceName)
+	}
+	if err := netlink.LinkDel(device); err != nil {
+		return fmt.Errorf("delete dynamic interface %q: %w", interfaceName, err)
+	}
+	b.mu.Lock()
+	delete(b.attempts, interfaceName)
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *Backend) ObservedEndpoint(ctx context.Context, interfaceName string) (netip.AddrPort, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return netip.AddrPort{}, false, err
+	}
+	client, err := wgctrl.New()
+	if err != nil {
+		return netip.AddrPort{}, false, fmt.Errorf("open WireGuard control client: %w", err)
+	}
+	defer client.Close()
+	device, err := client.Device(interfaceName)
+	if err != nil {
+		return netip.AddrPort{}, false, fmt.Errorf("read WireGuard device %q: %w", interfaceName, err)
+	}
+	if len(device.Peers) != 1 || device.Peers[0].Endpoint == nil {
+		return netip.AddrPort{}, false, nil
+	}
+	addr, ok := netip.AddrFromSlice(device.Peers[0].Endpoint.IP)
+	if !ok || device.Peers[0].Endpoint.Port < 1 || device.Peers[0].Endpoint.Port > 65535 {
+		return netip.AddrPort{}, false, errors.New("WireGuard reported an invalid peer endpoint")
+	}
+	addr = addr.Unmap()
+	return netip.AddrPortFrom(addr, uint16(device.Peers[0].Endpoint.Port)), true, nil
+}
+
+func (b *Backend) ReachableLoopbacks(ctx context.Context, table int, pool netip.Prefix) ([]netip.Addr, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	routes, err := routesInTable(table)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[netip.Addr]struct{}{}
+	for i := range routes {
+		prefix, ok := prefixFromIPNet(routes[i].Dst)
+		if !ok || prefix.Bits() != 128 || !prefix.Addr().Is6() || !pool.Contains(prefix.Addr()) || routes[i].Type != unix.RTN_UNICAST {
+			continue
+		}
+		seen[prefix.Addr()] = struct{}{}
+	}
+	result := make([]netip.Addr, 0, len(seen))
+	for address := range seen {
+		result = append(result, address)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Compare(result[j]) < 0 })
+	return result, nil
 }
 
 func ensureStaticRoutes(desired *reconcile.DesiredState) error {
@@ -494,9 +633,9 @@ func rejectForeignTableState(desired *reconcile.DesiredState) error {
 }
 
 func cleanupLinkRoutes(desired *reconcile.DesiredState, desiredLinks map[string]struct{}) error {
-	indices := make(map[int]struct{}, len(desired.Links))
-	for _, item := range desired.Links {
-		device, err := netlink.LinkByName(item.InterfaceName)
+	indices := make(map[int]struct{}, len(desiredLinks))
+	for name := range desiredLinks {
+		device, err := netlink.LinkByName(name)
 		if err != nil {
 			return err
 		}
@@ -514,6 +653,19 @@ func cleanupLinkRoutes(desired *reconcile.DesiredState, desiredLinks map[string]
 		}
 		if err := netlink.RouteDel(&routes[i]); err != nil {
 			return fmt.Errorf("delete stale Link route: %w", err)
+		}
+	}
+	return nil
+}
+
+func retainOwnedLinkNames(names map[string]struct{}) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("list links: %w", err)
+	}
+	for _, item := range links {
+		if item.Type() == "wireguard" && strings.HasPrefix(item.Attrs().Alias, ownerPrefix) {
+			names[item.Attrs().Name] = struct{}{}
 		}
 	}
 	return nil
@@ -1031,5 +1183,8 @@ func defaultAllowedIPs() []net.IPNet {
 }
 
 func isLinkNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
 	return strings.Contains(strings.ToLower(err.Error()), "not found")
 }

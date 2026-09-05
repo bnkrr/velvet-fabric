@@ -142,3 +142,9 @@ func TestRulesMatchIncludesOwnershipAndSelectors(t *testing.T) {
 		t.Fatal("source and destination selectors matched")
 	}
 }
+
+func TestIsLinkNotFoundHandlesNil(t *testing.T) {
+	if isLinkNotFound(nil) {
+		t.Fatal("nil error was treated as link-not-found")
+	}
+}

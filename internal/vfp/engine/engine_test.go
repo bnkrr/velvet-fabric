@@ -80,6 +80,59 @@ func TestEstablishmentTimeoutInterruptsHungPeer(t *testing.T) {
 	}
 }
 
+func TestRoutedSessionCarriesDynamicOperation(t *testing.T) {
+	aID := uuid.MustParse("10000000-0000-4000-8000-000000000001")
+	bID := uuid.MustParse("20000000-0000-4000-8000-000000000002")
+	aLoopback := netip.MustParseAddr("fd41::1")
+	bLoopback := netip.MustParseAddr("fd41::2")
+	operation := [16]byte{9, 8, 7}
+	key := [32]byte{1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	aConn, bConn := net.Pipe()
+	declined := make(chan struct{}, 1)
+	aConfig := Config{
+		Context: RoutedSession, LocalUID: message.UID{UUID: aID, Name: "a"},
+		LocalLoopbackV6: aLoopback, ExpectedRemoteLoopbackV6: bLoopback,
+		LoopbackPoolV6: netip.MustParsePrefix("fd41::/48"),
+		Operational: func(session *Session) error {
+			return session.Send(message.Message{Type: message.DynamicLinkPropose, OperationID: operation, WGPublicKey: key, Endpoint: netip.MustParseAddrPort("192.0.2.1:51820")})
+		},
+		OperationalMessage: func(_ *Session, value message.Message) error {
+			if value.Type == message.DynamicLinkDecline && value.OperationID == operation {
+				declined <- struct{}{}
+			}
+			return nil
+		},
+	}
+	bConfig := Config{
+		Context: RoutedSession, LocalUID: message.UID{UUID: bID, Name: "b"}, LocalLoopbackV6: bLoopback,
+		LoopbackPoolV6: netip.MustParsePrefix("fd41::/48"),
+		OperationalMessage: func(session *Session, value message.Message) error {
+			if value.Type != message.DynamicLinkPropose {
+				t.Fatalf("unexpected routed message %v", value.Type)
+			}
+			return session.Send(message.Message{Type: message.DynamicLinkDecline, OperationID: value.OperationID})
+		},
+	}
+	errors := make(chan error, 2)
+	go func() { errors <- New(aConfig).Run(ctx, aConn) }()
+	go func() { errors <- New(bConfig).Run(ctx, bConn) }()
+	select {
+	case <-declined:
+	case <-time.After(time.Second):
+		t.Fatal("dynamic decline was not delivered")
+	}
+	cancel()
+	for range 2 {
+		select {
+		case <-errors:
+		case <-time.After(time.Second):
+			t.Fatal("routed engine did not stop")
+		}
+	}
+}
+
 func testConfig(id uuid.UUID, name string, v6 netip.Addr, accept func(message.UID, link.Proposal) bool, result chan<- Result) Config {
 	return Config{
 		LocalUID: message.UID{UUID: id, Name: name}, LocalLoopbackV6: v6,

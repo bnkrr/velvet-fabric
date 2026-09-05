@@ -32,13 +32,14 @@ var peerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 var interfacePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 type NodeSpec struct {
-	APIVersion string                `json:"api_version"`
-	Kind       string                `json:"kind"`
-	Fabric     FabricSpec            `json:"fabric"`
-	Node       Node                  `json:"node"`
-	Peers      []Peer                `json:"peers"`
-	Babel      *BabelSpec            `json:"babel,omitempty"`
-	Domains    map[string]DomainSpec `json:"domains,omitempty"`
+	APIVersion   string                `json:"api_version"`
+	Kind         string                `json:"kind"`
+	Fabric       FabricSpec            `json:"fabric"`
+	Node         Node                  `json:"node"`
+	Peers        []Peer                `json:"peers"`
+	Babel        *BabelSpec            `json:"babel,omitempty"`
+	DynamicLinks *DynamicLinksSpec     `json:"dynamic_links,omitempty"`
+	Domains      map[string]DomainSpec `json:"domains,omitempty"`
 }
 
 type FabricSpec struct {
@@ -56,6 +57,17 @@ type BabelSpec struct {
 	Enabled    *bool  `json:"enabled"`
 	Executable string `json:"executable,omitempty"`
 }
+
+type DynamicLinksSpec struct {
+	Mode                   string   `json:"mode"`
+	AllowCandidatePrefixes []string `json:"allow_candidate_prefixes,omitempty"`
+}
+
+const (
+	DynamicLinksActive  = "active"
+	DynamicLinksPassive = "passive"
+	DynamicLinksOff     = "off"
+)
 
 type Node struct {
 	UID               NodeUID `json:"uid"`
@@ -238,6 +250,31 @@ func (s *NodeSpec) Validate() error {
 			problems = append(problems, "babel.executable must be an absolute path")
 		}
 	}
+	if s.DynamicLinks != nil {
+		switch s.DynamicLinks.Mode {
+		case DynamicLinksActive, DynamicLinksPassive:
+			if len(s.DynamicLinks.AllowCandidatePrefixes) == 0 {
+				problems = append(problems, "dynamic_links.allow_candidate_prefixes must not be empty in active or passive mode")
+			}
+		case DynamicLinksOff:
+		case "":
+			problems = append(problems, "dynamic_links.mode is required when dynamic_links is present")
+		default:
+			problems = append(problems, "dynamic_links.mode must be active, passive, or off")
+		}
+		seen := map[netip.Prefix]struct{}{}
+		for i, raw := range s.DynamicLinks.AllowCandidatePrefixes {
+			prefix, err := parseCanonicalPrefix(raw)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("dynamic_links.allow_candidate_prefixes[%d] %v", i, err))
+				continue
+			}
+			if _, exists := seen[prefix]; exists {
+				problems = append(problems, fmt.Sprintf("dynamic_links.allow_candidate_prefixes[%d] duplicates %s", i, prefix))
+			}
+			seen[prefix] = struct{}{}
+		}
+	}
 	if !uidNamePattern.MatchString(s.Node.UID.Name) {
 		problems = append(problems, "node.uid.name must contain at most five lowercase letters or digits")
 	}
@@ -359,6 +396,12 @@ func (f FabricSpec) EffectiveRoutingTableID() int {
 func (s *BabelSpec) IsEnabled() bool {
 	return s != nil && s.Enabled != nil && *s.Enabled
 }
+func (s *DynamicLinksSpec) IsActive() bool {
+	return s != nil && s.Mode == DynamicLinksActive
+}
+func (s *DynamicLinksSpec) AllowsInbound() bool {
+	return s != nil && (s.Mode == DynamicLinksActive || s.Mode == DynamicLinksPassive)
+}
 func ParseKey(value string) (wgtypes.Key, error) { return wgtypes.ParseKey(strings.TrimSpace(value)) }
 func ParsePSK(value string) ([]byte, error)      { return parseInlineKey(value) }
 
@@ -390,6 +433,17 @@ func InterfaceName(local NodeUID, peerName, peerPublicKey string) string {
 	}
 	digest := deriveDigest([]byte("velvet/interface-name/v2"), local.UUID, peerName, peerPublicKey)
 	return fmt.Sprintf("vl-%.3s-%.3s-%02x%02x", left, right, digest[0], digest[1])
+}
+
+func DynamicInterfaceName(remote NodeUID) string {
+	suffix := strings.ReplaceAll(strings.ToLower(remote.UUID), "-", "")
+	if len(suffix) > 4 {
+		suffix = suffix[:4]
+	}
+	if remote.Name == "" {
+		return "vdl-" + suffix
+	}
+	return "vdl-" + remote.Name + "-" + suffix
 }
 
 func readConfig(path string) ([]byte, os.FileMode, error) {
@@ -527,6 +581,8 @@ func validateRouting(s *NodeSpec, peerNames map[string]struct{}) []string {
 		}
 		if err := validateTableID(domain.TableID); err != nil {
 			problems = append(problems, where+".table_id "+err.Error())
+		} else if domain.TableID <= s.Fabric.EffectiveRoutingTableID() {
+			problems = append(problems, where+".table_id must be greater than fabric.routing_table_id")
 		} else if owner, exists := tables[domain.TableID]; exists {
 			problems = append(problems, fmt.Sprintf("%s.table_id duplicates %s", where, owner))
 		} else {

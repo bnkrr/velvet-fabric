@@ -70,7 +70,11 @@ func (m *Manager) SetLinkPrefixes(interfaceName string, prefixes []netip.Prefix)
 		m.mu.Unlock()
 		return
 	}
-	m.latest[interfaceName] = clean
+	if len(clean) == 0 {
+		delete(m.latest, interfaceName)
+	} else {
+		m.latest[interfaceName] = clean
+	}
 	m.mu.Unlock()
 	select {
 	case m.updates <- linkUpdate{interfaceName: interfaceName, prefixes: clean}:
@@ -207,7 +211,7 @@ func (m *Manager) waitReady(ctx context.Context, waited <-chan error, digest str
 			return false, fmt.Errorf("babel-rs did not become ready within 10s")
 		case <-ticker.C:
 			var status daemonStatus
-			if controlRequest(ctx, m.plan.ControlPath, "status", &status) == nil && status.Ready && status.ActiveConfigSHA256 == digest && status.AttachedInterfaces == len(m.plan.Interfaces) {
+			if controlRequest(ctx, m.plan.ControlPath, "status", &status) == nil && status.Ready && status.ActiveConfigSHA256 == digest {
 				m.setStatus(Status{State: "running", PID: pid, Version: status.Version, ConfigGeneration: status.ConfigGeneration, ActiveConfigSHA256: status.ActiveConfigSHA256, AttachedInterfaces: status.AttachedInterfaces, Neighbors: status.Neighbors, SelectedRoutes: status.SelectedRoutes})
 				return false, nil
 			}
