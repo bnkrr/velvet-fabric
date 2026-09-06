@@ -3,8 +3,10 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,7 +50,7 @@ func dynamicFixture(t *testing.T, backend *runtimeBackend) (*dynamicRuntime, *en
 }
 
 func TestDynamicCommitValidatesBeforeMaterialization(t *testing.T) {
-	for _, scenario := range []string{"wrong-node", "superseded", "cancelled", "stopped", "proposing", "materialize-failed", "valid"} {
+	for _, scenario := range []string{"wrong-node", "superseded", "cancelled", "stopped", "proposing", "materialize-failed", "valid", "recovering"} {
 		t.Run(scenario, func(t *testing.T) {
 			backend := &runtimeBackend{}
 			d, session, proposal := dynamicFixture(t, backend)
@@ -71,11 +73,22 @@ func TestDynamicCommitValidatesBeforeMaterialization(t *testing.T) {
 				d.stopped = true
 			case "proposing":
 				attempt.state = dynamicProposing
+			case "recovering":
+				attempt.state = dynamicRecovering
 			case "materialize-failed":
 				backend.materializeErr = errors.New("kernel failure")
 			}
+			var recovered bool
+			d.runner.Log = func(event Event) {
+				if event.Event == "velvet-dynamic-link" && event.Status == "recovered" {
+					recovered = true
+				}
+			}
 			err := d.commitLink(ctx, attempt, result)
-			if scenario == "valid" {
+			if scenario == "valid" || scenario == "recovering" {
+				if recovered != (scenario == "recovering") {
+					t.Fatal("incorrect recovery notification")
+				}
 				if err != nil || attempt.state != dynamicUp || len(d.runner.states) != 1 || backend.materialized != 1 {
 					t.Fatalf("valid commit: err=%v state=%v calls=%d", err, attempt.state, backend.materialized)
 				}
@@ -209,28 +222,106 @@ func TestEndpointEvidenceUsesActualListenPort(t *testing.T) {
 }
 
 func TestDynamicStopWaitsForWorkersBeforeCleanup(t *testing.T) {
-	backend := &runtimeBackend{}
-	d, session, proposal := dynamicFixture(t, backend)
-	if attempt, _ := d.prepareInbound(session, proposal); attempt == nil {
-		t.Fatal("inbound preparation failed")
-	}
-	release := make(chan struct{})
-	d.workers.Go(func() { <-d.ctx.Done(); <-release })
-	stopped := make(chan struct{})
-	go func() { d.stop(); close(stopped) }()
-	<-d.ctx.Done()
-	select {
-	case <-stopped:
+	synctest.Test(t, func(t *testing.T) {
+		backend := &runtimeBackend{}
+		d, session, proposal := dynamicFixture(t, backend)
+		if attempt, _ := d.prepareInbound(session, proposal); attempt == nil {
+			t.Fatal("inbound preparation failed")
+		}
+		release := make(chan struct{})
+		workerExited := make(chan struct{})
+		order := make(chan bool, 1)
+		backend.onRemove = func() {
+			select {
+			case <-workerExited:
+				order <- true
+			default:
+				order <- false
+			}
+		}
+		d.workers.Go(func() { <-d.ctx.Done(); <-release; close(workerExited) })
+		stopped := make(chan struct{})
+		go func() { d.stop(); close(stopped) }()
+		synctest.Wait()
+		<-d.ctx.Done()
+		select {
+		case <-stopped:
+			close(release)
+			t.Fatal("stop returned before its worker exited")
+		default:
+		}
 		close(release)
-		t.Fatal("stop returned before its worker exited")
-	case <-time.After(50 * time.Millisecond):
+		<-stopped
+		if len(backend.removed) != 1 || !<-order {
+			t.Fatal("interface cleanup preceded worker exit or was omitted")
+		}
+		if attempt, _ := d.prepareInbound(session, proposal); attempt != nil || backend.prepared != 1 {
+			t.Fatal("stopped runtime prepared another Link")
+		}
+	})
+}
+
+func TestDynamicResponsesCannotAffectAnotherAttempt(t *testing.T) {
+	for _, kind := range []message.Type{message.DynamicLinkAccept, message.DynamicLinkDecline} {
+		for _, scenario := range []string{"wrong-session", "wrong-operation", "late-response"} {
+			t.Run(fmt.Sprintf("%d/%s", kind, scenario), func(t *testing.T) {
+				backend := &runtimeBackend{}
+				d, session, proposal := dynamicFixture(t, backend)
+				attempt, _, err := d.prepareOutbound(session)
+				if err != nil || attempt == nil {
+					t.Fatal("preparation failed")
+				}
+				response := proposal
+				response.Type = kind
+				response.OperationID = attempt.operationID
+				responding := session
+				switch scenario {
+				case "wrong-session":
+					copy := *session
+					responding = &copy
+				case "wrong-operation":
+					response.OperationID[0] ^= 1
+				case "late-response":
+					d.failAttempt(attempt, "timeout", dynamicProposing)
+				}
+				removed := len(backend.removed)
+				if err := d.handleRoutedMessage(responding, response); err != nil {
+					t.Fatal(err)
+				}
+				if backend.configured != 0 || len(backend.removed) != removed || len(d.pendingCleanups) != 0 {
+					t.Fatal("unmatched response changed resources")
+				}
+				if scenario != "late-response" && d.attempts[attempt.remote] != attempt {
+					t.Fatal("unmatched response replaced active Attempt")
+				}
+			})
+		}
 	}
-	close(release)
-	<-stopped
-	if len(backend.removed) != 1 {
-		t.Fatal("stop did not remove its reservation")
-	}
-	if attempt, _ := d.prepareInbound(session, proposal); attempt != nil || backend.prepared != 1 {
-		t.Fatal("stopped runtime prepared another Link")
+}
+
+func TestDynamicConfigurationFailureCleansReservation(t *testing.T) {
+	for _, inbound := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inbound=%v", inbound), func(t *testing.T) {
+			backend := &runtimeBackend{configureErr: errors.New("kernel rejected configuration")}
+			d, session, response := dynamicFixture(t, backend)
+			if inbound {
+				if attempt, _ := d.prepareInbound(session, response); attempt != nil {
+					t.Fatal("failed configuration was accepted")
+				}
+			} else {
+				attempt, _, err := d.prepareOutbound(session)
+				if err != nil || attempt == nil {
+					t.Fatal("preparation failed")
+				}
+				response.Type = message.DynamicLinkAccept
+				response.OperationID = attempt.operationID
+				if err := d.handleAccept(session, response); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if backend.configured != 1 || len(backend.removed) != 1 || len(d.attempts) != 0 || len(d.runner.states) != 0 {
+				t.Fatal("configuration failure leaked state")
+			}
+		})
 	}
 }

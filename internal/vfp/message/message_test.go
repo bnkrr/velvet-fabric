@@ -1,8 +1,12 @@
 package message
 
 import (
+	"bytes"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"net/netip"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -27,42 +31,31 @@ func TestMessageRoundTripAndUnknownTLV(t *testing.T) {
 	}
 }
 
-func TestDynamicMessagesRoundTrip(t *testing.T) {
-	operation := [16]byte{1, 2, 3}
-	key := [32]byte{4, 5, 6}
-	endpoint := netip.MustParseAddrPort("[2001:db8::1]:51820")
-	for _, kind := range []Type{DynamicLinkPropose, DynamicLinkAccept} {
-		frame, err := Encode(Message{Type: kind, OperationID: operation, WGPublicKey: key, Endpoint: endpoint})
-		if err != nil {
-			t.Fatal(err)
+func TestOperationalMessagesRoundTrip(t *testing.T) {
+	for _, endpoint := range []string{"192.0.2.9:49152", "[2001:db8::1]:51820"} {
+		for _, kind := range []Type{EndpointObservation, DynamicLinkPropose, DynamicLinkAccept, DynamicLinkDecline} {
+			if kind == DynamicLinkDecline && endpoint != "192.0.2.9:49152" {
+				continue
+			}
+			want := Message{Type: kind}
+			if kind != DynamicLinkDecline {
+				want.Endpoint = netip.MustParseAddrPort(endpoint)
+			}
+			if kind != EndpointObservation {
+				want.OperationID = [16]byte{1, 2, 3}
+			}
+			if kind == DynamicLinkPropose || kind == DynamicLinkAccept {
+				want.WGPublicKey = [32]byte{4, 5, 6}
+			}
+			frame, err := Encode(want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := Decode(frame)
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("%v: got %#v, want %#v: %v", kind, got, want, err)
+			}
 		}
-		got, err := Decode(frame)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got.OperationID != operation || got.WGPublicKey != key || got.Endpoint != endpoint {
-			t.Fatalf("dynamic message mismatch: %#v", got)
-		}
-	}
-	frame, err := Encode(Message{Type: DynamicLinkDecline, OperationID: operation})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := Decode(frame)
-	if err != nil || got.OperationID != operation {
-		t.Fatalf("decline mismatch: %#v %v", got, err)
-	}
-}
-
-func TestEndpointObservationRoundTrip(t *testing.T) {
-	want := netip.MustParseAddrPort("192.0.2.9:49152")
-	frame, err := Encode(Message{Type: EndpointObservation, Endpoint: want})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := Decode(frame)
-	if err != nil || got.Endpoint != want {
-		t.Fatalf("observation mismatch: %#v %v", got, err)
 	}
 }
 
@@ -154,4 +147,82 @@ func TestProposalMayBeEmpty(t *testing.T) {
 	if err == nil {
 		t.Fatal("empty NODE_STATE accepted")
 	}
+}
+
+// A literal protocol vector prevents encoder and decoder from sharing a wire-format bug.
+func TestEndpointObservationWireVector(t *testing.T) {
+	frame, err := hex.DecodeString("01050010000800080001c000c0000209")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Message{Type: EndpointObservation, Endpoint: netip.MustParseAddrPort("192.0.2.9:49152")}
+	got, err := Decode(frame)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("decode: %#v %v", got, err)
+	}
+	encoded, err := Encode(want)
+	if err != nil || !bytes.Equal(encoded, frame) {
+		t.Fatalf("encode: %x %v", encoded, err)
+	}
+}
+
+func TestReadRejectsInvalidFraming(t *testing.T) {
+	for name, frame := range map[string][]byte{
+		"short-header": {1, 4, 0}, "short-body": {1, 4, 0, 5},
+		"undersize": {1, 4, 0, 3}, "oversize": {1, 4, 0x10, 1}, "version": {2, 4, 0, 4},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Read(bytes.NewReader(frame)); !errors.Is(err, ErrConnection) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+func TestDecodeRequiresEachDynamicParameter(t *testing.T) {
+	for _, kind := range []Type{DynamicLinkPropose, DynamicLinkAccept} {
+		for _, missing := range []uint16{OperationIDTLV, WGPublicKeyTLV, WGEndpointTLV} {
+			var body []byte
+			for _, field := range []struct {
+				kind  uint16
+				value []byte
+			}{
+				{OperationIDTLV, make([]byte, 16)}, {WGPublicKeyTLV, append([]byte{1}, make([]byte, 31)...)},
+				{WGEndpointTLV, []byte{0, 1, 0, 1, 192, 0, 2, 1}},
+			} {
+				if field.kind != missing {
+					body = tlv.Append(body, field.kind, field.value)
+				}
+			}
+			frame := append([]byte{1, byte(kind), 0, byte(4 + len(body))}, body...)
+			if _, err := Decode(frame); !errors.Is(err, ErrFrame) {
+				t.Fatalf("kind %d missing %d: %v", kind, missing, err)
+			}
+		}
+	}
+}
+
+func FuzzMessageDecode(f *testing.F) {
+	for _, seed := range []string{"01040004", "01050010000800080001c000c0000209", "01ff0004", "01010004"} {
+		data, _ := hex.DecodeString(seed)
+		f.Add(data)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > MaxFrameLength+1 {
+			return
+		}
+		_, _ = Read(bytes.NewReader(data))
+		value, err := Decode(data)
+		if err != nil {
+			return
+		}
+		encoded, err := Encode(value)
+		if err != nil {
+			t.Fatalf("decoded message cannot encode: %v", err)
+		}
+		again, err := Decode(encoded)
+		if err != nil || !reflect.DeepEqual(value, again) {
+			t.Fatalf("unstable message: %#v => %#v: %v", value, again, err)
+		}
+	})
 }

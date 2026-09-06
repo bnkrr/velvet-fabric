@@ -5,6 +5,7 @@ go 1.26.0
 toolchain go1.27.1
 
 require (
+	github.com/google/go-cmp v0.6.0
 	github.com/google/uuid v1.6.0
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/crypto v0.56.0
@@ -14,7 +15,6 @@ require (
 )
 
 require (
-	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/josharian/native v1.1.0 // indirect
 	github.com/mdlayher/genetlink v1.3.2 // indirect
 	github.com/mdlayher/netlink v1.7.2 // indirect

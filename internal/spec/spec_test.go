@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -16,6 +17,10 @@ func TestLoadGeneratesAndAtomicallyPersistsUUID(t *testing.T) {
 	value := validSpec(t)
 	value.Node.UID.UUID = ""
 	writeJSON(t, path, value)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	loaded, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
@@ -29,6 +34,14 @@ func TestLoadGeneratesAndAtomicallyPersistsUUID(t *testing.T) {
 	}
 	if loadedAgain.Node.UID.UUID != loaded.Node.UID.UUID {
 		t.Fatal("persisted UUID changed")
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := before.Sys().(*syscall.Stat_t), after.Sys().(*syscall.Stat_t)
+	if before.Mode().Perm() != after.Mode().Perm() || a.Uid != b.Uid || a.Gid != b.Gid {
+		t.Fatal("UUID rewrite changed permissions or ownership")
 	}
 }
 
@@ -54,45 +67,28 @@ func TestLoadRejectsInsecurePermissionsAndSymlinks(t *testing.T) {
 	}
 }
 
-func TestUUIDRewritePreservesModeAndOwnership(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "node.json")
-	value := validSpec(t)
-	value.Node.UID.UUID = ""
-	writeJSON(t, path, value)
-	before, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err != nil {
-		t.Fatal(err)
-	}
-	after, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if before.Mode().Perm() != after.Mode().Perm() {
-		t.Fatalf("mode changed from %04o to %04o", before.Mode().Perm(), after.Mode().Perm())
-	}
-	beforeStat, beforeOK := before.Sys().(*syscall.Stat_t)
-	afterStat, afterOK := after.Sys().(*syscall.Stat_t)
-	if !beforeOK || !afterOK || beforeStat.Uid != afterStat.Uid || beforeStat.Gid != afterStat.Gid {
-		t.Fatal("ownership changed during atomic rewrite")
-	}
-}
-
 func TestLoadRejectsRemoteIdentityAndKeyFileFields(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "node.json")
-	value := validSpec(t)
-	data, _ := json.Marshal(value)
-	var raw map[string]any
-	_ = json.Unmarshal(data, &raw)
-	peer := raw["peers"].([]any)[0].(map[string]any)
-	peer["uuid"] = uuid.NewString()
-	node := raw["node"].(map[string]any)
-	node["private_key_file"] = "/tmp/key"
-	writeJSON(t, path, raw)
-	if _, err := Load(path); err == nil {
-		t.Fatal("removed schema fields were accepted")
+	for _, field := range []string{"uuid", "private_key_file"} {
+		t.Run(field, func(t *testing.T) {
+			data, err := json.Marshal(validSpec(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(data, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if field == "uuid" {
+				raw["peers"].([]any)[0].(map[string]any)[field] = uuid.NewString()
+			} else {
+				raw["node"].(map[string]any)[field] = "/tmp/key"
+			}
+			path := filepath.Join(t.TempDir(), "node.json")
+			writeJSON(t, path, raw)
+			if _, err := Load(path); err == nil || !strings.Contains(err.Error(), field) {
+				t.Fatalf("Load = %v, want rejected %s", err, field)
+			}
+		})
 	}
 }
 
@@ -162,34 +158,33 @@ func TestRouteAcceptsScalarAndExpandedForms(t *testing.T) {
 	}
 }
 
-func TestRouteExpandedFormRejectsUnknownFields(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "node.json")
-	value := validSpec(t)
-	data, _ := json.Marshal(value)
-	var raw map[string]any
-	_ = json.Unmarshal(data, &raw)
-	raw["fabric"].(map[string]any)["routes"] = map[string]any{"b": []any{map[string]any{"prefix": "fd41::20/128", "weight": 10}}}
-	writeJSON(t, path, raw)
-	if _, err := Load(path); err == nil {
-		t.Fatal("unknown expanded route field was accepted")
-	}
-}
-
-func TestValidationChecksRoutingOwnershipAndDomains(t *testing.T) {
-	value := validSpec(t)
-	metric := uint32(10)
-	value.Fabric.Routes = Routes{"missing": {{Prefix: "fd41::20/128"}}}
-	value.Domains = map[string]DomainSpec{
-		"one": {
-			TableID:        DefaultRoutingTableID,
-			SourcePrefixes: []string{"10.10.0.0/16"},
-			Routes:         Routes{"b": {{Prefix: "192.0.2.0/24", Metric: &metric}}},
-			Announcements:  []Announcement{{Prefix: "192.0.2.0/24"}},
-		},
-		"two": {TableID: 20002, SourcePrefixes: []string{"10.10.1.0/24"}},
-	}
-	if err := value.Validate(); err == nil {
-		t.Fatal("invalid route ownership, duplicate table, overlapping domains, and conflicting announcement were accepted")
+func TestRouteAndAnnouncementJSON(t *testing.T) {
+	for _, kind := range []string{"route", "announcement"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, raw := range []string{`"192.0.2.0/24"`, `{"prefix":"192.0.2.0/24","metric":20}`, `{"prefix":"192.0.2.0/24","weight":20}`} {
+				var prefix string
+				var metric *uint32
+				var err error
+				if kind == "route" {
+					var v Route
+					err = json.Unmarshal([]byte(raw), &v)
+					prefix, metric = v.Prefix, v.Metric
+				} else {
+					var v Announcement
+					err = json.Unmarshal([]byte(raw), &v)
+					prefix, metric = v.Prefix, v.Metric
+				}
+				if strings.Contains(raw, "weight") {
+					if err == nil {
+						t.Fatal("unknown field accepted")
+					}
+					continue
+				}
+				if err != nil || prefix != "192.0.2.0/24" || (metric != nil) != strings.Contains(raw, "metric") || metric != nil && *metric != 20 {
+					t.Fatalf("decode %s: %s %v %v", raw, prefix, metric, err)
+				}
+			}
+		})
 	}
 }
 
@@ -211,90 +206,75 @@ func TestValidationAcceptsStaticCoreRouting(t *testing.T) {
 	}
 }
 
-func TestAnnouncementAcceptsScalarAndExpandedForms(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "node.json")
-	value := validSpec(t)
-	data, _ := json.Marshal(value)
-	var raw map[string]any
-	_ = json.Unmarshal(data, &raw)
-	raw["fabric"].(map[string]any)["announcements"] = []any{
-		"fd30::/64",
-		map[string]any{"prefix": "198.51.100.0/24", "metric": 20},
-	}
-	writeJSON(t, path, raw)
-	loaded, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := loaded.Fabric.Announcements; len(got) != 2 || got[0].Metric != nil || got[1].Metric == nil || *got[1].Metric != 20 {
-		t.Fatalf("decoded announcements = %#v", got)
-	}
-}
-
-func TestAnnouncementsRequireLocalOwnershipAndDomainFamily(t *testing.T) {
-	value := validSpec(t)
-	value.Fabric.Routes = Routes{"b": {{Prefix: "fd30::/64"}}}
-	value.Fabric.Announcements = []Announcement{{Prefix: "fd30::/64"}}
-	value.Domains = map[string]DomainSpec{
-		"production": {
-			TableID:        20001,
-			SourcePrefixes: []string{"10.100.1.0/24"},
-			Announcements:  []Announcement{{Prefix: "fd40::/64"}},
-		},
-	}
-	if err := value.Validate(); err == nil {
-		t.Fatal("conflicting Fabric ownership and family-less Domain announcement were accepted")
-	}
-}
-
-func TestBabelSectionRequiresEnabledAndAbsoluteExecutable(t *testing.T) {
-	value := validSpec(t)
-	value.Babel = &BabelSpec{Executable: "babel-rs"}
-	if err := value.Validate(); err == nil {
-		t.Fatal("babel section without enabled and with relative executable was accepted")
-	}
+func TestValidationRejectsEachInvalidConstraint(t *testing.T) {
 	enabled := true
-	value.Babel = &BabelSpec{Enabled: &enabled, Executable: "/usr/local/bin/babel-rs"}
-	if err := value.Validate(); err != nil {
-		t.Fatalf("valid Babel section rejected: %v", err)
+	for _, tc := range []struct {
+		name, want string
+		change     func(*NodeSpec)
+	}{
+		{"unknown-peer", "unknown peer", func(s *NodeSpec) { s.Fabric.Routes = Routes{"missing": {{Prefix: "fd41::20/128"}}} }},
+		{"fabric-table-conflict", "greater than", func(s *NodeSpec) { d := s.Domains["one"]; d.TableID = DefaultRoutingTableID; s.Domains["one"] = d }},
+		{"table-before-fabric", "greater than", func(s *NodeSpec) { d := s.Domains["one"]; d.TableID = 19000; s.Domains["one"] = d }},
+		{"duplicate-domain-table", "duplicates", func(s *NodeSpec) {
+			s.Domains["two"] = DomainSpec{TableID: 20001, SourcePrefixes: []string{"10.20.0.0/16"}}
+		}},
+		{"overlapping-sources", "overlaps", func(s *NodeSpec) {
+			s.Domains["two"] = DomainSpec{TableID: 20002, SourcePrefixes: []string{"10.10.1.0/24"}}
+		}},
+		{"domain-route-announcement", "conflicts", func(s *NodeSpec) {
+			d := s.Domains["one"]
+			d.Routes = Routes{"b": {{Prefix: "192.0.2.0/24"}}}
+			d.Announcements = []Announcement{{Prefix: "192.0.2.0/24"}}
+			s.Domains["one"] = d
+		}},
+		{"fabric-route-announcement", "conflicts", func(s *NodeSpec) {
+			s.Fabric.Routes = Routes{"b": {{Prefix: "fd30::/64"}}}
+			s.Fabric.Announcements = []Announcement{{Prefix: "fd30::/64"}}
+		}},
+		{"announcement-family", "same-family", func(s *NodeSpec) {
+			d := s.Domains["one"]
+			d.Announcements = []Announcement{{Prefix: "fd40::/64"}}
+			s.Domains["one"] = d
+		}},
+		{"babel-enabled-missing", "babel.enabled", func(s *NodeSpec) { s.Babel = &BabelSpec{Executable: "/usr/bin/babel-rs"} }},
+		{"babel-relative-path", "absolute", func(s *NodeSpec) { s.Babel = &BabelSpec{Enabled: &enabled, Executable: "babel-rs"} }},
+		{"dynamic-mode-missing", "mode is required", func(s *NodeSpec) { s.DynamicLinks = &DynamicLinksSpec{} }},
+		{"dynamic-mode-unknown", "mode must be", func(s *NodeSpec) {
+			s.DynamicLinks = &DynamicLinksSpec{Mode: "automatic", AllowCandidatePrefixes: []string{"192.0.2.0/24"}}
+		}},
+		{"dynamic-empty-allowlist", "must not be empty", func(s *NodeSpec) { s.DynamicLinks = &DynamicLinksSpec{Mode: DynamicLinksActive} }},
+		{"dynamic-host-bits", "canonical", func(s *NodeSpec) {
+			s.DynamicLinks = &DynamicLinksSpec{Mode: DynamicLinksActive, AllowCandidatePrefixes: []string{"192.0.2.1/24"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := validSpec(t)
+			s.Domains = map[string]DomainSpec{"one": {TableID: 20001, SourcePrefixes: []string{"10.10.0.0/16"}}}
+			if err := s.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			tc.change(&s)
+			if err := s.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
-func TestDynamicLinksSectionValidation(t *testing.T) {
-	value := validSpec(t)
-	value.DynamicLinks = &DynamicLinksSpec{}
-	if err := value.Validate(); err == nil {
-		t.Fatal("dynamic_links without mode was accepted")
-	}
-	value.DynamicLinks.Mode = DynamicLinksActive
-	if err := value.Validate(); err == nil {
-		t.Fatal("active dynamic_links without candidate prefixes was accepted")
-	}
-	value.DynamicLinks.AllowCandidatePrefixes = []string{"0.0.0.0/0", "::/0"}
-	if err := value.Validate(); err != nil {
-		t.Fatalf("valid active dynamic_links rejected: %v", err)
-	}
-	value.DynamicLinks.Mode = DynamicLinksPassive
-	if err := value.Validate(); err != nil {
-		t.Fatalf("valid passive dynamic_links rejected: %v", err)
-	}
-	value.DynamicLinks = &DynamicLinksSpec{Mode: DynamicLinksOff}
-	if err := value.Validate(); err != nil {
-		t.Fatalf("off dynamic_links rejected: %v", err)
-	}
-	value.DynamicLinks = &DynamicLinksSpec{Mode: "automatic", AllowCandidatePrefixes: []string{"192.0.2.1/24"}}
-	if err := value.Validate(); err == nil {
-		t.Fatal("invalid mode and non-canonical candidate prefix were accepted")
-	}
-}
-
-func TestDomainTableMustFollowFabricDestinationRules(t *testing.T) {
-	value := validSpec(t)
-	value.Domains = map[string]DomainSpec{
-		"production": {TableID: 19000, SourcePrefixes: []string{"10.0.0.0/8"}},
-	}
-	if err := value.Validate(); err == nil {
-		t.Fatal("domain table before Fabric table was accepted")
+func TestDynamicLinksModes(t *testing.T) {
+	for _, mode := range []string{DynamicLinksActive, DynamicLinksPassive, DynamicLinksOff} {
+		t.Run(mode, func(t *testing.T) {
+			s := validSpec(t)
+			s.DynamicLinks = &DynamicLinksSpec{Mode: mode}
+			if mode != DynamicLinksOff {
+				s.DynamicLinks.AllowCandidatePrefixes = []string{"0.0.0.0/0", "::/0"}
+			}
+			enabled := true
+			s.Babel = &BabelSpec{Enabled: &enabled, Executable: "/usr/bin/babel-rs"}
+			if err := s.Validate(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

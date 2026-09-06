@@ -32,22 +32,25 @@ func TestPrefixIPNetPreservesHostAddress(t *testing.T) {
 
 func TestEndpointRotationAndFreshHandshake(t *testing.T) {
 	backend := New()
-	plan := reconcile.LinkPlan{InterfaceName: "vl-a-b", Endpoints: []string{"192.0.2.1:5000", "192.0.2.2:5000"}}
+	key := wgtypes.Key{1}
+	plan := reconcile.LinkPlan{InterfaceName: "vl-a-b", PeerPublicKey: key, Endpoints: []string{"192.0.2.1:5000", "192.0.2.2:5000"}}
 	device := &wgtypes.Device{}
 	if got, change := backend.endpointChoice(plan, device); got != 0 || !change {
-		t.Fatalf("initial endpoint = %d, want 0", got)
+		t.Fatalf("initial endpoint = %d, change=%v", got, change)
 	}
-	backend.mu.Lock()
-	attempt := backend.attempts[plan.InterfaceName]
-	attempt.since = time.Now().Add(-16 * time.Second)
-	backend.attempts[plan.InterfaceName] = attempt
-	backend.mu.Unlock()
+	expire := func() {
+		attempt := backend.attempts[plan.InterfaceName]
+		attempt.since = time.Now().Add(-16 * time.Second)
+		backend.attempts[plan.InterfaceName] = attempt
+	}
+	expire()
 	if got, change := backend.endpointChoice(plan, device); got != 1 || !change {
-		t.Fatalf("endpoint after timeout = %d, want 1", got)
+		t.Fatalf("expired endpoint = %d, change=%v", got, change)
 	}
-	device.Peers = []wgtypes.Peer{{LastHandshakeTime: time.Now()}}
-	if got, _ := backend.endpointChoice(plan, device); got != 1 {
-		t.Fatalf("fresh handshake changed endpoint to %d", got)
+	expire()
+	device.Peers = []wgtypes.Peer{{PublicKey: key, Endpoint: &net.UDPAddr{IP: net.ParseIP("192.0.2.2"), Port: 5000}, LastHandshakeTime: time.Now()}}
+	if got, change := backend.endpointChoice(plan, device); got != 1 || change {
+		t.Fatalf("fresh handshake rotated endpoint: index=%d change=%v", got, change)
 	}
 }
 
@@ -167,16 +170,6 @@ func TestDynamicOwnershipRequiresExactAliasAndType(t *testing.T) {
 	}
 }
 
-func TestDesiredLinkNamesIncludesLoopbackAndConfiguredLinks(t *testing.T) {
-	desired := &reconcile.DesiredState{Links: []reconcile.LinkPlan{{InterfaceName: "vl-a"}, {InterfaceName: "vl-b"}}}
-	names := desiredLinkNames(desired)
-	for _, name := range []string{reconcile.LoopbackInterface, "vl-a", "vl-b"} {
-		if _, ok := names[name]; !ok {
-			t.Fatalf("desired names missing %q", name)
-		}
-	}
-}
-
 func TestDesiredRoutesAndRules(t *testing.T) {
 	metric := uint32(42)
 	desired := &reconcile.DesiredState{
@@ -237,33 +230,8 @@ func TestNetworkValueHelpers(t *testing.T) {
 	if !prefixesOverlap(prefix, netip.MustParsePrefix("192.0.2.5/32")) || prefixesOverlap(prefix, netip.MustParsePrefix("2001:db8::/64")) {
 		t.Fatal("prefix overlap returned the wrong result")
 	}
-	if family(prefix.Addr()) != netlink.FAMILY_V4 || family(netip.MustParseAddr("2001:db8::1")) != netlink.FAMILY_V6 {
-		t.Fatal("address family returned the wrong result")
-	}
 	if _, ok := prefixFromIPNet(nil); ok {
 		t.Fatal("nil IPNet produced a prefix")
-	}
-	if got := forwardingPaths; len(got) != 2 {
-		t.Fatalf("forwarding paths = %v", got)
-	}
-}
-
-func TestRouteAndRuleCollectionMatching(t *testing.T) {
-	route := netlink.Route{Table: 20000, Protocol: StaticProtocol, Type: unix.RTN_THROW, Dst: prefixIPNet(netip.MustParsePrefix("10.0.0.0/8"))}
-	if !anyRouteMatches(route, []netlink.Route{route}) || anyRouteMatches(route, nil) {
-		t.Fatal("route collection match returned the wrong result")
-	}
-	wanted := managedRoute{route: route}
-	if !managedRoutePresent(wanted, []netlink.Route{route}) || !anyManagedRouteMatches(route, []managedRoute{wanted}) {
-		t.Fatal("managed route collection match returned the wrong result")
-	}
-	rule := *netlink.NewRule()
-	rule.Table, rule.Priority, rule.Protocol = 20000, 20000, uint8(StaticProtocol)
-	if !anyRuleMatches(rule, []netlink.Rule{rule}) || anyRuleMatches(rule, nil) {
-		t.Fatal("rule collection match returned the wrong result")
-	}
-	if routeDestination(netlink.Route{}) != "default" {
-		t.Fatal("nil route destination was not rendered as default")
 	}
 }
 

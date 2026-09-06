@@ -315,11 +315,19 @@ for a Velvet-managed instance.
 
 ## Development and testing
 
-Run local tests:
+Run local checks (the Babel supervisor tests launch a test child process and
+use local Unix sockets; they do not require an installed Babel binary):
 
 ```sh
-go test ./...
+go vet ./...
+go test -race ./...
+go test ./internal/vfp/message -run '^$' -fuzz '^FuzzMessageDecode$' -fuzztime=5s -parallel=2
 ```
+
+Keep inference input/output vectors in `internal/inference`. Runtime tests cover
+Evidence storage, reservation cleanup and session identity; new algorithm
+profiles can reuse these checks. Add a new network topology when it exercises
+new transport or NAT behavior.
 
 The privileged Linux E2E suite under `tests/e2e/` creates disposable network
 namespaces. It covers adjacent unnumbered Links, static Core reconciliation and

@@ -254,8 +254,17 @@ func reload(ctx context.Context, path string, active *running, interval time.Dur
 		setStatus(func(value *daemonStatus) { value.LastReloadError = err.Error() })
 		return active, err
 	}
+	return reloadCandidate(candidate, active,
+		func(desired *reconcile.DesiredState) (*running, error) {
+			return startRunner(ctx, desired, interval, once, logEvent)
+		},
+		stopRunner, setStatus)
+}
+
+// reloadCandidate performs the generation transaction after configuration loading.
+func reloadCandidate(candidate *reconcile.DesiredState, active *running, start func(*reconcile.DesiredState) (*running, error), stop func(*running) error, setStatus func(func(*daemonStatus))) (*running, error) {
 	if candidate.UUID != active.desired.UUID {
-		err = errors.New("node.uid.uuid cannot change during reload")
+		err := errors.New("node.uid.uuid cannot change during reload")
 		setStatus(func(value *daemonStatus) { value.LastReloadError = err.Error() })
 		return active, err
 	}
@@ -264,16 +273,16 @@ func reload(ctx context.Context, path string, active *running, interval time.Dur
 		return active, nil
 	}
 	setStatus(func(value *daemonStatus) { value.Ready = false })
-	if err := stopRunner(active); err != nil {
+	if err := stop(active); err != nil {
 		setStatus(func(value *daemonStatus) { value.LastReloadError = err.Error() })
 		return nil, err
 	}
-	next, startErr := startRunner(ctx, candidate, interval, once, logEvent)
+	next, startErr := start(candidate)
 	if startErr != nil {
 		if errors.Is(startErr, errRunnerDidNotStop) {
 			return nil, fmt.Errorf("candidate failed without stopping cleanly: %w", startErr)
 		}
-		rollback, rollbackErr := startRunner(ctx, active.desired, interval, once, logEvent)
+		rollback, rollbackErr := start(active.desired)
 		if rollbackErr != nil {
 			return nil, fmt.Errorf("candidate failed: %v; rollback failed: %w", startErr, rollbackErr)
 		}
