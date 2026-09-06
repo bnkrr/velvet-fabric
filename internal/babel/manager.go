@@ -97,13 +97,15 @@ func prefixesEqual(left, right []netip.Prefix) bool {
 }
 
 func (m *Manager) Run(ctx context.Context) {
+	defer func() {
+		m.setStatus(Status{State: "stopped"})
+		m.emit(Event{Status: "stopped"})
+	}()
 	backoff := time.Second
 	for ctx.Err() == nil {
 		started := time.Now()
 		err := m.runOnce(ctx)
 		if ctx.Err() != nil {
-			m.setStatus(Status{State: "stopped"})
-			m.emit(Event{Status: "stopped"})
 			return
 		}
 		m.setStatus(Status{State: "retrying", LastError: err.Error()})
@@ -142,11 +144,16 @@ func (m *Manager) runOnce(ctx context.Context) error {
 	}
 	waited := make(chan error, 1)
 	go func() { waited <- command.Wait() }()
-	exited, err := m.waitReady(ctx, waited, digest, command.Process.Pid)
-	if err != nil {
+	// Every return after Start owns stopping and reaping the child, including
+	// failed control reloads and unexpected active config digests.
+	exited := false
+	defer func() {
 		if !exited {
 			stop(m.plan.ControlPath, command, waited)
 		}
+	}()
+	exited, err = m.waitReady(ctx, waited, digest, command.Process.Pid)
+	if err != nil {
 		return err
 	}
 	m.emit(Event{Status: "running"})
@@ -156,7 +163,6 @@ func (m *Manager) runOnce(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			stop(m.plan.ControlPath, command, waited)
 			return ctx.Err()
 		case <-m.updates:
 			candidate, candidateDigest, prepareErr := m.prepare()
@@ -188,6 +194,7 @@ func (m *Manager) runOnce(ctx context.Context) error {
 		case <-statusTicker.C:
 			m.refreshStatus(ctx, command.Process.Pid)
 		case waitErr := <-waited:
+			exited = true
 			if waitErr == nil {
 				return fmt.Errorf("babel-rs exited unexpectedly with status 0")
 			}
