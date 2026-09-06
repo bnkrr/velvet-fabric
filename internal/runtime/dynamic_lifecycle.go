@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"net/netip"
 	"slices"
 	"time"
@@ -13,14 +12,16 @@ import (
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/engine"
 )
 
-func (d *dynamicRuntime) startConnectivityLocked(attempt *dynamicAttempt) {
+func (d *dynamicLinkEngine) startConnectivityLocked(attempt *dynamicAttempt) {
 	ctx, cancel := context.WithCancel(d.ctx)
 	attempt.cancel = cancel
 	d.armConnectivityDeadlineLocked(attempt, ctx)
 	d.workers.Go(func() { d.establishDynamic(ctx, attempt) })
 }
 
-func (d *dynamicRuntime) establishDynamic(ctx context.Context, attempt *dynamicAttempt) {
+func (d *dynamicLinkEngine) establishDynamic(ctx context.Context, attempt *dynamicAttempt) {
+	// Discovery/TCP/VFP may reconnect within this Attempt's deadline. This is
+	// connectivity work on the frozen Candidate, not another inference round.
 	for ctx.Err() == nil {
 		conn, err := d.runner.discoverPeer(ctx, attempt.plan)
 		if err == nil {
@@ -47,64 +48,17 @@ func (d *dynamicRuntime) establishDynamic(ctx context.Context, attempt *dynamicA
 		}
 	}
 	if d.ctx.Err() == nil {
-		d.failAttempt(attempt, "connectivity recovery deadline", dynamicAttempting, dynamicRecovering)
+		d.failAttempt(attempt, "connectivity deadline", dynamicAttempting, dynamicRecovering)
 	}
 }
 
-func (d *dynamicRuntime) commitLink(ctx context.Context, attempt *dynamicAttempt, result engine.Result) error {
-	d.resourceMu.Lock()
-	defer d.resourceMu.Unlock()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if d.stopped || d.attempts[attempt.remote] != attempt || (attempt.state != dynamicAttempting && attempt.state != dynamicRecovering) {
-		return errors.New("dynamic Link Attempt is no longer awaiting connectivity")
-	}
-	if result.RemoteUID.UUID != attempt.remote {
-		return errors.New("dynamic Link Node UID does not match routed target")
-	}
-	if err := d.runner.commitLink(ctx, attempt.plan, true, result, nil); err != nil {
-		return err
-	}
-	d.commitAttemptLocked(attempt)
-	return nil
-}
-
-func (d *dynamicRuntime) commitAttemptLocked(attempt *dynamicAttempt) {
-	recovered := attempt.state == dynamicRecovering
-	attempt.state = dynamicUp
-	if attempt.deadlineTimer != nil {
-		attempt.deadlineTimer.Stop()
-	}
-	status := "up"
-	if recovered {
-		status = "recovered"
-	}
-	d.runner.log(Event{Event: "velvet-dynamic-link", Status: status, RemoteUID: attempt.remote.String(), Interface: attempt.plan.InterfaceName})
-}
-
-func (d *dynamicRuntime) failAttempt(attempt *dynamicAttempt, reason string, allowed ...dynamicAttemptState) {
-	d.resourceMu.Lock()
-	defer d.resourceMu.Unlock()
-	d.mu.Lock()
-	if d.attempts[attempt.remote] != attempt || !slices.Contains(allowed, attempt.state) {
-		d.mu.Unlock()
-		return
-	}
-	d.discardAttemptLocked(attempt.remote, attempt)
-	d.mu.Unlock()
-	d.removeInterface(attempt.plan, reason)
-	d.runner.log(Event{Event: "velvet-dynamic-attempt", Status: "failed", RemoteUID: attempt.remote.String(), Error: reason})
-}
-
-func (d *dynamicRuntime) discardAttemptLocked(remote uuid.UUID, attempt *dynamicAttempt) {
+func (d *dynamicLinkEngine) discardAttemptLocked(remote uuid.UUID, attempt *dynamicAttempt) {
 	delete(d.attempts, remote)
 	stopAttempt(attempt)
 }
 
 func stopAttempt(attempt *dynamicAttempt) {
+	attempt.state = dynamicStopped
 	if attempt.responseTimer != nil {
 		attempt.responseTimer.Stop()
 	}
@@ -116,7 +70,7 @@ func stopAttempt(attempt *dynamicAttempt) {
 	}
 }
 
-func (d *dynamicRuntime) deferCleanupLocked(remote uuid.UUID, plan reconcile.LinkPlan, reason string) {
+func (d *dynamicLinkEngine) deferCleanupLocked(remote uuid.UUID, plan reconcile.LinkPlan, reason string) {
 	d.cancelDeferredCleanupLocked(remote)
 	cleanup := &dynamicCleanup{plan: plan}
 	cleanup.timer = time.AfterFunc(dynamicResponseTimeout, func() {
@@ -138,30 +92,29 @@ func (d *dynamicRuntime) deferCleanupLocked(remote uuid.UUID, plan reconcile.Lin
 	d.pendingCleanups[remote] = cleanup
 }
 
-func (d *dynamicRuntime) cancelDeferredCleanupLocked(remote uuid.UUID) {
+func (d *dynamicLinkEngine) cancelDeferredCleanupLocked(remote uuid.UUID) {
 	if cleanup := d.pendingCleanups[remote]; cleanup != nil {
 		cleanup.timer.Stop()
 		delete(d.pendingCleanups, remote)
 	}
 }
 
-func (d *dynamicRuntime) routedSessionClosed(session *engine.Session) {
+func (d *dynamicLinkEngine) routedSessionClosed(session *engine.Session) {
 	d.resourceMu.Lock()
 	defer d.resourceMu.Unlock()
 	d.mu.Lock()
+	var cleanup *reconcile.LinkPlan
 	attempt, exists := d.attempts[session.RemoteUID.UUID]
 	if exists && attempt.session == session && attempt.state == dynamicProposing {
-		d.discardAttemptLocked(session.RemoteUID.UUID, attempt)
-	} else {
-		attempt = nil
+		cleanup = d.fallbackLocked(attempt, "routed session closed before response")
 	}
 	d.mu.Unlock()
-	if attempt != nil {
-		d.removeInterface(attempt.plan, "routed session closed before response")
+	if cleanup != nil {
+		d.removeInterface(*cleanup, "routed session closed before response")
 	}
 }
 
-func (d *dynamicRuntime) candidateAllowed(candidate netip.AddrPort) bool {
+func (d *dynamicLinkEngine) candidateAllowed(candidate netip.AddrPort) bool {
 	plan := d.runner.Desired.DynamicLinks
 	if plan == nil {
 		return false
@@ -174,7 +127,7 @@ func (d *dynamicRuntime) candidateAllowed(candidate netip.AddrPort) bool {
 	return false
 }
 
-func (d *dynamicRuntime) setEvidence(interfaceName string, localListenPort int, endpoint netip.AddrPort) error {
+func (d *dynamicLinkEngine) setEvidence(interfaceName string, localListenPort int, endpoint netip.AddrPort) error {
 	value, err := inference.NewEvidence(interfaceName, localListenPort, endpoint)
 	if err != nil {
 		return err
@@ -191,7 +144,7 @@ func (d *dynamicRuntime) setEvidence(interfaceName string, localListenPort int, 
 	return nil
 }
 
-func (d *dynamicRuntime) removeEvidenceLocked(interfaceName string) {
+func (d *dynamicLinkEngine) removeEvidenceLocked(interfaceName string) {
 	for i := range d.evidence {
 		if d.evidence[i].Link == interfaceName {
 			d.evidence = slices.Delete(d.evidence, i, i+1)
@@ -202,7 +155,7 @@ func (d *dynamicRuntime) removeEvidenceLocked(interfaceName string) {
 
 // removeInterface requires resourceMu. No new Attempt can reuse the interface
 // between dropping its runtime state and completing kernel deletion.
-func (d *dynamicRuntime) removeInterface(plan reconcile.LinkPlan, reason string) {
+func (d *dynamicLinkEngine) removeInterface(plan reconcile.LinkPlan, reason string) {
 	d.mu.Lock()
 	d.removeEvidenceLocked(plan.InterfaceName)
 	d.mu.Unlock()
@@ -215,7 +168,7 @@ func (d *dynamicRuntime) removeInterface(plan reconcile.LinkPlan, reason string)
 	}
 }
 
-func (d *dynamicRuntime) armConnectivityDeadlineLocked(attempt *dynamicAttempt, ctx context.Context) {
+func (d *dynamicLinkEngine) armConnectivityDeadlineLocked(attempt *dynamicAttempt, ctx context.Context) {
 	if attempt.deadlineTimer != nil {
 		attempt.deadlineTimer.Stop()
 	}
@@ -226,7 +179,7 @@ func (d *dynamicRuntime) armConnectivityDeadlineLocked(attempt *dynamicAttempt, 
 	})
 }
 
-func (d *dynamicRuntime) expireConnectivity(attempt *dynamicAttempt, ctx context.Context, epoch uint64) {
+func (d *dynamicLinkEngine) expireConnectivity(attempt *dynamicAttempt, ctx context.Context, epoch uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.attempts[attempt.remote] == attempt && attempt.deadlineEpoch == epoch && attempt.state != dynamicUp && ctx.Err() == nil && attempt.cancel != nil {

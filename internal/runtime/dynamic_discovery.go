@@ -12,7 +12,7 @@ import (
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
 )
 
-func (d *dynamicRuntime) acceptRouted(ctx context.Context) {
+func (d *dynamicLinkEngine) acceptRouted(ctx context.Context) {
 	for {
 		conn, err := d.listener.AcceptTCP()
 		if err != nil {
@@ -35,7 +35,7 @@ func (d *dynamicRuntime) acceptRouted(ctx context.Context) {
 	}
 }
 
-func (d *dynamicRuntime) discoverLoopbacks(ctx context.Context) {
+func (d *dynamicLinkEngine) discoverLoopbacks(ctx context.Context) {
 	ticker := time.NewTicker(dynamicDiscoveryInterval)
 	defer ticker.Stop()
 	for {
@@ -48,7 +48,7 @@ func (d *dynamicRuntime) discoverLoopbacks(ctx context.Context) {
 	}
 }
 
-func (d *dynamicRuntime) scanLoopbacks(ctx context.Context) {
+func (d *dynamicLinkEngine) scanLoopbacks(ctx context.Context) {
 	d.mu.Lock()
 	hasEvidence := len(d.evidence) != 0
 	d.mu.Unlock()
@@ -73,7 +73,7 @@ func (d *dynamicRuntime) scanLoopbacks(ctx context.Context) {
 	}
 }
 
-func (d *dynamicRuntime) reserveDial(target netip.Addr) bool {
+func (d *dynamicLinkEngine) reserveDial(target netip.Addr) bool {
 	if target == d.runner.Desired.LoopbackV6 || d.runner.hasDirectLinkToLoopback(target) {
 		return false
 	}
@@ -99,7 +99,7 @@ func (d *dynamicRuntime) reserveDial(target netip.Addr) bool {
 	}
 }
 
-func (d *dynamicRuntime) dialRouted(ctx context.Context, target netip.Addr) {
+func (d *dynamicLinkEngine) dialRouted(ctx context.Context, target netip.Addr) {
 	local := &net.TCPAddr{IP: net.IP(d.runner.Desired.LoopbackV6.AsSlice())}
 	remote := &net.TCPAddr{IP: net.IP(target.AsSlice()), Port: d.runner.Desired.VFPPort}
 	conn, err := dialTCP(ctx, local, remote)
@@ -112,7 +112,7 @@ func (d *dynamicRuntime) dialRouted(ctx context.Context, target netip.Addr) {
 	d.finishRoutedDial(target, ctx.Err() == nil)
 }
 
-func (d *dynamicRuntime) serveRouted(ctx context.Context, conn net.Conn, expected netip.Addr) {
+func (d *dynamicLinkEngine) serveRouted(ctx context.Context, conn net.Conn, expected netip.Addr) {
 	var session *engine.Session
 	protocol := engine.New(engine.Config{
 		Context:                  engine.RoutedSession,
@@ -141,7 +141,7 @@ func (d *dynamicRuntime) serveRouted(ctx context.Context, conn net.Conn, expecte
 	}
 }
 
-func (d *dynamicRuntime) finishRoutedDial(target netip.Addr, failed bool) {
+func (d *dynamicLinkEngine) finishRoutedDial(target netip.Addr, failed bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	state, exists := d.targets[target]
