@@ -9,7 +9,9 @@ remote_root=${VELVET_VM_REMOTE_ROOT:-/root/proj/velvet/velvet-fabric/.local/e2e}
 local_binary="${repo_root}/.local/bin/velvetd-linux-amd64"
 local_ctl="${repo_root}/.local/bin/velvetctl-linux-amd64"
 babel_repo="${repo_root}/../babel-rs"
-babel_binary="${babel_repo}/target/release/babel-rs"
+babel_revision=7e2371ce022919a0184da032b2f77e065877634c # v0.3.0
+babel_target="${repo_root}/.local/cache/babel-rs-v0.3.0"
+babel_binary="${babel_target}/release/babel-rs"
 
 mkdir -p "$(dirname "${local_binary}")"
 GOCACHE="${repo_root}/.local/cache/go-build" \
@@ -21,10 +23,14 @@ GOMODCACHE="${repo_root}/.local/cache/go-mod" \
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   "${go_bin}" build -trimpath -o "${local_ctl}" ./cmd/velvetctl
 
-if [[ ${1:-all} == dynamic || ${1:-all} == all ]]; then
-  CARGO_HOME="${babel_repo}/.local/cargo" RUSTUP_TOOLCHAIN=stable \
-    /home/bnkr/.cargo/bin/cargo build --release --manifest-path "${babel_repo}/Cargo.toml" --package babel-rs
-fi
+# Export the pinned commit without checking out or building sibling worktree edits.
+mkdir -p "${repo_root}/.local/experiments"
+babel_source=$(mktemp -d "${repo_root}/.local/experiments/babel-e2e.XXXXXXXX")
+trap 'rm -rf -- "${babel_source}"' EXIT
+git -C "${babel_repo}" archive "${babel_revision}" | tar -x -C "${babel_source}"
+CARGO_HOME="${babel_repo}/.local/cargo" CARGO_TARGET_DIR="${babel_target}" RUSTUP_TOOLCHAIN=stable \
+  /home/bnkr/.cargo/bin/cargo build --locked --release --manifest-path "${babel_source}/Cargo.toml" --package babel-rs
+"${babel_binary}" --version
 
 ssh -F "${ssh_config}" -o ControlMaster=no -o ControlPath=none "${ssh_alias}" \
   "mkdir -p '${remote_root}'"
