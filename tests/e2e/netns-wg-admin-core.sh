@@ -7,6 +7,7 @@ test "$(id -u)" -eq 0 || { echo "netns E2E must run as root" >&2; exit 2; }
 for command in ip wg ping python3 awk grep mktemp tr kill; do command -v "${command}" >/dev/null || { echo "missing command: ${command}" >&2; exit 2; }; done
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "${script_dir}/core-topology.sh"
 generator="${script_dir}/generate-wg-admin-core.py"
 test -f "${generator}" || { echo "missing config generator: ${generator}" >&2; exit 2; }
 
@@ -48,47 +49,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 umask 077
-wg genpsk >"${runtime}/fabric.psk"
-for node in ${nodes}; do
-  wg genkey >"${runtime}/${node}.key"
-  wg pubkey <"${runtime}/${node}.key" >"${runtime}/${node}.pub"
-done
+create_core_keys
 python3 "${generator}" "${runtime}"
 
-ip link add "${bridge}" type bridge
-ip link set "${bridge}" up
-
-index=0
-for item in \
-  "ea:192.0.2.11" "eb:192.0.2.12" \
-  "r1:192.0.2.21" "r2:192.0.2.22" "r3:192.0.2.23" \
-  "xa:192.0.2.31" "xb:192.0.2.32" "xc:192.0.2.33"; do
-  node=${item%%:*}
-  address=${item#*:}
-  ns=$(namespace "${node}")
-  index=$((index + 1))
-  root_if="vwr${index}-${suffix}"
-  node_if="vwn${index}-${suffix}"
-  ip netns add "${ns}"
-  ip link add "${root_if}" type veth peer name "${node_if}"
-  ip link set "${root_if}" master "${bridge}"
-  ip link set "${root_if}" up
-  ip link set "${node_if}" netns "${ns}"
-  ip -n "${ns}" link set lo up
-  ip -n "${ns}" link set "${node_if}" name underlay0
-  ip -n "${ns}" address add "${address}/24" dev underlay0
-  ip -n "${ns}" link set underlay0 up
-done
-
-add_attached() {
-  node=$1
-  interface=$2
-  shift 2
-  ns=$(namespace "${node}")
-  ip -n "${ns}" link add "${interface}" type dummy
-  for address in "$@"; do ip -n "${ns}" address add "${address}" dev "${interface}"; done
-  ip -n "${ns}" link set "${interface}" up
-}
+create_core_underlay vw
 
 # Access and service networks are deliberately external to Velvet. They model
 # wg-admin's device pools, translated NAT resources, and egress announcements.
@@ -126,7 +90,9 @@ for node in ${nodes}; do add_return_selectors "$(namespace "${node}")"; done
 for item in "ea:2" "eb:2" "r1:3" "r2:4" "r3:2" "xa:1" "xb:1" "xc:1"; do
   node=${item%%:*}
   expected=${item#*:}
-  actual=$(grep -c '"event":"velvet-link-established"' "${runtime}/${node}.log" || true)
+  interfaces=$(ip netns exec "$(namespace "${node}")" wg show interfaces)
+  set -- ${interfaces}
+  actual=$#
   test "${actual}" -eq "${expected}" || { echo "${node}: established ${actual} Links, want ${expected}" >&2; exit 1; }
 done
 

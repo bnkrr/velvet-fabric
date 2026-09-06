@@ -11,6 +11,7 @@ test "$(id -u)" -eq 0 || { echo "netns E2E must run as root" >&2; exit 2; }
 for command in ip wg ping python3 grep mktemp kill awk; do command -v "${command}" >/dev/null || { echo "missing command: ${command}" >&2; exit 2; }; done
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "${script_dir}/core-topology.sh"
 generator="${script_dir}/generate-dynamic-core.py"
 suffix=$$
 bridge="vdbr${suffix}"
@@ -56,11 +57,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 umask 077
-wg genpsk >"${runtime}/fabric.psk"
-for node in ${nodes}; do
-  wg genkey >"${runtime}/${node}.key"
-  wg pubkey <"${runtime}/${node}.key" >"${runtime}/${node}.pub"
-done
+create_core_keys
 python3 "${generator}" "${runtime}" "${babel_rs}"
 
 # This milestone must contain no operator-configured static multi-hop routes.
@@ -69,32 +66,8 @@ if grep -q '"routes"' "${runtime}"/*.json; then
   exit 1
 fi
 
-ip link add "${bridge}" type bridge
-ip link set "${bridge}" up
-index=0
-for item in \
-  "ea:192.0.2.11" "eb:192.0.2.12" \
-  "r1:192.0.2.21" "r2:192.0.2.22" "r3:192.0.2.23" \
-  "xa:192.0.2.31" "xb:192.0.2.32" "xc:192.0.2.33"; do
-  node=${item%%:*}; address=${item#*:}; ns=$(namespace "${node}")
-  index=$((index + 1)); root_if="vdr${index}-${suffix}"; node_if="vdn${index}-${suffix}"
-  ip netns add "${ns}"
-  ip link add "${root_if}" type veth peer name "${node_if}"
-  ip link set "${root_if}" master "${bridge}"
-  ip link set "${root_if}" up
-  ip link set "${node_if}" netns "${ns}"
-  ip -n "${ns}" link set lo up
-  ip -n "${ns}" link set "${node_if}" name underlay0
-  ip -n "${ns}" address add "${address}/24" dev underlay0
-  ip -n "${ns}" link set underlay0 up
-done
+create_core_underlay vd
 
-add_attached() {
-  node=$1; interface=$2; shift 2; ns=$(namespace "${node}")
-  ip -n "${ns}" link add "${interface}" type dummy
-  for address in "$@"; do ip -n "${ns}" address add "${address}" dev "${interface}"; done
-  ip -n "${ns}" link set "${interface}" up
-}
 add_attached ea access0 10.100.30.1/24
 add_attached eb access0 10.100.31.1/24 10.100.32.1/24
 add_attached xa service0 10.60.1.1/24 10.61.1.1/24 10.100.201.1/24
@@ -146,7 +119,10 @@ wait_ping6() {
 
 # Every generated node loopback must become reachable across the dynamic RIB.
 for source in ${nodes}; do
-  for index in 1 2 3 4 5 6 7 8; do wait_ping6 "${source}" "fd78:abcd::${index}"; done
+  for index in 1 2 3 4 5 6 7 8; do
+    [ "${index}" = "$(loopback_index "${source}")" ] && continue
+    wait_ping6 "${source}" "fd78:abcd::${index}"
+  done
 done
 
 for node in ${nodes}; do
@@ -313,8 +289,16 @@ wait_babel_mesh() {
 }
 for node in ${nodes}; do
   wait_babel_mesh "${node}"
-  status="${runtime}/${node}.dynamic-status"
-  ip -n "$(namespace "${node}")" -o link show | grep -q 'vdl-'
+  interfaces=$(ip netns exec "$(namespace "${node}")" wg show interfaces)
+  set -- ${interfaces}
+  dynamic_count=0
+  for interface in "$@"; do
+    case ${interface} in vdl-*) dynamic_count=$((dynamic_count + 1));; esac
+  done
+  test "$#" -eq 7 && test "${dynamic_count}" -eq "$(expected_dynamic_links "${node}")" || {
+    echo "${node}: unexpected kernel mesh interfaces: ${interfaces}" >&2
+    exit 1
+  }
 done
 
 # The Dynamic Link contributes an adjacent loopback route, and Babel exports
@@ -337,7 +321,10 @@ wait_route_device -6 20000 fd78:abcd::8/128 202 vdl-xc-2000
 wait_route_device -4 20030 10.60.2.0/24 203 vdl-xb-2000
 echo "Dynamic Link mesh routes: PASS"
 for source in ${nodes}; do
-  for index in 1 2 3 4 5 6 7 8; do wait_ping6 "${source}" "fd78:abcd::${index}"; done
+  for index in 1 2 3 4 5 6 7 8; do
+    [ "${index}" = "$(loopback_index "${source}")" ] && continue
+    wait_ping6 "${source}" "fd78:abcd::${index}"
+  done
 done
 wait_ping4 ea 10.100.30.1 10.60.2.1
 wait_ping4 eb 10.100.31.1 10.60.3.1

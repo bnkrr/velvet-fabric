@@ -34,6 +34,7 @@ ssh "${ssh_config_args[@]}" -o ControlMaster=no -o ControlPath=none "${ssh_alias
 scp "${ssh_config_args[@]}" -o ControlMaster=no -o ControlPath=none \
   "${local_binary}" \
   "${local_ctl}" \
+  "${repo_root}/tests/e2e/core-topology.sh" \
   "${repo_root}/tests/e2e/netns-static.sh" \
   "${repo_root}/tests/e2e/netns-core-crud.sh" \
   "${repo_root}/tests/e2e/netns-wg-admin-core.sh" \

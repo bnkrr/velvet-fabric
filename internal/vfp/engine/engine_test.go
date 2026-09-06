@@ -171,3 +171,92 @@ func testConfig(id uuid.UUID, name string, v6 netip.Addr, accept func(message.UI
 		Commit: func(value Result) error { result <- value; return nil },
 	}
 }
+
+func TestSessionIdentityGuards(t *testing.T) {
+	for _, scenario := range []string{"self", "wrong-target", "outside-pool"} {
+		t.Run(scenario, func(t *testing.T) {
+			config := Config{Context: RoutedSession, LocalUID: message.UID{UUID: uuid.New()}, LocalLoopbackV6: netip.MustParseAddr("fd41::1"), ExpectedRemoteLoopbackV6: netip.MustParseAddr("fd41::2"), LoopbackPoolV6: netip.MustParsePrefix("fd41::/48")}
+			state := &sessionFSM{config: config}
+			remote := message.UID{UUID: uuid.New()}
+			if scenario == "self" {
+				remote = config.LocalUID
+			}
+			_, disposition, err := state.handle(message.Message{Type: message.Open, UID: &remote})
+			if scenario == "self" {
+				if err == nil || disposition != closeConnection || state.opened {
+					t.Fatal("self connection accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := netip.MustParseAddr("fd41::3")
+			want := closeConnection
+			if scenario == "outside-pool" {
+				address = netip.MustParseAddr("fd42::2")
+				want = discardFrame
+			}
+			_, disposition, err = state.handle(message.Message{Type: message.NodeState, LoopbackV6: address})
+			if err == nil || disposition != want || state.operational {
+				t.Fatal("invalid remote entered operational state")
+			}
+			if scenario == "outside-pool" {
+				_, _, err = state.handle(message.Message{Type: message.NodeState, LoopbackV6: config.ExpectedRemoteLoopbackV6})
+				if err != nil || !state.operational {
+					t.Fatal("valid correction did not establish session")
+				}
+			}
+		})
+	}
+}
+
+func TestOperationalSessionDiscardsBadFramesAndContinues(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	local, remote := net.Pipe()
+	defer remote.Close()
+	_ = remote.SetDeadline(time.Now().Add(2 * time.Second))
+	received := make(chan message.Message, 1)
+	var discarded atomic.Int32
+	done := make(chan error, 1)
+	config := Config{Context: RoutedSession, LocalUID: message.UID{UUID: uuid.New()}, LocalLoopbackV6: netip.MustParseAddr("fd41::1"), LoopbackPoolV6: netip.MustParsePrefix("fd41::/48"), FrameError: func(error) { discarded.Add(1) }, OperationalMessage: func(_ *Session, m message.Message) error { received <- m; return nil }}
+	go func() { done <- New(config).Run(ctx, local) }()
+	for _, reply := range []message.Message{
+		{Type: message.Open, UID: &message.UID{UUID: uuid.New()}},
+		{Type: message.NodeState, LoopbackV6: netip.MustParseAddr("fd41::2")},
+	} {
+		if _, err := message.Read(remote); err != nil {
+			t.Fatal(err)
+		}
+		if err := message.Write(remote, reply); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Both an unknown message and a legal message in the wrong context are
+	// frame errors, so neither may tear down the following valid operation.
+	if _, err := remote.Write([]byte{1, 255, 0, 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := message.Write(remote, message.Message{Type: message.EndpointObservation, Endpoint: netip.MustParseAddrPort("192.0.2.1:5000")}); err != nil {
+		t.Fatal(err)
+	}
+	want := message.Message{Type: message.DynamicLinkDecline, OperationID: [16]byte{9}}
+	if err := message.Write(remote, want); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		if got.Type != want.Type || got.OperationID != want.OperationID || discarded.Load() != 2 {
+			t.Fatalf("got %#v, discarded %d", got, discarded.Load())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("valid frame lost after discarded frames")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("session did not stop")
+	}
+}

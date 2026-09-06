@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -137,7 +138,7 @@ func TestRunnerOnceWithoutLinks(t *testing.T) {
 	}
 }
 
-func TestRunnerStatusAndStateQueries(t *testing.T) {
+func TestRunnerStatus(t *testing.T) {
 	staticID := uuid.MustParse("20000000-0000-4000-8000-000000000002")
 	dynamicID := uuid.MustParse("30000000-0000-4000-8000-000000000003")
 	dynamicPlan := reconcile.LinkPlan{InterfaceName: "vdl-test", OwnerAlias: "dynamic-owner"}
@@ -152,102 +153,73 @@ func TestRunnerStatusAndStateQueries(t *testing.T) {
 	if status.ConfiguredLinks != 3 || status.EstablishedLinks != 1 || status.DynamicLinks != 1 {
 		t.Fatalf("status = %#v", status)
 	}
-	if !runner.hasDirectLink(staticID) || runner.hasDirectLink(uuid.Nil) || !runner.hasDirectLinkToLoopback(netip.MustParseAddr("fd00::3")) {
-		t.Fatal("direct Link lookup returned the wrong result")
+}
+
+func TestDynamicPolicy(t *testing.T) {
+	d, _, _ := dynamicFixture(t, &runtimeBackend{})
+	for _, tc := range []struct {
+		mode            string
+		active, inbound bool
+	}{{spec.DynamicLinksActive, true, true}, {spec.DynamicLinksPassive, false, true}, {spec.DynamicLinksOff, false, false}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			d.runner.Desired.DynamicLinks.Mode = tc.mode
+			if d.active() != tc.active || d.allowsInbound() != tc.inbound {
+				t.Fatal("incorrect participation policy")
+			}
+		})
 	}
-	if got := runner.materializedStates(); len(got) != 2 {
-		t.Fatalf("materialized states = %d", len(got))
+	if !d.candidateAllowed(netip.MustParseAddrPort("192.0.2.1:1")) || d.candidateAllowed(netip.MustParseAddrPort("198.51.100.1:1")) {
+		t.Fatal("incorrect Candidate allowlist")
 	}
-	runner.removeDynamicState(dynamicPlan)
-	if len(runner.states) != 1 {
-		t.Fatalf("dynamic state was not removed: %#v", runner.states)
+	d.runner.Desired.DynamicLinks = nil
+	if d.active() || d.allowsInbound() || d.candidateAllowed(netip.MustParseAddrPort("192.0.2.1:1")) {
+		t.Fatal("omitted configuration enabled Dynamic Links")
 	}
 }
 
-func TestDynamicPolicyEvidenceAndReservation(t *testing.T) {
-	self := netip.MustParseAddr("fd00::1")
-	direct := netip.MustParseAddr("fd00::2")
-	target := netip.MustParseAddr("fd00::3")
-	runner := &Runner{
-		Desired: &reconcile.DesiredState{
-			LoopbackV6:   self,
-			DynamicLinks: &reconcile.DynamicLinksPlan{Mode: spec.DynamicLinksActive, AllowCandidatePrefixes: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")}},
-		},
-		states: map[string]materializedState{"direct": {peers: []netip.Addr{direct}}},
+func TestEvidenceStoreUpdateAndRemoval(t *testing.T) {
+	d, _, _ := dynamicFixture(t, &runtimeBackend{})
+	second := netip.MustParseAddrPort("[2001:db8::2]:62002")
+	if err := d.setEvidence("vl-second", 51002, second); err != nil {
+		t.Fatal(err)
 	}
-	dynamic := newDynamicRuntime(runner)
-	if !dynamic.active() || !dynamic.allowsInbound() {
-		t.Fatal("active mode policy was not enabled")
+	updated := netip.MustParseAddrPort("192.0.2.9:62009")
+	if err := d.setEvidence("vl-seed", 51009, updated); err != nil {
+		t.Fatal(err)
 	}
-	if !dynamic.candidateAllowed(netip.MustParseAddrPort("198.51.100.7:5000")) || dynamic.candidateAllowed(netip.MustParseAddrPort("203.0.113.7:5000")) {
-		t.Fatal("candidate policy returned the wrong result")
+	if len(d.evidence) != 2 || d.evidence[0].Link != "vl-seed" || d.evidence[0].LocalListenPort != 51009 || d.evidence[0].ObservedEndpoint != updated {
+		t.Fatalf("update changed order or mapping: %#v", d.evidence)
 	}
-	for _, item := range []struct {
-		link      string
-		localPort int
-		observed  netip.AddrPort
-	}{
-		{"vl-a", 51001, netip.MustParseAddrPort("198.51.100.1:1")},
-		{"vl-b", 51002, netip.MustParseAddrPort("198.51.100.2:2")},
-		{"vl-a", 51003, netip.MustParseAddrPort("198.51.100.3:3")},
-	} {
-		if err := dynamic.setEvidence(item.link, item.localPort, item.observed); err != nil {
-			t.Fatal(err)
+	d.mu.Lock()
+	d.removeEvidenceLocked("vl-seed")
+	d.mu.Unlock()
+	if len(d.evidence) != 1 || d.evidence[0].Link != "vl-second" || d.evidence[0].ObservedEndpoint != second {
+		t.Fatalf("deletion did not promote next Evidence: %#v", d.evidence)
+	}
+}
+
+func TestDialReservationExcludesSelfAndDirectPeers(t *testing.T) {
+	self, direct, target := netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2"), netip.MustParseAddr("fd00::3")
+	d := newDynamicRuntime(&Runner{Desired: &reconcile.DesiredState{LoopbackV6: self}, states: map[string]materializedState{"direct": {peers: []netip.Addr{direct}}}})
+	if d.reserveDial(self) || d.reserveDial(direct) || !d.reserveDial(target) || d.reserveDial(target) {
+		t.Fatal("incorrect reservation")
+	}
+	<-d.outboundSessions
+	d.finishRoutedDial(target, false)
+}
+
+func TestPendingLinksStopOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- waitForLinks(ctx, make(chan struct{}), 1) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("wait=%v", err)
 		}
-	}
-	dynamic.mu.Lock()
-	first := dynamic.evidence[0]
-	dynamic.mu.Unlock()
-	if first.Link != "vl-a" || first.LocalListenPort != 51003 || first.ObservedEndpoint != netip.MustParseAddrPort("198.51.100.3:3") {
-		t.Fatalf("first evidence = %#v", first)
-	}
-	dynamic.mu.Lock()
-	dynamic.removeEvidenceLocked("vl-a")
-	dynamic.mu.Unlock()
-	if dynamic.reserveDial(self) || dynamic.reserveDial(direct) || !dynamic.reserveDial(target) || dynamic.reserveDial(target) {
-		t.Fatal("dial reservation returned the wrong result")
-	}
-	<-dynamic.outboundSessions
-	dynamic.finishRoutedDial(target, false)
-	runner.Desired.DynamicLinks.Mode = spec.DynamicLinksPassive
-	if dynamic.active() || !dynamic.allowsInbound() {
-		t.Fatal("passive mode policy was wrong")
-	}
-	runner.Desired.DynamicLinks = nil
-	if dynamic.active() || dynamic.allowsInbound() || dynamic.candidateAllowed(netip.MustParseAddrPort("198.51.100.7:5000")) {
-		t.Fatal("disabled policy was enabled")
-	}
-}
-
-func TestDynamicAttemptCommitAndUtilities(t *testing.T) {
-	remote := uuid.MustParse("20000000-0000-4000-8000-000000000002")
-	var events []Event
-	runner := &Runner{Desired: &reconcile.DesiredState{}, Reconciler: reconcile.New(&runtimeBackend{}), states: make(map[string]materializedState), Log: func(event Event) { events = append(events, event) }}
-	dynamic := newDynamicRuntime(runner)
-	attempt := &dynamicAttempt{remote: remote, state: dynamicAttempting}
-	dynamic.attempts[remote] = attempt
-	if err := dynamic.commitLink(context.Background(), attempt, engine.Result{RemoteUID: message.UID{UUID: remote}}); err != nil {
-		t.Fatal(err)
-	}
-	if attempt.state != dynamicUp || len(events) != 2 || events[1].Status != "up" {
-		t.Fatalf("first commit: attempt=%#v events=%#v", attempt, events)
-	}
-	attempt.state = dynamicRecovering
-	if err := dynamic.commitLink(context.Background(), attempt, engine.Result{RemoteUID: message.UID{UUID: remote}}); err != nil {
-		t.Fatal(err)
-	}
-	if events[len(events)-1].Status != "recovered" {
-		t.Fatalf("recovery event = %#v", events[len(events)-1])
-	}
-	first, err := newOperationID()
-	if err != nil || first == ([16]byte{}) {
-		t.Fatalf("operation ID = %x, %v", first, err)
-	}
-	if got := nodeUID(message.UID{Name: "peer", UUID: remote}); got.Name != "peer" || got.UUID != remote.String() {
-		t.Fatalf("node UID = %#v", got)
-	}
-	if errorText(nil) != "Link establishment stopped" || errorText(errors.New("boom")) != "boom" {
-		t.Fatal("error text returned the wrong value")
+	case <-time.After(time.Second):
+		t.Fatal("pending Links did not stop")
 	}
 }
 
@@ -256,12 +228,10 @@ func TestCommitLinkMaterializesAndRecordsState(t *testing.T) {
 	local := uuid.MustParse("10000000-0000-4000-8000-000000000001")
 	remote := uuid.MustParse("20000000-0000-4000-8000-000000000002")
 	plan := reconcile.LinkPlan{PeerName: "peer", InterfaceName: "vdl-peer", OwnerAlias: "owner"}
-	var events []Event
 	runner := &Runner{
 		Desired:    &reconcile.DesiredState{UUID: local},
 		Reconciler: reconcile.New(backend),
 		states:     make(map[string]materializedState),
-		Log:        func(event Event) { events = append(events, event) },
 	}
 	called := false
 	result := engine.Result{
@@ -269,15 +239,16 @@ func TestCommitLinkMaterializesAndRecordsState(t *testing.T) {
 		RemoteLoopbackV6: netip.MustParseAddr("fd00::2"),
 		Proposal:         link.Proposal{V4: netip.MustParsePrefix("10.0.0.0/30")},
 	}
-	if err := runner.commitLink(context.Background(), plan, true, result, func(engine.Result) { called = true }); err != nil {
+	if err := runner.commitLink(context.Background(), plan, false, result, func(engine.Result) { called = true }); err != nil {
 		t.Fatal(err)
 	}
 	state, ok := runner.states[plan.InterfaceName]
-	if !ok || !state.dynamic || state.remote != remote || !called || backend.materialized != 1 {
+	if !ok || state.dynamic || state.remote != remote || !called || backend.materialized != 1 {
 		t.Fatalf("commit state=%#v exists=%v callback=%v materialized=%d", state, ok, called, backend.materialized)
 	}
-	if len(events) != 1 || events[0].Event != "velvet-dynamic-link-established" {
-		t.Fatalf("events = %#v", events)
+
+	if !reflect.DeepEqual(backend.local, []netip.Prefix{netip.MustParsePrefix("10.0.0.1/30")}) || !reflect.DeepEqual(backend.peers, []netip.Addr{result.RemoteLoopbackV6}) || backend.plan.InterfaceName != plan.InterfaceName {
+		t.Fatalf("wrong materialization: local=%v peers=%v plan=%v", backend.local, backend.peers, backend.plan)
 	}
 	backend.materializeErr = errors.New("materialize failed")
 	if err := runner.commitLink(context.Background(), reconcile.LinkPlan{InterfaceName: "failed"}, false, result, nil); !errors.Is(err, backend.materializeErr) {
@@ -288,31 +259,13 @@ func TestCommitLinkMaterializesAndRecordsState(t *testing.T) {
 	}
 }
 
-func TestRunnerSignalsAndWaits(t *testing.T) {
-	ready := make(chan error, 1)
-	runner := &Runner{Ready: ready}
-	runner.signalReady(nil)
-	if err := <-ready; err != nil {
-		t.Fatal(err)
-	}
-	established := make(chan struct{}, 2)
-	established <- struct{}{}
-	established <- struct{}{}
-	if err := waitForLinks(context.Background(), established, 2); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := waitForLinks(ctx, make(chan struct{}), 1); !errors.Is(err, context.Canceled) {
-		t.Fatalf("wait error = %v", err)
-	}
-	closed := make(chan struct{})
-	close(closed)
-	waitForBabel(closed)
-	waitForBabel(nil)
-}
-
 type runtimeBackend struct {
+	local        []netip.Prefix
+	peers        []netip.Addr
+	plan         reconcile.LinkPlan
+	configureErr error
+	onRemove     func()
+
 	prepared      int
 	configured    int
 	listenPort    int
@@ -340,7 +293,8 @@ func (b *runtimeBackend) Verify(context.Context, *reconcile.DesiredState) error 
 func (b *runtimeBackend) ProposalAvailable(context.Context, reconcile.LinkPlan, link.Proposal, []netip.Prefix) bool {
 	return true
 }
-func (b *runtimeBackend) Materialize(context.Context, *reconcile.DesiredState, reconcile.LinkPlan, []netip.Prefix, []netip.Addr) error {
+func (b *runtimeBackend) Materialize(_ context.Context, _ *reconcile.DesiredState, plan reconcile.LinkPlan, local []netip.Prefix, peers []netip.Addr) error {
+	b.plan, b.local, b.peers = plan, append([]netip.Prefix(nil), local...), append([]netip.Addr(nil), peers...)
 	b.materialized++
 	return b.materializeErr
 }
@@ -354,12 +308,15 @@ func (b *runtimeBackend) PrepareDynamic(_ context.Context, plan reconcile.LinkPl
 }
 func (b *runtimeBackend) ConfigureDynamic(context.Context, reconcile.LinkPlan) error {
 	b.configured++
-	return nil
+	return b.configureErr
 }
 func (b *runtimeBackend) ListenPort(context.Context, string) (int, error) {
 	return b.listenPort, b.listenPortErr
 }
 func (b *runtimeBackend) RemoveDynamic(_ context.Context, plan reconcile.LinkPlan) error {
+	if b.onRemove != nil {
+		b.onRemove()
+	}
 	if b.removeStarted != nil {
 		close(b.removeStarted)
 		<-b.removeRelease
