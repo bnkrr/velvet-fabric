@@ -48,7 +48,7 @@ func TestDynamicFailureRemovesOnlyItsMaterializedPlan(t *testing.T) {
 			plan.InterfaceName: {desired: plan, dynamic: true},
 		},
 	}
-	dynamic := newDynamicRuntime(runner)
+	dynamic := newDynamicLinkEngine(runner)
 	dynamic.ctx = context.Background()
 	operation := [16]byte{1}
 	dynamic.attempts[remoteID] = &dynamicAttempt{
@@ -77,7 +77,7 @@ func TestDynamicCleanupDoesNotHoldStateLock(t *testing.T) {
 		Reconciler: reconcile.New(backend),
 		states:     make(map[string]materializedState),
 	}
-	dynamic := newDynamicRuntime(runner)
+	dynamic := newDynamicLinkEngine(runner)
 	dynamic.ctx = context.Background()
 	attempt := &dynamicAttempt{remote: remote, plan: plan, state: dynamicAttempting}
 	dynamic.attempts[remote] = attempt
@@ -106,7 +106,7 @@ func TestDynamicCleanupDoesNotHoldStateLock(t *testing.T) {
 
 func TestDynamicRoutedDialRetriesAreBounded(t *testing.T) {
 	target := netip.MustParseAddr("fd41::2")
-	dynamic := newDynamicRuntime(&Runner{})
+	dynamic := newDynamicLinkEngine(&Runner{})
 	for attempt := 1; attempt <= maxRoutedDialAttempts; attempt++ {
 		dynamic.targets[target] = &dynamicTarget{dialing: true, failures: uint8(attempt - 1)}
 		dynamic.finishRoutedDial(target, true)
@@ -200,7 +200,7 @@ func TestEvidenceStoreUpdateAndRemoval(t *testing.T) {
 
 func TestDialReservationExcludesSelfAndDirectPeers(t *testing.T) {
 	self, direct, target := netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2"), netip.MustParseAddr("fd00::3")
-	d := newDynamicRuntime(&Runner{Desired: &reconcile.DesiredState{LoopbackV6: self}, states: map[string]materializedState{"direct": {peers: []netip.Addr{direct}}}})
+	d := newDynamicLinkEngine(&Runner{Desired: &reconcile.DesiredState{LoopbackV6: self}, states: map[string]materializedState{"direct": {peers: []netip.Addr{direct}}}})
 	if d.reserveDial(self) || d.reserveDial(direct) || !d.reserveDial(target) || d.reserveDial(target) {
 		t.Fatal("incorrect reservation")
 	}

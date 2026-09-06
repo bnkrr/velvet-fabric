@@ -33,7 +33,7 @@ type Runner struct {
 	mu      sync.RWMutex
 	states  map[string]materializedState
 	babel   *babel.Manager
-	dynamic *dynamicRuntime
+	dynamic *dynamicLinkEngine
 }
 
 type Status struct {
@@ -73,7 +73,7 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		return err
 	}
 
-	r.dynamic = newDynamicRuntime(r)
+	r.dynamic = newDynamicLinkEngine(r)
 	if err := r.dynamic.start(ctx); err != nil {
 		r.signalReady(err)
 		return err

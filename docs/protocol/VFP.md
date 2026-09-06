@@ -916,6 +916,13 @@ cancels its deadline and commits. If the deadline wins, it removes tentative
 state and ignores a late completion. The existing routed path remains present
 throughout and therefore needs no rollback or fallback Message.
 
+Local preparation or configuration failure, a mismatched target Node UID, or
+failure to commit also ends the Attempt. The baseline profile's only next step
+after an Attempt fails is to stop and retain the routed path: it does not select
+another Candidate, rerun inference, or request further measurements. Normal
+Discovery and session reconnection within the Connectivity Deadline are work
+within the same Attempt, not additional Candidate attempts.
+
 Either node may initiate. If both initiate concurrently, both retain the
 Attempt whose initiator Node UUID is lexicographically smaller; the larger
 UUID node supersedes its own Attempt and participates in the smaller UUID

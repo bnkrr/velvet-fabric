@@ -62,6 +62,17 @@ create WireGuard Links. Dynamic Links reuse the normal link-bound VFP
 establishment procedure for final connectivity validation. Static routes
 remain local desired state and are not propagated over VFP.
 
+The Dynamic Link engine lives in `internal/runtime`. Its shared preparation,
+configuration, and failure decision are in
+[dynamic_engine.go](internal/runtime/dynamic_engine.go): reserve a Link, run
+baseline inference against the Evidence store, freeze the Candidate, negotiate
+over routed VFP, validate the new Link, then commit. Negotiation and connectivity
+use the existing VFP sessions and Reconciler/backend directly. Every failed
+Attempt stops and releases its Link while retaining the existing routed path;
+there is no Candidate retry, re-inference, or additional measurement. Discovery
+and session reconnection within a Connectivity Deadline, including recovery of
+an established Link, remain part of the same Attempt.
+
 The version-1 VFP specification is
 [docs/protocol/VFP.md](docs/protocol/VFP.md). Informative design references are
 kept under `docs/protocol/refs/`.
@@ -244,6 +255,9 @@ configuration, starts one process for all local WireGuard Links, and
 automatically originates the node loopback. It reloads the child online as
 Link origins change and restarts an unexpected exit with bounded exponential
 backoff. Parent death terminates the child.
+
+The current Velvet release targets `babel-rs` v0.3.0. It does not generate the
+new structured-only interface configuration introduced by `babel-rs` v0.4.
 
 `babel-rs` uses UDP/6696 and `ff02::1:6` on every managed WireGuard interface.
 It owns dynamic routes with protocol `203`; `velvetd` owns static routes and

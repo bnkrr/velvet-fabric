@@ -31,13 +31,23 @@ const (
 type dynamicAttemptState uint8
 
 const (
-	dynamicProposing dynamicAttemptState = iota
+	dynamicPreparing dynamicAttemptState = iota
+	dynamicProposing
 	dynamicAttempting
 	dynamicUp
 	dynamicRecovering
+	dynamicStopped
 )
 
-type dynamicRuntime struct {
+// dynamicLinkEngine owns Dynamic Link creation and recovery, including execution,
+// timers and resource lifetime. It uses the existing Reconciler/backend and VFP
+// sessions directly; there is no separate state-aware runtime executor.
+//
+// prepare + baseline inference -> propose/accept -> connectivity -> commit -> up
+// Every failed Attempt stops and retains the existing routed path. Recovery uses
+// the same committed Link within its deadline; it never restarts inference.
+// See dynamic_engine.go for candidate preparation and the terminal decision.
+type dynamicLinkEngine struct {
 	runner  *Runner
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -70,6 +80,7 @@ type dynamicAttempt struct {
 	operationID   [16]byte
 	localProposal bool
 	plan          reconcile.LinkPlan
+	candidate     netip.AddrPort // frozen for this Attempt, independent of later Evidence
 	session       *engine.Session
 	state         dynamicAttemptState
 	responseTimer *time.Timer
@@ -83,8 +94,8 @@ type dynamicCleanup struct {
 	timer *time.Timer
 }
 
-func newDynamicRuntime(runner *Runner) *dynamicRuntime {
-	return &dynamicRuntime{
+func newDynamicLinkEngine(runner *Runner) *dynamicLinkEngine {
+	return &dynamicLinkEngine{
 		runner:           runner,
 		targets:          make(map[netip.Addr]*dynamicTarget),
 		attempts:         make(map[uuid.UUID]*dynamicAttempt),
@@ -95,7 +106,7 @@ func newDynamicRuntime(runner *Runner) *dynamicRuntime {
 	}
 }
 
-func (d *dynamicRuntime) start(ctx context.Context) error {
+func (d *dynamicLinkEngine) start(ctx context.Context) error {
 	ctx, d.cancel = context.WithCancel(ctx)
 	d.ctx = ctx
 	address := &net.TCPAddr{IP: net.IP(d.runner.Desired.LoopbackV6.AsSlice()), Port: d.runner.Desired.VFPPort}
@@ -116,7 +127,7 @@ func (d *dynamicRuntime) start(ctx context.Context) error {
 	return nil
 }
 
-func (d *dynamicRuntime) stop() {
+func (d *dynamicLinkEngine) stop() {
 	if d.cancel != nil {
 		d.cancel()
 	}
@@ -143,20 +154,20 @@ func (d *dynamicRuntime) stop() {
 	d.resourceMu.Lock()
 	defer d.resourceMu.Unlock()
 	for _, plan := range plans {
-		d.removeInterface(plan, "dynamic runtime stopped")
+		d.removeInterface(plan, "dynamic Link engine stopped")
 	}
 }
 
-func (d *dynamicRuntime) active() bool {
+func (d *dynamicLinkEngine) active() bool {
 	return d.runner.Desired.DynamicLinks != nil && d.runner.Desired.DynamicLinks.Mode == spec.DynamicLinksActive
 }
 
-func (d *dynamicRuntime) allowsInbound() bool {
+func (d *dynamicLinkEngine) allowsInbound() bool {
 	plan := d.runner.Desired.DynamicLinks
 	return plan != nil && (plan.Mode == spec.DynamicLinksActive || plan.Mode == spec.DynamicLinksPassive)
 }
 
-func (d *dynamicRuntime) reportError(err error) {
+func (d *dynamicLinkEngine) reportError(err error) {
 	select {
 	case d.errors <- err:
 	default:
