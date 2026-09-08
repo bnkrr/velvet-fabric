@@ -19,6 +19,9 @@ import (
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 )
 
+// Match the generated daemon budget; forced stop leaves one second of margin.
+const daemonShutdownTimeout = 5 * time.Second
+
 type Event struct {
 	Status string
 	Error  string
@@ -284,14 +287,15 @@ func Render(plan *reconcile.BabelPlan, linkOrigins map[string][]netip.Prefix) []
 
 	var output bytes.Buffer
 	fmt.Fprintf(&output, "state_file = %s\n", strconv.Quote(plan.StatePath))
-	output.WriteString("interfaces = [")
+	fmt.Fprintf(&output, "shutdown_timeout_ms = %d\n\n", daemonShutdownTimeout.Milliseconds())
+	output.WriteString("[[interfaces]]\nmatch = [")
 	for i, name := range plan.Interfaces {
 		if i != 0 {
 			output.WriteString(", ")
 		}
 		output.WriteString(strconv.Quote(name))
 	}
-	output.WriteString("]\n\n")
+	output.WriteString("]\nlink_type = \"wired\"\n\n")
 	for _, origin := range origins {
 		output.WriteString("[[origins]]\n")
 		fmt.Fprintf(&output, "destination = %s\n", strconv.Quote(origin.Destination.String()))
@@ -376,18 +380,16 @@ func stop(controlPath string, command *exec.Cmd, waited <-chan error) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	_ = controlRequest(ctx, controlPath, "shutdown", nil)
+	err := controlRequest(ctx, controlPath, "shutdown", nil)
 	cancel()
-	select {
-	case <-waited:
-		return
-	case <-time.After(3 * time.Second):
+	if err != nil {
+		// Without an accepted control request, SIGTERM starts cleanup now.
+		_ = command.Process.Signal(syscall.SIGTERM)
 	}
-	_ = command.Process.Signal(syscall.SIGTERM)
 	select {
 	case <-waited:
 		return
-	case <-time.After(3 * time.Second):
+	case <-time.After(daemonShutdownTimeout + time.Second):
 		_ = command.Process.Kill()
 		select {
 		case <-waited:

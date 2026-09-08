@@ -259,8 +259,12 @@ automatically originates the node loopback. It reloads the child online as
 Link origins change and restarts an unexpected exit with bounded exponential
 backoff. Parent death terminates the child.
 
-The current Velvet release targets `babel-rs` v0.3.0. It does not generate the
-new structured-only interface configuration introduced by `babel-rs` v0.4.
+The current Velvet release targets `babel-rs` v0.4.1. Generated configuration
+uses structured `[[interfaces]]` rules with `match` patterns for static and
+dynamic Links. It explicitly selects the `wired` metric preset used by the
+previous integration; upgrading does not automatically enable RTT scoring.
+The generated daemon cleanup budget is five seconds; Fabric allows six seconds
+after an accepted shutdown request or fallback SIGTERM before forcing exit.
 
 `babel-rs` uses UDP/6696 and `ff02::1:6` on every managed WireGuard interface.
 It owns dynamic routes with protocol `203`; `velvetd` owns static routes and

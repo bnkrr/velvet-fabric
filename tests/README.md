@@ -84,6 +84,21 @@ bounded report wait after its send window, without extending the parent task
 deadline. This guards against prematurely discarding reports on a slower
 multi-hop Fabric path.
 
+## Babel compatibility
+
+The managed integration and privileged tests pin `babel-rs` v0.4.1 at
+`b5e15d857d776c60179dcb6078a524b56b3ced94`. `manager_test.go` covers the
+structured `[[interfaces]]`/`match` configuration, static names and dynamic
+interface patterns, explicit wired policy, top-level shutdown budget, origins
+and export views. The real netns suites exercise Babel's own config validator,
+control readiness/reload, interface attachment, route export and restart.
+
+`shutdown_test.go` exercises an actual child process with an unavailable
+control socket and four seconds of cleanup after SIGTERM. Fabric must allow
+the configured five-second Babel shutdown budget plus one second of margin,
+then reap the child. This guards against the former three-second SIGTERM wait
+killing a correctly shutting-down daemon before it finishes cleanup.
+
 ## Real netns integration
 
 `e2e/netns-udp-nat.py` runs real velvetd, pinned Babel, VFP, UDP and kernel WG

@@ -10,7 +10,7 @@ import (
 
 func TestRenderManagedConfig(t *testing.T) {
 	plan := &reconcile.BabelPlan{
-		StatePath: "/tmp/state", Interfaces: []string{"vl-a-b", "vl-a-c"},
+		StatePath: "/tmp/state", Interfaces: []string{"vl-a-b", "vl-a-c", "vdl-*"},
 		Protocol: 203, DeviceOnly: true, ManageRules: false,
 		Origins: []reconcile.BabelOrigin{{Destination: netip.MustParsePrefix("fd78::1/128")}},
 		Views: []reconcile.BabelView{
@@ -22,7 +22,8 @@ func TestRenderManagedConfig(t *testing.T) {
 		"vl-a-b": {netip.MustParsePrefix("10.240.0.1/30"), netip.MustParsePrefix("fe80::1/64")},
 	}))
 	for _, expected := range []string{
-		`interfaces = ["vl-a-b", "vl-a-c"]`,
+		"shutdown_timeout_ms = 5000\n\n[[interfaces]]",
+		"[[interfaces]]\nmatch = [\"vl-a-b\", \"vl-a-c\", \"vdl-*\"]\nlink_type = \"wired\"",
 		`destination = "10.240.0.0/30"`,
 		`destination = "fd78::1/128"`,
 		"manage_rules = false",
