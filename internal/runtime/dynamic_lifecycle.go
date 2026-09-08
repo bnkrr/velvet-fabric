@@ -58,6 +58,9 @@ func (d *dynamicLinkEngine) discardAttemptLocked(remote uuid.UUID, attempt *dyna
 }
 
 func stopAttempt(attempt *dynamicAttempt) {
+	if attempt.udp != nil {
+		attempt.udp.close()
+	}
 	attempt.state = dynamicStopped
 	if attempt.responseTimer != nil {
 		attempt.responseTimer.Stop()
@@ -104,8 +107,11 @@ func (d *dynamicLinkEngine) routedSessionClosed(session *engine.Session) {
 	defer d.resourceMu.Unlock()
 	d.mu.Lock()
 	var cleanup *reconcile.LinkPlan
+	if lease := d.observerLeases[session]; lease != nil {
+		lease.cancel()
+	}
 	attempt, exists := d.attempts[session.RemoteUID.UUID]
-	if exists && attempt.session == session && attempt.state == dynamicProposing {
+	if exists && attempt.session == session && (attempt.state == dynamicProposing || attempt.state == dynamicProbing) {
 		cleanup = d.fallbackLocked(attempt, "routed session closed before response")
 	}
 	d.mu.Unlock()

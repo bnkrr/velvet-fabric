@@ -13,48 +13,46 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	Version   = 1
-	HelloSize = 8
-	Hello     = MessageType(1)
-	HelloAck  = MessageType(2)
+	Hello    = message.DiscoveryHello
+	HelloAck = message.DiscoveryHelloAck
 )
 
 var (
 	MulticastAddress = netip.MustParseAddr("ff02::1")
-	magic            = [4]byte{'V', 'F', 'P', 'D'}
 	ErrInvalidHello  = errors.New("invalid VFP discovery message")
 )
 
-type MessageType uint8
+type MessageType = message.Type
 
 type Observation struct {
 	Source netip.Addr
 	Type   MessageType
 }
 
-// Encode produces a fixed-size pre-session marker. Node identity and
-// resources remain in authenticated-by-WireGuard VFP/TCP messages.
-func Encode(messageType MessageType) ([HelloSize]byte, error) {
-	if messageType != Hello && messageType != HelloAck {
-		return [HelloSize]byte{}, fmt.Errorf("%w: unknown type %d", ErrInvalidHello, messageType)
+// Encode uses the common VFP codec. Identity remains in WG-protected TCP sessions.
+func Encode(messageType MessageType) ([]byte, error) {
+	if !messageType.IsDiscovery() {
+		return nil, ErrInvalidHello
 	}
-	return [HelloSize]byte{magic[0], magic[1], magic[2], magic[3], Version, byte(messageType), 0, HelloSize}, nil
+	packet, err := message.EncodeDatagram(message.Message{Type: messageType})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidHello, err)
+	}
+	return packet, nil
 }
 
 func Parse(packet []byte) (MessageType, error) {
-	if len(packet) != HelloSize || packet[0] != magic[0] || packet[1] != magic[1] || packet[2] != magic[2] || packet[3] != magic[3] {
-		return 0, ErrInvalidHello
+	m, err := message.DecodeDatagram(packet)
+	if err != nil || !m.Type.IsDiscovery() {
+		return 0, fmt.Errorf("%w: %v", ErrInvalidHello, err)
 	}
-	messageType := MessageType(packet[5])
-	if packet[4] != Version || (messageType != Hello && messageType != HelloAck) || binary.BigEndian.Uint16(packet[6:8]) != HelloSize {
-		return 0, ErrInvalidHello
-	}
-	return messageType, nil
+	return m.Type, nil
 }
 
 type Socket struct {
@@ -161,7 +159,8 @@ func (s *Socket) SendAck(remote netip.Addr) error {
 // ReadHello ignores unrelated or malformed datagrams and returns only a valid
 // link-local source received on the requested interface.
 func (s *Socket) ReadHello() (Observation, error) {
-	buffer := make([]byte, 256)
+	// The extra byte makes even a truncated oversized datagram exceed the cap.
+	buffer := make([]byte, message.MaxDatagramLength+1)
 	for {
 		n, control, source, err := s.receivePacket.ReadFrom(buffer)
 		if err != nil {

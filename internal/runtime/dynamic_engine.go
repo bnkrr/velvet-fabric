@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/inference"
@@ -14,8 +13,8 @@ import (
 )
 
 // prepareAttemptLocked is the common entry after admission and simultaneous
-// Proposal arbitration. Baseline is the only inference: reserve the actual WG
-// port, read the Evidence store, and freeze one Candidate. A reused reservation
+// Proposal arbitration. Reserve a UDP socket and a DOWN WG interface, then
+// freeze the initial baseline hint. A reused reservation
 // belongs to a superseded Proposal, not a retry of a failed Candidate.
 // Requires resourceMu and mu. Even on error the caller owns the returned Attempt
 // and must pass it to fallbackLocked before releasing the locks.
@@ -25,36 +24,50 @@ func (d *dynamicLinkEngine) prepareAttemptLocked(session *engine.Session, operat
 		plan: reserved, session: session, state: dynamicPreparing,
 	}
 	d.attempts[attempt.remote] = attempt
-	if attempt.plan.InterfaceName == "" {
-		plan, err := d.runner.Reconciler.PrepareDynamic(d.ctx, d.runner.Desired, nodeUID(session.RemoteUID))
-		if err != nil {
-			return attempt, fmt.Errorf("prepare dynamic Link: %w", err)
-		}
-		attempt.plan = plan
-	}
-	candidate, ok := inference.Baseline(d.evidence, attempt.plan.ListenPort)
+	hint, ok := inference.Baseline(d.evidence, 1)
 	if !ok {
 		return attempt, errors.New("cannot infer Candidate from Endpoint Evidence")
 	}
+	u, err := d.prepareUDP(attempt, hint)
+	if err != nil {
+		return attempt, err
+	}
+	attempt.udp = u
+	if attempt.plan.InterfaceName == "" {
+		plan, err := d.runner.Reconciler.PrepareProbe(d.ctx, d.runner.Desired, nodeUID(session.RemoteUID), int(u.primary.Endpoint().Port()))
+		if err != nil {
+			return attempt, err
+		}
+		attempt.plan = plan
+	}
+	attempt.plan.ListenPort = int(u.primary.Endpoint().Port())
+	attempt.plan.Probing = true
+	candidate, ok := inference.Baseline(d.evidence, attempt.plan.ListenPort)
+	if !ok {
+		return attempt, errors.New("cannot infer Candidate")
+	}
 	attempt.candidate = candidate
+	d.runner.log(Event{Event: "velvet-udp-probe", Status: "prepared", RemoteUID: attempt.remote.String(), Interface: attempt.plan.InterfaceName, LocalEndpoint: u.primary.Endpoint().String()})
 	return attempt, nil
 }
 
-// configureAttemptLocked binds the remote parameters to the prepared Attempt.
-// Connectivity starts only after the corresponding Accept has been sent or
+// configureAttemptLocked binds the remote probe parameters without enabling WG.
+// UDP discovery starts only after the corresponding Accept has been sent or
 // received. Requires resourceMu and mu; the caller handles failure via fallback.
 func (d *dynamicLinkEngine) configureAttemptLocked(attempt *dynamicAttempt, value message.Message) error {
 	if !d.candidateAllowed(value.Endpoint) {
 		return errors.New("remote Candidate rejected")
 	}
-	plan, err := d.runner.Reconciler.ConfigureDynamic(
-		d.ctx, d.runner.Desired, attempt.plan, wgtypes.Key(value.WGPublicKey), value.Endpoint,
-	)
-	if err != nil {
-		return fmt.Errorf("configure accepted Link: %w", err)
+	if value.ProbeKey == [32]byte{} {
+		return errors.New("missing probe receive key")
 	}
-	attempt.plan = plan
-	attempt.state = dynamicAttempting
+	if wgtypes.Key(value.WGPublicKey) == attempt.plan.PrivateKey.PublicKey() {
+		return errors.New("peer WireGuard key equals local key")
+	}
+	attempt.udp.remoteEndpoint = value.Endpoint
+	attempt.udp.remoteKey = value.ProbeKey
+	attempt.udp.remotePublicKey = wgtypes.Key(value.WGPublicKey)
+	attempt.state = dynamicProbing
 	if attempt.responseTimer != nil {
 		attempt.responseTimer.Stop()
 	}
@@ -105,9 +118,9 @@ func (d *dynamicLinkEngine) commitAttemptLocked(attempt *dynamicAttempt) {
 	d.runner.log(Event{Event: "velvet-dynamic-link", Status: status, RemoteUID: attempt.remote.String(), Interface: attempt.plan.InterfaceName})
 }
 
-// fallbackLocked is the engine's only failure decision in the baseline profile:
+// fallbackLocked is the terminal failure decision after a discovery task:
 // stop this Attempt, release its Link, and leave the existing routed path alone.
-// It does not retry, re-infer, measure, or reset the automatic target's one-shot
+// It does not start another task or reset the automatic target's one-shot
 // decision. A stale result cannot stop a replacement Attempt.
 //
 // Requires mu. The returned plan must be removed under resourceMu after releasing

@@ -31,9 +31,9 @@ The current release provides:
   observations from existing Links;
 - transactional reload, local status, and graceful shutdown.
 
-Dynamic Link currently uses a deliberately small one-Candidate inference
-profile rather than general NAT traversal: it reuses an externally observed IP
-with the new Link's actual WireGuard listen port and makes one bounded attempt.
+Dynamic Link uses a bounded evidence-driven candidate search, authenticated
+UDP probes, active observations and same-port WireGuard handoff. Unsupported
+NAT behavior or exhausted budgets retain the existing multi-hop path.
 Access interfaces, access tunnels, and NAT are outside Velvet Core. An
 announcement asserts that a prefix is already delivered locally by external
 access configuration; it does not create that configuration.
@@ -62,20 +62,23 @@ create WireGuard Links. Dynamic Links reuse the normal link-bound VFP
 establishment procedure for final connectivity validation. Static routes
 remain local desired state and are not propagated over VFP.
 
-The Dynamic Link engine lives in `internal/runtime`. Its shared preparation,
-configuration, and failure decision are in
-[dynamic_engine.go](internal/runtime/dynamic_engine.go): reserve a Link, run
-baseline inference against the Evidence store, freeze the Candidate, negotiate
-over routed VFP, validate the new Link, then commit. Negotiation and connectivity
-use the existing VFP sessions and Reconciler/backend directly. Every failed
-Attempt stops and releases its Link while retaining the existing routed path;
-there is no Candidate retry, re-inference, or additional measurement. Discovery
-and session reconnection within a Connectivity Deadline, including recovery of
-an established Link, remain part of the same Attempt.
+Dynamic-Link admission and resource lifetime live in `internal/runtime`;
+[peer.go](internal/linkdiscovery/peer.go) runs each node's evidence-driven loop.
+Routed VFP coordinates candidate batches and active measurements, public UDP
+finds a reciprocal path, and same-port handoff enables the normal WG/VFP
+commit procedure. An exhausted task releases its tentative Link and retains
+the routed path. Recovery of a committed Link remains bounded and uses that
+same Link without starting a new inference task.
 
 The version-1 VFP specification is
 [docs/protocol/VFP.md](docs/protocol/VFP.md). Informative design references are
 kept under `docs/protocol/refs/`.
+
+VFP's wire format is still in internal development. TCP sessions and UDP
+link-local discovery now share an eight-byte `VFP\0` header and TLV encoding,
+with wire Version remaining `1`. This revision does not accept the older TCP
+header or `VFPD` discovery packets; upgrade all Fabric nodes together. UDP is
+still used only inside existing WireGuard Links, not for underlay hole punching.
 
 ## Quick start
 
@@ -285,18 +288,27 @@ provide Endpoint Observations used by the baseline inference algorithm:
 
 `active` discovers reachable non-adjacent nodes, proposes Links, and accepts
 allowed proposals. `passive` only accepts proposals, while `off` disables both;
-omitting the section is equivalent to `off`. The allow-list checks only the IP
-of the Candidate supplied by the remote node.
+omitting the section is equivalent to `off`. The allow-list checks the IP of every remote candidate, including observer
+offers. Nodes with Dynamic Links off can still serve bounded observer leases
+through their existing Fabric sessions.
 
-For each target, the current implementation makes one attempt per effective
-configuration generation. Evidence records the carrying Link's actual local
-WireGuard listen port together with the endpoint observed by its peer. The
-baseline inference profile takes the IP from the first available Evidence,
-substitutes the ephemeral listen port reserved for the new WireGuard interface,
-and exchanges both endpoints and public keys over routed VFP. The tentative
-Link is committed only after the regular link-local VFP establishment succeeds.
-Failure deletes tentative state and leaves the existing routed path in service;
-this release does not retry automatically or implement general NAT traversal.
+For each target, velvetd admits one discovery task per effective configuration
+generation. It first exchanges baseline hints and fresh UDP receive keys over
+routed VFP. Each endpoint then runs its own inference over local evidence,
+exchanges bounded candidate batches, and sends encrypted one-way public UDP
+probes. Observation reports return through Fabric; invalid and replayed probes
+receive no response. Failed candidate rounds may actively measure the static
+peer first, then other reachable observers. Observers only offer baseline
+listeners and never recursively upgrade.
+
+A reciprocal UDP path is handed to kernel WireGuard on the same local port.
+WG first binds with empty AllowedIPs and keepalive=0; the peers exchange
+WG_READY before enabling normal traffic. The Link commits only after the
+regular link-local VFP establishment and target identity validation succeed.
+No progress, budget exhaustion, control loss or handoff failure cleans tentative
+resources and leaves the existing routed path in service. This is a bounded
+first NAT traversal implementation, not exhaustive NAT support: arbitrary
+random allocation and simultaneous destination-dependent mappings may fall back.
 
 Dynamic interfaces are locally named `vdl-<remote-name>-<uuid-prefix4>` (or
 `vdl-<uuid-prefix4>` without a remote name). They are runtime state, survive an
@@ -342,6 +354,12 @@ Keep inference input/output vectors in `internal/inference`. Runtime tests cover
 Evidence storage, reservation cleanup and session identity; new algorithm
 profiles can reuse these checks. Add a new network topology when it exercises
 new transport or NAT behavior.
+
+The first transport-independent Infer/search implementation is tested against
+deterministic NAT models in `internal/linkdiscovery`. These simulations run in
+the normal Go test suite and CI. The daemon uses a per-node loop and real
+VFP/UDP adapters, which need their own integration coverage. See [algorithm and network testing](tests/README.md)
+for coverage, commands, and model limitations.
 
 The privileged Linux E2E suite under `tests/e2e/` creates disposable network
 namespaces. It covers adjacent unnumbered Links, static Core reconciliation and

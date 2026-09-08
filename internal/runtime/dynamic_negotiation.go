@@ -84,6 +84,8 @@ func (d *dynamicLinkEngine) prepareOutbound(session *engine.Session) (*dynamicAt
 
 func (d *dynamicLinkEngine) handleRoutedMessage(session *engine.Session, value message.Message) error {
 	switch value.Type {
+	case message.DiscoveryControl:
+		return d.handleDiscoveryControl(session, value)
 	case message.DynamicLinkPropose:
 		return d.handleProposal(session, value)
 	case message.DynamicLinkAccept:
@@ -100,13 +102,13 @@ func (d *dynamicLinkEngine) handleProposal(session *engine.Session, value messag
 		return session.Send(message.Message{Type: message.DynamicLinkDecline, OperationID: value.OperationID})
 	}
 	if err := session.Send(dynamicLinkMessage(message.DynamicLinkAccept, attempt)); err != nil {
-		d.failAttempt(attempt, "send Accept failed", dynamicAttempting)
+		d.failAttempt(attempt, "send Accept failed", dynamicProbing)
 		return err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.isCurrentAttemptLocked(attempt) {
-		d.startConnectivityLocked(attempt)
+		d.startProbeLocked(attempt)
 		d.runner.log(Event{Event: "velvet-dynamic-attempt", Status: "accepted", RemoteUID: attempt.remote.String(), Interface: attempt.plan.InterfaceName})
 	}
 	return nil
@@ -185,7 +187,7 @@ func (d *dynamicLinkEngine) handleAccept(session *engine.Session, value message.
 		cleanup = d.fallbackLocked(attempt, cleanupReason)
 		return nil
 	}
-	d.startConnectivityLocked(attempt)
+	d.startProbeLocked(attempt)
 	return nil
 }
 
@@ -221,5 +223,6 @@ func dynamicLinkMessage(kind message.Type, attempt *dynamicAttempt) message.Mess
 		Type: kind, OperationID: attempt.operationID,
 		WGPublicKey: [32]byte(attempt.plan.PrivateKey.PublicKey()),
 		Endpoint:    attempt.candidate,
+		ProbeKey:    attempt.udp.receiver.Key,
 	}
 }

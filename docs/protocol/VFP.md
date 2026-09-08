@@ -2,9 +2,9 @@
 
 ## Version 1
 
-Status: Version 1 protocol specification
+Status: Development protocol specification; wire format not frozen
 Wire version: 1
-Last updated: 2026-09-05
+Last updated: 2026-09-07
 
 ## Abstract
 
@@ -30,6 +30,15 @@ research notes under `refs/` record alternatives considered during design but
 do not change the behavior specified here. Functions explicitly described as
 future work are outside version 1.
 
+During internal development, breaking revisions MAY retain wire Version 1.
+The specification revision and matching software commit define interoperability;
+Version 1 alone does not promise compatibility with earlier development builds.
+All participating nodes MUST be upgraded together for this framing revision.
+The previous four-octet TCP header and separate `VFPD` discovery format are no
+longer accepted; no dual-format parsing or automatic downgrade is defined.
+After the wire format is explicitly frozen, Section 10.2's version-change
+requirements apply to incompatible revisions.
+
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**,
 and **MAY** are to be interpreted as described by BCP 14 when, and only when,
 they appear in all capitals.
@@ -44,7 +53,8 @@ Multi-octet integers use network byte order.
 VFP carries distributed control information between `velvetd` nodes. Version
 1 includes:
 
-- session establishment and peer identity;
+- link-local discovery over UDP;
+- session establishment and peer identity over TCP;
 - node resources, including a node loopback address;
 - Link address negotiation and Link state changes;
 - control information required to establish a Dynamic Link.
@@ -135,8 +145,14 @@ VFP route messages.
 
 ### 4.1 Transport
 
-VFP runs over TCP. TCP provides ordered, reliable octets; VFP framing provides
-message boundaries.
+VFP uses the same common header and TLV encoding over TCP and UDP, as defined
+in Section 5. TCP carries stateful sessions. UDP carries link-local Discovery
+on configured WireGuard Links, or authenticated public probes under Section
+8.16. Message Type and socket context determine which procedure may run.
+
+TCP provides ordered, reliable octets; VFP framing provides message boundaries.
+UDP preserves datagram boundaries; retransmission is specific to the procedure
+(Section 4.2 for Discovery), not a generic reliable-UDP session layer.
 
 The default VFP TCP port is 58420. A deployment MAY override this port through
 out-of-band configuration. Both endpoints of a Link MUST agree on the effective
@@ -178,23 +194,15 @@ the same numeric port but remain separate transport namespaces. A sender MUST
 use hop limit 1. A receiver MUST accept a Hello only when it was received on
 the expected interface and its source is IPv6 link-local.
 
-The Discovery version-1 Hello is exactly eight octets:
+Discovery uses `DISCOVERY_HELLO` (`0x09`) and `DISCOVERY_HELLO_ACK` (`0x0a`)
+from the shared Message Type registry. Each canonical message is the common
+eight-octet header with an empty TLV body (Section 8.15). Discovery does not
+have a separate magic value, version, parser, or Message Type namespace.
 
-```text
-  0                   1                   2                   3
-  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- |                 Magic = ASCII "VFPD"                         |
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- |  Version = 1  | Message Type  |          Length = 8           |
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
-
-Message Type 1 is `HELLO`; Message Type 2 is `HELLO_ACK`. Unknown versions or
-Message Types, incorrect lengths, invalid source addresses, and datagrams
-received on another interface are silently ignored. The discovery datagram
-carries no Node UID, WireGuard key, port, or resource. Node identity remains an
-`OPEN` property after TCP is established.
+Invalid datagrams, unknown versions or Message Types, TCP-only messages,
+invalid source addresses, and datagrams received on another interface are
+silently ignored. The message carries no Node UID, WireGuard key, port, or
+resource. Node identity remains an `OPEN` property after TCP is established.
 
 A node sends one Hello immediately and repeats it with jittered exponential
 backoff bounded at two seconds while the interface has no active TCP session.
@@ -216,10 +224,15 @@ sufficient return-address evidence on this point-to-point Link. Equal
 addresses are a collision and no VFP session is established. Address ordering
 selects one TCP role only; it is never used to predict an address.
 
-Discovery framing has its own version. Its version changes do not change the
-VFP/TCP frame Version defined in Section 5.
+Discovery uses the common wire Version and the UDP rules in Section 5.4.
 
 ### 4.3 Security context
+
+The common Magic field identifies the encoding; it is not authentication.
+UDP Discovery relies on the carrying WireGuard Link's protection and the
+interface/source checks in Section 4.2. An implementation MUST NOT expose this
+unauthenticated discovery procedure on the underlay. Public underlay probes use the separate authenticated envelope and leased
+receive contexts specified in Section 8.16; they never answer HELLO/ACK.
 
 In the static-Link phase, VFP runs inside a WireGuard Link whose peer public
 key and optional Fabric PSK are already configured. VFP does not add a
@@ -258,11 +271,13 @@ frame has passed structural and semantic validation.
 
 ### 5.1 Frame header
 
-Version 1 uses the following common frame header:
+TCP and UDP use the following eight-octet common frame header:
 
 ```text
   0                   1                   2                   3
   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |                 Magic = 0x56465000 ("VFP\0")                   |
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  |    Version    | Message Type  |        Message Length         |
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -272,23 +287,26 @@ Version 1 uses the following common frame header:
  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
+**Magic (32 bits)**
+: MUST contain the octets `56 46 50 00`. It distinguishes VFP encoding from
+  unrelated data and does not authorize the sender.
+
 **Version (8 bits)**
-: The VFP wire version. A version-1 sender MUST encode this field as `1`.
+: The VFP wire version. A sender MUST encode `1` for this development revision;
+  see Sections 1 and 10.2 for the compatibility policy.
 
 **Message Type (8 bits)**
-: The action or state-machine event represented by this frame.
+: The action or state-machine event represented by a frame. Section 8.1 defines
+  a shared registry and the permitted transport contexts.
 
 **Message Length (16 bits)**
-: Total frame length in octets, including the four-octet common header.
+: Total frame length in octets, including the eight-octet common header.
+  The minimum is 8. The maximum is 4096 on TCP and 1200 on UDP. These limits
+  MUST be checked before allocation from a peer-supplied length.
 
-The minimum Message Length is 4. The version-1 maximum Message Length is 4096.
-A sender MUST NOT emit a larger frame. A receiver MUST treat a larger declared
-length as connection-invalid even though the 16-bit field can represent values
-up to 65535.
-
-The common header currently contains no magic value, flags, transaction ID,
-session ID, source Node ID, or destination Node ID. Any such field requires a
-concrete protocol need before inclusion.
+The common header contains no flags, transaction ID, session ID, source Node
+ID, or destination Node ID. Any such field requires a concrete protocol need
+before inclusion. Existing operation correlation remains a message-specific TLV.
 
 ### 5.2 TLV encoding
 
@@ -324,18 +342,43 @@ for a Message Type whose schema permits no required TLVs.
 Encoding a value as a TLV does not make it semantically optional. Requiredness
 is specified by the schema of the Message Type in the current state.
 
-### 5.3 Frame extraction
+### 5.3 TCP frame extraction
 
 A receiver MUST:
 
-1. read the complete common header;
-2. validate Message Length against the common-header size and hard receive
-   limit;
-3. read exactly the remaining `Message Length - header length` octets;
+1. read the complete eight-octet common header;
+2. validate Magic, Version, and Message Length (8..4096) before allocating or
+   waiting for the body;
+3. read exactly the remaining `Message Length - 8` octets;
 4. process no bytes from the following frame as part of the current frame.
 
-An outer frame boundary that cannot be determined safely is a connection-level
-error as specified in Section 9.
+TCP segmentation and coalescing do not change message boundaries. A malformed
+header or truncated frame is a connection-level error as specified in Section 9.
+The receiver MUST NOT scan for a later Magic value to resynchronize the stream.
+TCP carries only the session messages listed in Section 8.1; receiving a
+Discovery message is a state/context error, not a Discovery event. The first
+message MUST still be `OPEN`.
+
+### 5.4 UDP datagram extraction
+
+A sender MUST place exactly one complete VFP message in each UDP datagram.
+Message Length MUST equal the actual UDP payload length and be in 8..1200.
+A sender MUST avoid relying on IP fragmentation and obey any smaller known
+path limit. VFP defines no application fragmentation or reassembly.
+
+A receiver MUST detect truncated and oversized datagrams before decoding. A
+buffer of at least 1201 octets with rejection of any result above 1200, or an
+explicit socket truncation indicator, prevents a truncated prefix from being
+mistaken for a valid message. Concatenated frames and partial frames are not
+accepted. Invalid Magic, Version, length, TLV structure, or transport context
+causes silent datagram discard; there is no generic UDP error response.
+
+After datagram validation, apply the schema allowed on that socket: link-local
+Discovery on a known WG interface (Section 4.2), or authenticated PUBLIC_PROBE
+on a leased underlay socket (Section 8.16). Public probes require one canonical
+sealed TLV and authenticate it before plaintext decoding. Session messages MUST
+NOT be processed over UDP. There is no UDP OPEN exchange or generic reliability
+layer; each procedure defines its own loss, replay and timing rules.
 
 ## 6. Generic TLV Processing
 
@@ -389,7 +432,8 @@ override it.
 
 For each Message Type, its specification MUST define:
 
-- in which protocol states it is valid;
+- in which transports, contexts, and protocol states it is valid;
+- which authentication or carrying-transport protection it requires;
 - the allowed known TLVs;
 - `min_occurs` and `max_occurs` for each allowed TLV;
 - semantic validation and resulting state transition;
@@ -440,9 +484,21 @@ points.
 | `0x06` | `DYNAMIC_LINK_PROPOSE` | Propose one Dynamic-Link operation and the initiator's parameters |
 | `0x07` | `DYNAMIC_LINK_ACCEPT` | Accept an operation and return the acceptor's parameters |
 | `0x08` | `DYNAMIC_LINK_DECLINE` | Decline participation in one Dynamic-Link operation |
+| `0x09` | `DISCOVERY_HELLO` | Discover the remote link-local address on an existing WG Link |
+| `0x0a` | `DISCOVERY_HELLO_ACK` | Reply to a Discovery Hello without causing another reply |
+| `0x0b` | `DISCOVERY_CONTROL` | Coordinate candidates, observations and WG handoff over routed TCP |
+| `0x0c` | `PUBLIC_PROBE` | Authenticated one-way probe on a leased public UDP socket |
 
-There is no `OPEN_ACK`, `LINK_REJECT`, Dynamic-Link success/failure, generic
-result, or generic error Message Type. A valid peer `OPEN` completes the
+Types `0x01` and `0x02` are TCP messages in both link-bound and routed sessions.
+Types `0x03` through `0x05` are TCP messages in link-bound sessions only; Types
+`0x06` through `0x08` are TCP messages in operational routed sessions only.
+Their state restrictions remain in Sections 8.3 through 8.14. Types `0x09` and
+`0x0a` are UDP-only, valid solely in the link-local Discovery context of
+Section 4.2. Type `0x0b` is operational routed TCP only; `0x0c` is public
+UDP only, under Section 8.16.
+
+There is no `OPEN_ACK`, `LINK_REJECT`, or generic error Message Type.
+Dynamic discovery results and termination are DISCOVERY_CONTROL records. A valid peer `OPEN` completes the
 opening exchange. A static counterproposal implicitly rejects and replaces the
 previous proposal. `LINK_ACCEPT` refers to the single outstanding static
 proposal held by session state.
@@ -459,7 +515,9 @@ proposal held by session state.
 | `0x0006` | `OPERATION_ID` | 16 | Opaque identifier correlating one operation's messages |
 | `0x0007` | `WG_PUBLIC_KEY` | 32 | Sender's WireGuard public key for one Link Attempt |
 | `0x0008` | `WG_ENDPOINT` | 8 or 20 | A WireGuard underlay endpoint whose role is defined by the Message Type |
-| `0x0009` | Reserved | — | Not used by version 1 |
+| `0x0009` | `PROBE_KEY` | 32 | Fresh operation/direction receive key |
+| `0x000a` | `DISCOVERY_DATA` | 45..717 | Bounded discovery control record (Section 8.16) |
+| `0x000b` | `SEALED_PROBE` | 50 or 62 | Context, nonce counter and authenticated ciphertext (Section 8.16) |
 
 The following subsections define the complete value syntax. Addresses are
 encoded as network-order octets without text, address-family, or prefix-length
@@ -759,7 +817,7 @@ path assigns one of two local contexts; no `SESSION_TYPE` field is sent:
 - A **routed session** is opened from one node loopback to another through an
   already routed Fabric path. After `NODE_STATE`, it immediately becomes
   operational and accepts only `DYNAMIC_LINK_PROPOSE`,
-  `DYNAMIC_LINK_ACCEPT`, and `DYNAMIC_LINK_DECLINE`.
+  `DYNAMIC_LINK_ACCEPT`, `DYNAMIC_LINK_DECLINE`, and `DISCOVERY_CONTROL`.
 
 The initiator of a routed session MUST require the peer's `LOOPBACK_V6` to
 equal the destination loopback used for that TCP connection. Both session
@@ -825,12 +883,12 @@ participates when it wants the Link or permits inbound creation, accepts the
 initiator's Candidate, has no existing direct Link to that Node, and can
 reserve the required local resources.
 
-Version 1's baseline Endpoint Inference algorithm chooses the first locally
+The initial baseline hint chooses the first locally
 available Endpoint Observation in stable Evidence-store order. Given
 Observation `A:old_port` and the actual listen port `P` reserved for the new
-WireGuard interface, it returns exactly one Candidate `A:P`. It preserves the
+userspace probe socket, it returns one initial Candidate `A:P`. It preserves the
 observed IP address and does not use either port from the Evidence mapping.
-The complete mapping remains available to other inference profiles. With no
+Subsequent candidates and measurements follow Section 8.16. With no
 Evidence it cannot propose or accept an Attempt. The protocol carries no
 Candidate priority, confidence, source, or NAT classification.
 
@@ -844,21 +902,23 @@ generation.
 Once that routed session reaches operational state, policy refusal, resource
 failure, failed Proposal, or Decline retains the routed path but creates no
 automatic retry in that generation. Passive nodes only respond; disabled nodes
-still send Observations on their existing Links but neither propose nor accept
-Dynamic Links.
+still send Observations on their existing Links and can serve bounded observer
+leases, but neither propose nor accept Dynamic Links.
 
 ### 8.12 Dynamic-Link messages
 
 `DYNAMIC_LINK_PROPOSE` starts one Link Attempt on an operational routed
 session. Before sending it, the initiator MUST reserve its tentative
-WireGuard interface and actual listen port, freeze its local public key and
-Candidate, and choose a fresh active-operation `OPERATION_ID`.
+DOWN WireGuard interface and a userspace UDP socket holding the final listen
+port, freeze its local public key and initial hint, and choose a fresh
+active-operation `OPERATION_ID`.
 
 | TLV | Cardinality | Meaning |
 |---|---:|---|
 | `OPERATION_ID` | `1` | Identifier chosen by the initiator |
 | `WG_PUBLIC_KEY` | `1` | Initiator's key for this Attempt |
-| `WG_ENDPOINT` | `1` | Initiator Candidate to be tried by the acceptor |
+| `WG_ENDPOINT` | `1` | Initiator initial hint |
+| `PROBE_KEY` | `1` | Initiator fresh receive key |
 
 `DYNAMIC_LINK_ACCEPT` accepts the complete Proposal and supplies the
 acceptor's frozen parameters:
@@ -867,7 +927,8 @@ acceptor's frozen parameters:
 |---|---:|---|
 | `OPERATION_ID` | `1` | Exact value copied from the Proposal |
 | `WG_PUBLIC_KEY` | `1` | Acceptor's key for this Attempt |
-| `WG_ENDPOINT` | `1` | Acceptor Candidate to be tried by the initiator |
+| `WG_ENDPOINT` | `1` | Acceptor initial hint |
+| `PROBE_KEY` | `1` | Acceptor fresh receive key |
 
 `DYNAMIC_LINK_DECLINE` states only that the receiver will not participate in
 this Attempt:
@@ -882,7 +943,7 @@ other operations. A receiver sends Decline if local participation or Candidate
 policy rejects the Proposal, a direct Link already exists, resources or a
 complete local Candidate are unavailable, or the two WireGuard keys are
 equal. If an initiator rejects the Candidate returned in an otherwise valid
-Accept, it locally fails the Attempt; version 1 defines no second response.
+Accept, it locally fails the Attempt. END terminates an accepted UDP task.
 
 Accept and Decline MUST be sent on the routed session that carried the
 Proposal. A response whose `OPERATION_ID` is unknown, ended, or belongs to a
@@ -891,37 +952,24 @@ its TLVs in ascending Type order.
 
 ### 8.13 Link Attempt procedure
 
-After Accept is sent or received, each endpoint configures the peer public key
-and Candidate on its tentative WireGuard interface. The Link PSK, if used, is
-derived outside VFP from Fabric state and both public keys. Link-local address
-derivation remains Section 4.2 and is not carried in Dynamic-Link messages.
+After Accept is sent or received, each endpoint starts Section 8.16's bounded
+UDP discovery loop. Public-key configuration and the actual endpoint are
+installed only after reciprocal probes and handoff agreement. The Link PSK is
+derived outside VFP from Fabric state and both public keys.
 
-The tentative Link then runs the standard link-bound procedure: Discovery,
-TCP, `OPEN`, `NODE_STATE`, `LINK_PROPOSE`, and `LINK_ACCEPT`. The Attempt is
-committed only when that new link-bound session reaches operational state and
-its remote Node UID equals the routed-session target. This is both the
-WireGuard connectivity test and the bidirectional VFP test; no additional
-success Message is sent.
+After both WG_READY records, run Discovery, TCP, OPEN, NODE_STATE,
+LINK_PROPOSE and LINK_ACCEPT. Commit only when that new link-bound session is
+operational and its Node UID equals the routed-session target. UDP success and
+WG readiness alone cannot commit a Link.
 
-The initiator starts a ten-second Response Timeout after completely writing
-Proposal. Receipt of its corresponding Accept or Decline stops that timer.
-The acceptor starts a 30-second Connectivity Deadline after completely
-writing Accept; the initiator starts the same deadline after validating
-Accept. These values are version-1 constants, not negotiated configuration.
-
-Before Accept completes, loss of the routed session fails the associated
-Attempt. After Accept completes, routed-session lifetime no longer controls
-it. If standard Link establishment becomes operational first, the endpoint
-cancels its deadline and commits. If the deadline wins, it removes tentative
-state and ignores a late completion. The existing routed path remains present
-throughout and therefore needs no rollback or fallback Message.
-
-Local preparation or configuration failure, a mismatched target Node UID, or
-failure to commit also ends the Attempt. The baseline profile's only next step
-after an Attempt fails is to stop and retain the routed path: it does not select
-another Candidate, rerun inference, or request further measurements. Normal
-Discovery and session reconnection within the Connectivity Deadline are work
-within the same Attempt, not additional Candidate attempts.
+The initiator has a ten-second response timeout after writing Proposal. UDP
+preparation through handoff has a 30-second local deadline from preparation.
+Routed-session loss before completed handoff fails the task. After handoff,
+standard Link establishment has its own 30-second Connectivity Deadline.
+Expiration or local failure removes tentative state and ignores late results;
+the existing routed path remains available. One-shot admission still applies
+after an entire task ends, while its internal rounds may update candidates and
+obtain new evidence within Section 8.16's limits.
 
 Either node may initiate. If both initiate concurrently, both retain the
 Attempt whose initiator Node UUID is lexicographically smaller; the larger
@@ -933,9 +981,9 @@ Decline and the countervailing Proposal arrive in either order.
 The minimal state progression is:
 
 ```text
-IDLE -> PROPOSING -> ATTEMPTING -> UP -> RECOVERING -> UP
-          |              |                 |
-          +--------------+-----------------+-> IDLE
+IDLE -> PROPOSING -> PROBING/HANDOFF -> ATTEMPTING -> UP -> RECOVERING -> UP
+          |                 |               |                |
+          +-----------------+---------------+----------------+-> IDLE
                                       (deadline, cleanup, routed path retained)
 ```
 
@@ -967,10 +1015,114 @@ protocol forms no useful adjacency until the Link carries packets and must
 withdraw its state if the interface is removed. This does not change the VFP
 success condition and does not put routing messages inside VFP.
 
+### 8.15 `DISCOVERY_HELLO` and `DISCOVERY_HELLO_ACK`
+
+Both messages use the common header, wire Version 1, and an empty canonical
+TLV body. Their canonical encodings are:
+
+```text
+DISCOVERY_HELLO:     56 46 50 00 01 09 00 08
+DISCOVERY_HELLO_ACK: 56 46 50 00 01 0a 00 08
+```
+
+Neither schema uses or requires any TLV. Receivers still validate all TLV
+boundaries and skip unknown or unused TLVs according to Section 6; they MUST
+NOT impose an exact eight-octet receive size on an otherwise valid message.
+The UDP limit in Section 5.4 applies.
+
+Section 4.2 defines interface scoping, source validation, retransmission,
+response behavior, and stopping on session establishment. These messages do
+not create or commit a Link. Duplicate messages remain discoveries of the same
+source; each valid Hello may elicit one HelloAck, and HelloAck never elicits a
+reply. Processing requires the existing WG protection and scope checks in
+Section 4.3.
+
+### 8.16 Public UDP discovery profile
+
+PROPOSE/ACCEPT admit a discovery task; their endpoint is an initial hint, not a
+WireGuard configuration. Both include PROBE_KEY (TLV 0x0009, 32 random octets),
+a fresh receive key for this operation and direction. Control remains on the
+existing routed Fabric session and inherits its all-members-trusted boundary.
+No public negotiation, credential exchange or error response is introduced.
+
+DISCOVERY_CONTROL (type 0x0b, routed TCP only) contains OPERATION_ID and
+DISCOVERY_DATA (TLV 0x000a). DISCOVERY_DATA is a bounded record: code u8,
+round u16, sequence u64, flag u8 (0/1), key 32 octets, endpoint count u8,
+then 0..32 endpoints, each encoded as size u8 followed by the WG_ENDPOINT
+value. Integers are big endian. Fields unused by a code are zero/empty.
+Codes are: 1 CANDIDATES (round, flag=new local evidence, endpoints),
+2 REPORT (round, sequence, one seen endpoint), 3 ROUND_DONE (round,
+zero or two endpoints: own public endpoint then peer public endpoint),
+4 WG_READY (no payload), 5 END (no payload), 6 OBSERVE_OPEN (one endpoint
+whose address selects the observer's underlay route/address family),
+7 OBSERVE_READY (key, one or two baseline listener candidates).
+No new message is permitted in link-bound TCP sessions. The v1 version remains
+1; interoperability with earlier internal dynamic-link formats is not provided.
+
+PUBLIC_PROBE (type 0x0c, public UDP only) has one SEALED_PROBE TLV (0x000b):
+operation ID 16 octets, sequence u64 (1..12000), and AES-256-GCM ciphertext
+including its 16-octet tag. The 12-octet nonce is four zero octets followed by
+sequence. Associated data is the complete VFP header, TLV header, operation ID
+and sequence. Plaintext is round u16 followed by the destination WG_ENDPOINT
+value. A receive key belongs to exactly one operation and direction; fresh
+keys and nonces must never be reused. The sender uses the receiver's key.
+Authentication, operation, expiry, sequence uniqueness, destination family,
+frame/TLV bounds and packet quota are checked before reporting. Replay records
+are bounded by the sequence limit. Invalid input is silently discarded, with
+no UDP response, no per-packet logging, and no state allocation for unknown
+operations. A valid probe also receives **no UDP response**: REPORT travels
+through the operation's routed Fabric session. Link-local HELLO/ACK remain
+separate schemas and are never answered by this public listener.
+
+Each node owns its evidence store and inference. It publishes at most 32
+candidates per numbered round, waits for the peer's same-round batch, and sends
+from its retained primary socket to that batch during an overlapping bounded
+window. Reports are correlated to sent sequence/destination and normalized in
+send order before insertion. Incoming probes plus reports of the node's own
+probes must demonstrate a matching reciprocal tuple. Both ROUND_DONE records
+must agree on the endpoint pair before handoff. A one-way observation alone
+is evidence, not connectivity success. Only current-round reports count toward
+that round's success. The local sending window is distinct from the reporting
+deadline: allow up to two further seconds for in-flight Fabric reports, ending
+earlier after reciprocal evidence (or one valid active observation). This wait
+never extends the parent task deadline. Remote evidence stores are never exchanged.
+
+After a failed round, new evidence triggers inference; otherwise the node may
+execute its finite local observe plan. The first offered observer is the
+configured static peer, followed by other reachable Fabric nodes as needed.
+OBSERVE_OPEN prepares temporary public listeners, with baseline inference
+only: it cannot recursively request observations. OBSERVE_READY binds the
+listeners and fresh key to this session and operation. Measurements use the
+same PUBLIC_PROBE/REPORT format and ordered local/destination endpoint steps.
+Primary and auxiliary sockets stay open while their evidence is used. Failed
+observer branches may advance inside the finite plan. No new evidence on
+either side means END, not another inference cycle. Waiting for the peer's
+bounded measurement is not local progress and does not reset any deadline.
+
+Initial runtime limits: 30 seconds per task, 16 rounds, 32 candidates per
+batch, 12000 transmitted probes, 64 measurements, 8 observer sessions per task,
+128 inbound routed sessions. Observer leases expire after 30 seconds or on
+session close/END. Cancellation and overflow terminate the affected operation;
+stale operation IDs/rounds cannot revive it. An accepted task retains its
+control session until handoff; losing it before then fails the attempt. Existing
+one-shot admission and smaller-UUID simultaneous-proposal arbitration remain.
+
+Handoff closes the userspace primary socket, brings up the prepared WG device
+on the **same port**, with the actual reciprocal endpoint, empty AllowedIPs
+and explicit keepalive=0. Only successful binding/configuration permits WG_READY.
+After receiving peer WG_READY, install regular AllowedIPs and run existing
+link-local discovery and link-bound VFP identity/address negotiation. Only that
+final validation commits the Link. Preserve the source address, family, routing
+context and namespace across handoff; if the route would choose a different
+source, fail. Auxiliary sockets and their evidence are released. Every failure
+cleans tentative resources and retains the existing routed Fabric path.
+
 ## 9. Error Handling
 
-VFP has exactly three generic error dispositions. There is no fourth generic
-severity and no generic error-response message.
+For TCP sessions, VFP has the three error dispositions below. UDP has no
+connection to close: any invalid datagram is silently discarded under Section
+5.4, while ignorable fields still follow Section 9.3. Neither transport defines
+a generic error-response message.
 
 The non-normative error-handling survey is recorded in
 [REF-ERROR](refs/ERROR_HANDLING.md).
@@ -980,6 +1132,7 @@ The non-normative error-handling survey is recorded in
 The receiver closes the TCP connection when a trustworthy next frame boundary
 or valid session cannot be maintained. Current cases are:
 
+- the common Magic is invalid;
 - Message Length is smaller than the common header;
 - Message Length exceeds the version-1 limit of 4096 octets;
 - TCP ends before the complete declared frame arrives;
@@ -1003,7 +1156,7 @@ state, and continues the established session. Current cases are:
 - a TLV Value Length crosses the outer frame boundary;
 - a TLV occurs fewer than its schema's `min_occurs`;
 - a selected known TLV has an invalid length or value;
-- the Message Type is invalid in the current state;
+- the Message Type is invalid in the current transport context or state;
 - the Message Type is unknown in an established session;
 - a Dynamic-Link response references an unknown, ended, or different-session
   operation.
@@ -1049,8 +1202,14 @@ still claim unchanged semantics.
 
 ### 10.2 Version changes
 
-A new protocol version is required when an old implementation cannot safely
-preserve the intended semantics by ignoring the new element. Examples include:
+While the protocol remains in internal development, Section 1 permits breaking
+revisions to retain Version 1, with coordinated software upgrades and no implied
+compatibility with previous development builds. In particular, this revision
+replaces both legacy framing formats without changing the Version field.
+
+After an explicit protocol freeze, a new protocol version is required when an
+old implementation cannot safely preserve the intended semantics by ignoring
+the new element. Examples include:
 
 - making a previously unknown field required for an existing Message Type;
 - changing the meaning or syntax of an existing field;

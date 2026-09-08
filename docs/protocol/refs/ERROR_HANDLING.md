@@ -61,7 +61,9 @@ Sources:
    be discarded without changing state while the established session remains.
 3. If one TLV is explicitly ignorable, it can be skipped while the rest of the
    frame continues.
-4. These three dispositions are sufficient for the generic protocol layer.
+4. These three dispositions cover TCP sessions. UDP has no connection to
+   close: malformed, truncated, oversized, or wrong-context datagrams are
+   silently discarded; structurally valid ignorable TLVs are still skipped.
    Route withdrawal, Link rejection, and similar outcomes belong to their
    business state machines.
 5. VFP does not need a generic error response, unsupported-message response,

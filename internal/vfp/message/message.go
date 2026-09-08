@@ -12,9 +12,11 @@ import (
 )
 
 const (
-	Version        = 1
-	HeaderLength   = 4
-	MaxFrameLength = 4096
+	Magic             = 0x56465000 // "VFP\x00", shared by TCP and UDP.
+	Version           = 1
+	HeaderLength      = 8
+	MaxFrameLength    = 4096
+	MaxDatagramLength = 1200
 )
 
 type Type uint8
@@ -28,16 +30,25 @@ const (
 	DynamicLinkPropose  Type = 0x06
 	DynamicLinkAccept   Type = 0x07
 	DynamicLinkDecline  Type = 0x08
+	DiscoveryHello      Type = 0x09
+	DiscoveryHelloAck   Type = 0x0a
+	DiscoveryControl    Type = 0x0b
+	PublicProbe         Type = 0x0c
 )
 
+func (t Type) IsDiscovery() bool { return t == DiscoveryHello || t == DiscoveryHelloAck }
+
 const (
-	NodeUIDTLV      uint16 = 0x0001
-	LoopbackV6TLV   uint16 = 0x0003
-	LinkPrefixV4TLV uint16 = 0x0004
-	LinkPrefixV6TLV uint16 = 0x0005
-	OperationIDTLV  uint16 = 0x0006
-	WGPublicKeyTLV  uint16 = 0x0007
-	WGEndpointTLV   uint16 = 0x0008
+	NodeUIDTLV       uint16 = 0x0001
+	LoopbackV6TLV    uint16 = 0x0003
+	LinkPrefixV4TLV  uint16 = 0x0004
+	LinkPrefixV6TLV  uint16 = 0x0005
+	OperationIDTLV   uint16 = 0x0006
+	WGPublicKeyTLV   uint16 = 0x0007
+	WGEndpointTLV    uint16 = 0x0008
+	ProbeKeyTLV      uint16 = 0x0009
+	DiscoveryDataTLV uint16 = 0x000a
+	SealedProbeTLV   uint16 = 0x000b
 )
 
 var ErrFrame = errors.New("invalid VFP frame")
@@ -50,6 +61,8 @@ type UID struct {
 
 type Message struct {
 	Type         Type
+	ProbeKey     [32]byte
+	Data         []byte
 	UID          *UID
 	LoopbackV6   netip.Addr
 	LinkPrefixV4 netip.Prefix
@@ -64,28 +77,45 @@ func Read(r io.Reader) ([]byte, error) {
 	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, fmt.Errorf("%w: read header: %v", ErrConnection, err)
 	}
-	length := int(binary.BigEndian.Uint16(header[2:4]))
-	if length < HeaderLength || length > MaxFrameLength {
-		return nil, fmt.Errorf("%w: declared length %d", ErrConnection, length)
+	length, err := frameLength(header)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrConnection, err)
 	}
 	frame := make([]byte, length)
 	copy(frame, header)
 	if _, err := io.ReadFull(r, frame[HeaderLength:]); err != nil {
 		return nil, fmt.Errorf("%w: read body: %v", ErrConnection, err)
 	}
-	if frame[0] != Version {
-		return nil, fmt.Errorf("%w: unsupported version %d", ErrConnection, frame[0])
-	}
 	return frame, nil
 }
 
+// frameLength checks the common header before any body allocation or read.
+func frameLength(frame []byte) (int, error) {
+	if len(frame) < HeaderLength {
+		return 0, fmt.Errorf("%w: short header", ErrFrame)
+	}
+	if binary.BigEndian.Uint32(frame[:4]) != Magic {
+		return 0, fmt.Errorf("%w: invalid magic", ErrFrame)
+	}
+	if frame[4] != Version {
+		return 0, fmt.Errorf("%w: unsupported version %d", ErrFrame, frame[4])
+	}
+	length := int(binary.BigEndian.Uint16(frame[6:8]))
+	if length < HeaderLength || length > MaxFrameLength {
+		return 0, fmt.Errorf("%w: declared length %d", ErrFrame, length)
+	}
+	return length, nil
+}
+
+// Decode validates a complete message; its caller supplies transport/session context.
 func Decode(frame []byte) (Message, error) {
-	if len(frame) < HeaderLength || len(frame) > MaxFrameLength || int(binary.BigEndian.Uint16(frame[2:4])) != len(frame) || frame[0] != Version {
+	length, err := frameLength(frame)
+	if err != nil || length != len(frame) {
 		return Message{}, ErrFrame
 	}
-	result := Message{Type: Type(frame[1])}
-	if result.Type < Open || result.Type > DynamicLinkDecline {
-		return Message{}, fmt.Errorf("%w: unknown message type 0x%02x", ErrFrame, frame[1])
+	result := Message{Type: Type(frame[5])}
+	if result.Type < Open || result.Type > PublicProbe {
+		return Message{}, fmt.Errorf("%w: unknown message type 0x%02x", ErrFrame, frame[5])
 	}
 	selected := map[uint16][]byte{}
 	cursor := tlv.NewCursor(frame[HeaderLength:])
@@ -104,7 +134,6 @@ func Decode(frame []byte) (Message, error) {
 			selected[view.Type] = view.Value
 		}
 	}
-	var err error
 	switch result.Type {
 	case Open:
 		value, ok := selected[NodeUIDTLV]
@@ -133,14 +162,18 @@ func Decode(frame []byte) (Message, error) {
 		if err != nil {
 			return Message{}, fmt.Errorf("%w: %v", ErrFrame, err)
 		}
-	case LinkAccept:
-		// Every known TLV is unused for LINK_ACCEPT and was ignored above.
+	case LinkAccept, DiscoveryHello, DiscoveryHelloAck:
+		// These messages have no used TLVs; structural validation still applies.
 	case EndpointObservation:
 		result.Endpoint, err = parseEndpoint(selected[WGEndpointTLV])
 		if err != nil || !result.Endpoint.IsValid() {
 			return Message{}, fmt.Errorf("%w: ENDPOINT_OBSERVATION requires a valid WG_ENDPOINT", ErrFrame)
 		}
 	case DynamicLinkPropose, DynamicLinkAccept:
+		if len(selected[ProbeKeyTLV]) != 32 {
+			return Message{}, ErrFrame
+		}
+		copy(result.ProbeKey[:], selected[ProbeKeyTLV])
 		if err = parseOperationID(selected[OperationIDTLV], &result.OperationID); err != nil {
 			return Message{}, fmt.Errorf("%w: %v", ErrFrame, err)
 		}
@@ -150,6 +183,19 @@ func Decode(frame []byte) (Message, error) {
 		result.Endpoint, err = parseEndpoint(selected[WGEndpointTLV])
 		if err != nil || !result.Endpoint.IsValid() {
 			return Message{}, fmt.Errorf("%w: dynamic Link message requires a valid WG_ENDPOINT", ErrFrame)
+		}
+	case DiscoveryControl:
+		if err = parseOperationID(selected[OperationIDTLV], &result.OperationID); err != nil {
+			return Message{}, ErrFrame
+		}
+		result.Data = append([]byte(nil), selected[DiscoveryDataTLV]...)
+		if _, err = DecodeControl(result.Data); err != nil {
+			return Message{}, err
+		}
+	case PublicProbe:
+		result.Data = append([]byte(nil), selected[SealedProbeTLV]...)
+		if len(result.Data) != 50 && len(result.Data) != 62 {
+			return Message{}, ErrFrame
 		}
 	case DynamicLinkDecline:
 		if err = parseOperationID(selected[OperationIDTLV], &result.OperationID); err != nil {
@@ -197,7 +243,7 @@ func Encode(m Message) ([]byte, error) {
 			value := m.LinkPrefixV6.Addr().As16()
 			body = tlv.Append(body, LinkPrefixV6TLV, value[:])
 		}
-	case LinkAccept:
+	case LinkAccept, DiscoveryHello, DiscoveryHelloAck:
 	case EndpointObservation:
 		value, err := encodeEndpoint(m.Endpoint)
 		if err != nil {
@@ -215,6 +261,18 @@ func Encode(m Message) ([]byte, error) {
 			return nil, err
 		}
 		body = tlv.Append(body, WGEndpointTLV, value)
+		body = tlv.Append(body, ProbeKeyTLV, m.ProbeKey[:])
+	case DiscoveryControl:
+		if _, err := DecodeControl(m.Data); err != nil {
+			return nil, err
+		}
+		body = tlv.Append(body, OperationIDTLV, m.OperationID[:])
+		body = tlv.Append(body, DiscoveryDataTLV, m.Data)
+	case PublicProbe:
+		if len(m.Data) != 50 && len(m.Data) != 62 {
+			return nil, ErrFrame
+		}
+		body = tlv.Append(body, SealedProbeTLV, m.Data)
 	case DynamicLinkDecline:
 		body = tlv.Append(body, OperationIDTLV, m.OperationID[:])
 	default:
@@ -224,12 +282,44 @@ func Encode(m Message) ([]byte, error) {
 	if length > MaxFrameLength {
 		return nil, errors.New("frame too large")
 	}
-	frame := []byte{Version, byte(m.Type), 0, 0}
-	binary.BigEndian.PutUint16(frame[2:4], uint16(length))
+	frame := make([]byte, HeaderLength, length)
+	binary.BigEndian.PutUint32(frame[:4], Magic)
+	frame[4], frame[5] = Version, byte(m.Type)
+	binary.BigEndian.PutUint16(frame[6:8], uint16(length))
 	return append(frame, body...), nil
 }
 
+// DecodeDatagram applies the current UDP binding. The socket reader must not
+// pass a truncated prefix as a complete datagram (see VFP section 5.4).
+func DecodeDatagram(packet []byte) (Message, error) {
+	if len(packet) > MaxDatagramLength {
+		return Message{}, fmt.Errorf("%w: datagram too large", ErrFrame)
+	}
+	m, err := Decode(packet)
+	if err != nil {
+		return Message{}, err
+	}
+	if !m.Type.IsDiscovery() && m.Type != PublicProbe {
+		return Message{}, fmt.Errorf("%w: message is not valid over UDP", ErrFrame)
+	}
+	return m, nil
+}
+
+func EncodeDatagram(m Message) ([]byte, error) {
+	if !m.Type.IsDiscovery() && m.Type != PublicProbe {
+		return nil, fmt.Errorf("%w: message is not valid over UDP", ErrFrame)
+	}
+	frame, err := Encode(m)
+	if err == nil && len(frame) > MaxDatagramLength {
+		return nil, ErrFrame
+	}
+	return frame, err
+}
+
 func Write(w io.Writer, m Message) error {
+	if m.Type.IsDiscovery() || m.Type == PublicProbe {
+		return fmt.Errorf("%w: discovery is not valid over TCP", ErrFrame)
+	}
 	frame, err := Encode(m)
 	if err != nil {
 		return err
@@ -257,7 +347,11 @@ func usedBy(messageType Type, tlvType uint16) bool {
 	case EndpointObservation:
 		return tlvType == WGEndpointTLV
 	case DynamicLinkPropose, DynamicLinkAccept:
-		return tlvType == OperationIDTLV || tlvType == WGPublicKeyTLV || tlvType == WGEndpointTLV
+		return tlvType == OperationIDTLV || tlvType == WGPublicKeyTLV || tlvType == WGEndpointTLV || tlvType == ProbeKeyTLV
+	case DiscoveryControl:
+		return tlvType == OperationIDTLV || tlvType == DiscoveryDataTLV
+	case PublicProbe:
+		return tlvType == SealedProbeTLV
 	case DynamicLinkDecline:
 		return tlvType == OperationIDTLV
 	default:

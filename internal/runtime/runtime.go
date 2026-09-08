@@ -13,14 +13,15 @@ import (
 )
 
 type Event struct {
-	Event     string `json:"event"`
-	Status    string `json:"status,omitempty"`
-	NodeUID   string `json:"node_uid,omitempty"`
-	Peer      string `json:"peer,omitempty"`
-	Interface string `json:"interface,omitempty"`
-	RemoteUID string `json:"remote_uid,omitempty"`
-	RemoteIP  string `json:"remote_ip,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Event         string `json:"event"`
+	Status        string `json:"status,omitempty"`
+	NodeUID       string `json:"node_uid,omitempty"`
+	Peer          string `json:"peer,omitempty"`
+	Interface     string `json:"interface,omitempty"`
+	RemoteUID     string `json:"remote_uid,omitempty"`
+	RemoteIP      string `json:"remote_ip,omitempty"`
+	LocalEndpoint string `json:"local_endpoint,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 type Runner struct {

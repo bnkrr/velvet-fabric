@@ -260,11 +260,13 @@ func TestCommitLinkMaterializesAndRecordsState(t *testing.T) {
 }
 
 type runtimeBackend struct {
-	local        []netip.Prefix
-	peers        []netip.Addr
-	plan         reconcile.LinkPlan
-	configureErr error
-	onRemove     func()
+	local           []netip.Prefix
+	peers           []netip.Addr
+	plan            reconcile.LinkPlan
+	configureErr    error
+	configuredPlans []reconcile.LinkPlan
+	onConfigure     func(reconcile.LinkPlan)
+	onRemove        func()
 
 	prepared      int
 	configured    int
@@ -306,8 +308,12 @@ func (b *runtimeBackend) PrepareDynamic(_ context.Context, plan reconcile.LinkPl
 	plan.ListenPort = 53000
 	return plan, nil
 }
-func (b *runtimeBackend) ConfigureDynamic(context.Context, reconcile.LinkPlan) error {
+func (b *runtimeBackend) ConfigureDynamic(_ context.Context, plan reconcile.LinkPlan) error {
 	b.configured++
+	b.configuredPlans = append(b.configuredPlans, plan)
+	if b.onConfigure != nil {
+		b.onConfigure(plan)
+	}
 	return b.configureErr
 }
 func (b *runtimeBackend) ListenPort(context.Context, string) (int, error) {

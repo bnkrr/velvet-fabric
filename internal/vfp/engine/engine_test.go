@@ -235,10 +235,14 @@ func TestOperationalSessionDiscardsBadFramesAndContinues(t *testing.T) {
 	}
 	// Both an unknown message and a legal message in the wrong context are
 	// frame errors, so neither may tear down the following valid operation.
-	if _, err := remote.Write([]byte{1, 255, 0, 4}); err != nil {
+	if _, err := remote.Write([]byte("VFP\x00\x01\xff\x00\x08")); err != nil {
 		t.Fatal(err)
 	}
 	if err := message.Write(remote, message.Message{Type: message.EndpointObservation, Endpoint: netip.MustParseAddrPort("192.0.2.1:5000")}); err != nil {
+		t.Fatal(err)
+	}
+	// A UDP-only discovery frame must also be discarded without a reply.
+	if _, err := remote.Write([]byte("VFP\x00\x01\x09\x00\x08")); err != nil {
 		t.Fatal(err)
 	}
 	want := message.Message{Type: message.DynamicLinkDecline, OperationID: [16]byte{9}}
@@ -247,7 +251,7 @@ func TestOperationalSessionDiscardsBadFramesAndContinues(t *testing.T) {
 	}
 	select {
 	case got := <-received:
-		if got.Type != want.Type || got.OperationID != want.OperationID || discarded.Load() != 2 {
+		if got.Type != want.Type || got.OperationID != want.OperationID || discarded.Load() != 3 {
 			t.Fatalf("got %#v, discarded %d", got, discarded.Load())
 		}
 	case <-time.After(time.Second):

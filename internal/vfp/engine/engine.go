@@ -462,7 +462,7 @@ func (s *sessionFSM) remoteLoopbackV6() netip.Addr {
 
 func validOperationalMessage(context SessionContext, kind message.Type) bool {
 	if context == RoutedSession {
-		return kind == message.DynamicLinkPropose || kind == message.DynamicLinkAccept || kind == message.DynamicLinkDecline
+		return kind == message.DynamicLinkPropose || kind == message.DynamicLinkAccept || kind == message.DynamicLinkDecline || kind == message.DiscoveryControl
 	}
 	return kind == message.EndpointObservation
 }

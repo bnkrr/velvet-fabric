@@ -4,9 +4,9 @@ Status: Informative research note; not part of the VFP specification.
 
 ## Question
 
-How should a TCP-carried, stateful Fabric control protocol frame messages and
-encode message-specific data without committing the implementation to a generic
-RPC or object-serialization system?
+How should Fabric control messages share an extensible encoding across TCP
+sessions and UDP discovery without committing the implementation to a generic
+RPC, reliable-UDP, or object-serialization system?
 
 ## Compared designs
 
@@ -64,6 +64,27 @@ Source:
 
 - [Tailscale DERP protocol implementation](https://github.com/tailscale/tailscale/blob/main/derp/derp.go)
 
+## TCP/UDP precedents used in the 2026-09-07 revision
+
+STUN shares a fixed header and TLV attributes across transports. Its length
+field provides framing when it is the only protocol on a TCP connection; UDP
+request retransmission and TCP transaction deadlines are specified separately.
+Its magic cookie helps identify the protocol, while integrity mechanisms
+provide authentication. This is the closest model for VFP's common encoding;
+VFP does not adopt STUN's transaction header or response model wholesale.
+[RFC 8489 sections 5, 6.2, and 9](https://www.rfc-editor.org/rfc/rfc8489.html#section-5).
+
+DNS shares message encoding and adds a two-byte length prefix on TCP. This
+demonstrates separating message syntax from transport framing. VFP already
+has a message length, so it does not need an additional prefix.
+[RFC 1035 section 4.2.2](https://www.rfc-editor.org/rfc/rfc1035.html#section-4.2.2).
+
+CoAP adjusts its header for reliable transports: TCP adds length information
+and omits the UDP Type and Message ID fields used for reliability. Shared
+message semantics do not require shared reliability mechanisms. VFP's current
+UDP discovery needs no generic ACK, transaction header, or session handshake.
+[RFC 8323 section 3.2](https://www.rfc-editor.org/rfc/rfc8323.html#section-3.2).
+
 ## Conclusions used by VFP
 
 1. A length-delimited common frame is needed on TCP.
@@ -77,6 +98,13 @@ Source:
    reflection, or a generic status envelope.
 7. Versioning and capability negotiation are distinct. Capability machinery
    should not be added until an independently negotiable feature exists.
+8. TCP and UDP share the common header, TLV codec, and Message Type registry;
+   each message still has an explicit transport and security context.
+9. Magic distinguishes the encoding, Length determines boundaries, and
+   authentication is a separate requirement. None substitutes for another.
+10. UDP carries one complete bounded message per datagram. Loss, duplicate
+    handling, and responses belong to the specific procedure. Discovery can
+    have an empty canonical TLV body while using the common parser.
 
 The exact VFP header widths and code points are defined by the normative VFP
 document, not by this survey.

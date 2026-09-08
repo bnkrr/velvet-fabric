@@ -52,6 +52,9 @@ type DynamicLinksPlan struct {
 }
 
 type LinkPlan struct {
+	// Probing keeps a tentative interface DOWN; ReceiveOnly gates outbound WG.
+	Probing          bool
+	ReceiveOnly      bool
 	PeerName         string
 	InterfaceName    string
 	OwnerAlias       string

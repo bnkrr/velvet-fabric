@@ -46,6 +46,7 @@ scp "${ssh_config_args[@]}" -o ControlMaster=no -o ControlPath=none \
   "${repo_root}/tests/e2e/netns-wg-admin-core.sh" \
   "${repo_root}/tests/e2e/generate-wg-admin-core.py" \
   "${repo_root}/tests/e2e/netns-dynamic.sh" \
+  "${repo_root}/tests/e2e/netns-udp-nat.py" \
   "${repo_root}/tests/e2e/generate-dynamic-core.py" \
   "${babel_binary}" \
   "${ssh_alias}:${remote_root}/"
@@ -62,10 +63,28 @@ case ${1:-all} in
   dynamic)
     remote_tests="'${remote_root}/netns-dynamic.sh' '${remote_root}/velvetd' '${remote_root}/babel-rs' '${remote_root}/velvetctl'"
     ;;
-  all)
-    remote_tests="'${remote_root}/netns-static.sh' '${remote_root}/velvetd' && '${remote_root}/netns-core-crud.sh' '${remote_root}/velvetd' && '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/velvetd' && '${remote_root}/netns-dynamic.sh' '${remote_root}/velvetd' '${remote_root}/babel-rs' '${remote_root}/velvetctl'"
+  nat)
+    remote_tests="python3 '${remote_root}/netns-udp-nat.py' '${remote_root}/velvetd' '${remote_root}/babel-rs'"
+    shift
+    for nat_case in "$@"; do
+      case ${nat_case} in
+        preserve|remap|delayed-remap|blocked|control-loss|random|observer-fallback|lifecycle) remote_tests+=" '${nat_case}'" ;;
+        *)
+          if [[ ${nat_case} =~ ^v[46]-single-(preserve|remap|random)-(public|nat)-init$ ||
+                ${nat_case} =~ ^v6-(native|filtered)-(a|b)-init$ ||
+                ${nat_case} =~ ^v6-dual-(preserve|remap|blocked|random)$ ]]; then
+            remote_tests+=" '${nat_case}'"
+          else
+            echo "unknown NAT scenario: ${nat_case}" >&2; exit 2
+          fi
+          ;;
+      esac
+    done
     ;;
-  *) echo "usage: $0 [all|static|crud|static-core|dynamic]" >&2; exit 2 ;;
+  all)
+    remote_tests="'${remote_root}/netns-static.sh' '${remote_root}/velvetd' && '${remote_root}/netns-core-crud.sh' '${remote_root}/velvetd' && '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/velvetd' && '${remote_root}/netns-dynamic.sh' '${remote_root}/velvetd' '${remote_root}/babel-rs' '${remote_root}/velvetctl' && python3 '${remote_root}/netns-udp-nat.py' '${remote_root}/velvetd' '${remote_root}/babel-rs'"
+    ;;
+  *) echo "usage: $0 [all|static|crud|static-core|dynamic|nat]" >&2; exit 2 ;;
 esac
 ssh "${ssh_config_args[@]}" -o ControlMaster=no -o ControlPath=none "${ssh_alias}" \
   "chmod 0700 '${remote_root}/velvetd' '${remote_root}/velvetctl' '${remote_root}/babel-rs' '${remote_root}/netns-static.sh' '${remote_root}/netns-core-crud.sh' '${remote_root}/netns-wg-admin-core.sh' '${remote_root}/generate-wg-admin-core.py' '${remote_root}/netns-dynamic.sh' '${remote_root}/generate-dynamic-core.py' && ${remote_tests}"

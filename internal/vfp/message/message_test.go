@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"reflect"
 	"testing"
+	"testing/iotest"
 
 	"github.com/google/uuid"
 	"github.com/velvet-fabric/velvet-fabric/internal/tlv"
@@ -19,9 +20,9 @@ func TestMessageRoundTripAndUnknownTLV(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := tlv.Append(frame[4:], 0xff00, []byte("ignored"))
-	frame = append(frame[:4], body...)
-	binary.BigEndian.PutUint16(frame[2:4], uint16(len(frame)))
+	body := tlv.Append(frame[HeaderLength:], 0xff00, []byte("ignored"))
+	frame = append(frame[:HeaderLength], body...)
+	binary.BigEndian.PutUint16(frame[6:8], uint16(len(frame)))
 	got, err := Decode(frame)
 	if err != nil {
 		t.Fatal(err)
@@ -85,8 +86,8 @@ func TestObservationAndCandidateUseWGEndpointTLV(t *testing.T) {
 			if view.Type == WGEndpointTLV {
 				found = true
 			}
-			if view.Type == 0x0009 {
-				t.Fatalf("message %x used reserved endpoint TLV 0x0009", value.Type)
+			if view.Type == 0x000c {
+				t.Fatalf("message %x used reserved endpoint TLV 0x000c", value.Type)
 			}
 		}
 		if !found {
@@ -100,10 +101,11 @@ func TestObservationAndCandidateUseWGEndpointTLV(t *testing.T) {
 	}
 	body := tlv.Append(nil, OperationIDTLV, operation[:])
 	body = tlv.Append(body, WGPublicKeyTLV, key[:])
-	body = tlv.Append(body, 0x0009, endpointValue)
-	frame := []byte{Version, byte(DynamicLinkPropose), 0, 0}
+	body = tlv.Append(body, ProbeKeyTLV, make([]byte, 32))
+	body = tlv.Append(body, 0x000c, endpointValue)
+	frame := []byte{0x56, 0x46, 0x50, 0, 1, byte(DynamicLinkPropose), 0, 0}
 	frame = append(frame, body...)
-	binary.BigEndian.PutUint16(frame[2:4], uint16(len(frame)))
+	binary.BigEndian.PutUint16(frame[6:8], uint16(len(frame)))
 	if _, err := Decode(frame); err == nil {
 		t.Fatal("reserved TLV 0x0009 was accepted as WG_ENDPOINT")
 	}
@@ -122,9 +124,9 @@ func TestDuplicateSingletonSelectsFirst(t *testing.T) {
 	first, second := uuid.New(), uuid.New()
 	body := tlv.Append(nil, NodeUIDTLV, first[:])
 	body = tlv.Append(body, NodeUIDTLV, second[:])
-	frame := []byte{Version, byte(Open), 0, 0}
+	frame := []byte{0x56, 0x46, 0x50, 0, 1, byte(Open), 0, 0}
 	frame = append(frame, body...)
-	binary.BigEndian.PutUint16(frame[2:4], uint16(len(frame)))
+	binary.BigEndian.PutUint16(frame[6:8], uint16(len(frame)))
 	got, err := Decode(frame)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +153,7 @@ func TestProposalMayBeEmpty(t *testing.T) {
 
 // A literal protocol vector prevents encoder and decoder from sharing a wire-format bug.
 func TestEndpointObservationWireVector(t *testing.T) {
-	frame, err := hex.DecodeString("01050010000800080001c000c0000209")
+	frame, err := hex.DecodeString("5646500001050014000800080001c000c0000209")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,14 +170,89 @@ func TestEndpointObservationWireVector(t *testing.T) {
 
 func TestReadRejectsInvalidFraming(t *testing.T) {
 	for name, frame := range map[string][]byte{
-		"short-header": {1, 4, 0}, "short-body": {1, 4, 0, 5},
-		"undersize": {1, 4, 0, 3}, "oversize": {1, 4, 0x10, 1}, "version": {2, 4, 0, 4},
+		"short-header":     []byte("VFP\x00\x01\x04\x00"),
+		"short-body":       []byte("VFP\x00\x01\x04\x00\x09"),
+		"undersize":        []byte("VFP\x00\x01\x04\x00\x07"),
+		"oversize":         []byte("VFP\x00\x01\x04\x10\x01"),
+		"version":          []byte("VFP\x00\x02\x04\x00\x08"),
+		"magic":            []byte("NOPE\x01\x04\x00\x08"),
+		"legacy-tcp":       {1, 4, 0, 4},
+		"legacy-discovery": []byte("VFPD\x01\x01\x00\x08"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Read(bytes.NewReader(frame)); !errors.Is(err, ErrConnection) {
 				t.Fatalf("got %v", err)
 			}
 		})
+	}
+}
+
+func TestReadValidatesHeaderBeforeBody(t *testing.T) {
+	for _, header := range []string{"NOPE\x01\x04\x00\x0c", "VFP\x00\x02\x04\x00\x0c"} {
+		reader := bytes.NewReader(append([]byte(header), []byte("body")...))
+		if _, err := Read(reader); !errors.Is(err, ErrConnection) || reader.Len() != 4 {
+			t.Fatalf("invalid header consumed body: remaining=%d err=%v", reader.Len(), err)
+		}
+	}
+}
+
+func TestReadPreservesStreamBoundaries(t *testing.T) {
+	first := []byte("VFP\x00\x01\x04\x00\x08")
+	second, _ := hex.DecodeString("5646500001050014000800080001c000c0000209")
+	stream := append(bytes.Clone(first), second...)
+	for _, fragmented := range []bool{false, true} {
+		reader := bytes.NewReader(stream)
+		for _, want := range [][]byte{first, second} {
+			var got []byte
+			var err error
+			if fragmented {
+				got, err = Read(iotest.OneByteReader(reader))
+			} else {
+				got, err = Read(reader)
+			}
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("fragmented=%v got=%x err=%v", fragmented, got, err)
+			}
+		}
+		if reader.Len() != 0 {
+			t.Fatal("stream not fully consumed")
+		}
+	}
+}
+
+func TestDatagramBoundariesAndContext(t *testing.T) {
+	hello := []byte("VFP\x00\x01\x09\x00\x08")
+	for name, packet := range map[string][]byte{
+		"concatenated": append(bytes.Clone(hello), hello...),
+		"truncated":    hello[:7],
+		"tcp-only":     []byte("VFP\x00\x01\x04\x00\x08"),
+		"unknown-type": []byte("VFP\x00\x01\xff\x00\x08"),
+		"bad-tlv":      []byte("VFP\x00\x01\x09\x00\x0c\xff\x00\x00\x01"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeDatagram(packet); !errors.Is(err, ErrFrame) {
+				t.Fatalf("accepted invalid datagram: %v", err)
+			}
+		})
+	}
+	// Unused fields still follow the shared TLV rules, including the UDP cap.
+	for _, size := range []int{MaxDatagramLength, MaxDatagramLength + 1} {
+		packet := tlv.Append(bytes.Clone(hello), 0xff00, make([]byte, size-HeaderLength-4))
+		binary.BigEndian.PutUint16(packet[6:8], uint16(size))
+		if _, err := Decode(packet); err != nil {
+			t.Fatalf("structurally valid common frame rejected: %v", err)
+		}
+		_, err := DecodeDatagram(packet)
+		if (err == nil) != (size == MaxDatagramLength) {
+			t.Fatalf("UDP size %d: %v", size, err)
+		}
+	}
+	if _, err := EncodeDatagram(Message{Type: LinkAccept}); err == nil {
+		t.Fatal("encoded TCP-only message over UDP")
+	}
+	var output bytes.Buffer
+	if err := Write(&output, Message{Type: DiscoveryHello}); err == nil || output.Len() != 0 {
+		t.Fatal("wrote discovery to TCP")
 	}
 }
 
@@ -194,7 +271,7 @@ func TestDecodeRequiresEachDynamicParameter(t *testing.T) {
 					body = tlv.Append(body, field.kind, field.value)
 				}
 			}
-			frame := append([]byte{1, byte(kind), 0, byte(4 + len(body))}, body...)
+			frame := append([]byte{0x56, 0x46, 0x50, 0, 1, byte(kind), 0, byte(HeaderLength + len(body))}, body...)
 			if _, err := Decode(frame); !errors.Is(err, ErrFrame) {
 				t.Fatalf("kind %d missing %d: %v", kind, missing, err)
 			}
@@ -203,7 +280,7 @@ func TestDecodeRequiresEachDynamicParameter(t *testing.T) {
 }
 
 func FuzzMessageDecode(f *testing.F) {
-	for _, seed := range []string{"01040004", "01050010000800080001c000c0000209", "01ff0004", "01010004"} {
+	for _, seed := range []string{"5646500001040008", "5646500001050014000800080001c000c0000209", "5646500001ff0008", "5646500001010008", "5646500001090008", "01040004"} {
 		data, _ := hex.DecodeString(seed)
 		f.Add(data)
 	}

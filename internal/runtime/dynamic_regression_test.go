@@ -12,10 +12,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/velvet-fabric/velvet-fabric/internal/inference"
+	"github.com/velvet-fabric/velvet-fabric/internal/linkdiscovery"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 	"github.com/velvet-fabric/velvet-fabric/internal/spec"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/engine"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
+	"github.com/velvet-fabric/velvet-fabric/internal/vfp/probe"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -40,13 +42,20 @@ func dynamicFixture(t *testing.T, backend *runtimeBackend) (*dynamicLinkEngine, 
 	}
 	d := newDynamicLinkEngine(runner)
 	runner.dynamic = d
+	d.probeSource = func(netip.AddrPort) (netip.Addr, error) { return netip.MustParseAddr("127.0.0.1"), nil }
+	d.listenProbe = func(_ context.Context, local netip.AddrPort, _ *probe.Receiver, _ func(probe.Received)) (probeSocket, error) {
+		if local.Port() == 0 {
+			local = netip.AddrPortFrom(local.Addr(), 53000)
+		}
+		return &fakeProbeSocket{local: local}, nil
+	}
 	d.ctx, d.cancel = context.WithCancel(context.Background())
 	t.Cleanup(d.stop)
 	if err := d.setEvidence("vl-seed", 51000, netip.MustParseAddrPort("192.0.2.1:62000")); err != nil {
 		t.Fatal(err)
 	}
 	session := &engine.Session{Context: d.ctx, RemoteUID: message.UID{UUID: remote, Name: "peer"}, RemoteLoopbackV6: netip.MustParseAddr("fd00::2")}
-	proposal := message.Message{Type: message.DynamicLinkPropose, OperationID: [16]byte{2}, WGPublicKey: [32]byte(peerKey.PublicKey()), Endpoint: netip.MustParseAddrPort("192.0.2.2:54000")}
+	proposal := message.Message{ProbeKey: [32]byte{1}, Type: message.DynamicLinkPropose, OperationID: [16]byte{2}, WGPublicKey: [32]byte(peerKey.PublicKey()), Endpoint: netip.MustParseAddrPort("192.0.2.2:54000")}
 	return d, session, proposal
 }
 
@@ -59,6 +68,7 @@ func TestDynamicCommitValidatesBeforeMaterialization(t *testing.T) {
 			if attempt == nil {
 				t.Fatal("inbound preparation failed")
 			}
+			attempt.state = dynamicAttempting
 			result := engine.Result{RemoteUID: session.RemoteUID, RemoteLoopbackV6: session.RemoteLoopbackV6}
 			ctx, cancel := context.WithCancel(d.ctx)
 			defer cancel()
@@ -187,7 +197,7 @@ func TestDynamicInferenceFailureCleansReservation(t *testing.T) {
 		} else if attempt, err := d.prepareOutbound(session); attempt != nil || err == nil {
 			t.Fatal("proposed invalid inference")
 		}
-		if backend.prepared != 1 || len(backend.removed) != 1 || len(d.attempts) != 0 || backend.configured != 0 {
+		if backend.prepared != 0 || len(backend.removed) != 0 || len(d.attempts) != 0 || backend.configured != 0 {
 			t.Fatal("failed inference leaked or configured a reservation")
 		}
 	}
@@ -202,7 +212,7 @@ func TestDynamicCleanupSerializesInterfaceReuse(t *testing.T) {
 	}
 	<-backend.prepareCalled
 	removed := make(chan struct{})
-	go func() { d.failAttempt(old, "failure", dynamicAttempting); close(removed) }()
+	go func() { d.failAttempt(old, "failure", dynamicProbing); close(removed) }()
 	<-backend.removeStarted
 	prepared := make(chan *dynamicAttempt, 1)
 	go func() { next := d.prepareInbound(session, proposal); prepared <- next }()
@@ -315,29 +325,23 @@ func TestDynamicResponsesCannotAffectAnotherAttempt(t *testing.T) {
 }
 
 func TestDynamicConfigurationFailureCleansReservation(t *testing.T) {
-	for _, inbound := range []bool{false, true} {
-		t.Run(fmt.Sprintf("inbound=%v", inbound), func(t *testing.T) {
-			backend := &runtimeBackend{configureErr: errors.New("kernel rejected configuration")}
-			d, session, response := dynamicFixture(t, backend)
-			if inbound {
-				if attempt := d.prepareInbound(session, response); attempt != nil {
-					t.Fatal("failed configuration was accepted")
-				}
-			} else {
-				attempt, err := d.prepareOutbound(session)
-				if err != nil || attempt == nil {
-					t.Fatal("preparation failed")
-				}
-				response.Type = message.DynamicLinkAccept
-				response.OperationID = attempt.operationID
-				if err := d.handleAccept(session, response); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if backend.configured != 1 || len(backend.removed) != 1 || len(d.attempts) != 0 || len(d.runner.states) != 0 {
-				t.Fatal("configuration failure leaked state")
-			}
-		})
+	backend := &runtimeBackend{configureErr: errors.New("kernel rejected configuration")}
+	d, session, proposal := dynamicFixture(t, backend)
+	attempt := d.prepareInbound(session, proposal)
+	if attempt == nil {
+		t.Fatal("preparation failed")
+	}
+	if backend.configured != 0 {
+		t.Fatal("WG configured before probing")
+	}
+	result := linkdiscovery.PeerResult{Local: attempt.udp.primary.Endpoint(), Endpoint: proposal.Endpoint}
+	err := d.handoff(attempt, result)
+	if err == nil {
+		t.Fatal("handoff should fail")
+	}
+	d.failAttempt(attempt, err.Error(), dynamicProbing)
+	if backend.configured != 1 || len(backend.removed) != 1 || len(d.attempts) != 0 {
+		t.Fatal("handoff failure leaked resources")
 	}
 }
 
@@ -417,3 +421,9 @@ func TestDynamicRoutedFailureRetainsPathWithoutRetry(t *testing.T) {
 		})
 	}
 }
+
+type fakeProbeSocket struct{ local netip.AddrPort }
+
+func (s *fakeProbeSocket) Endpoint() netip.AddrPort          { return s.local }
+func (s *fakeProbeSocket) Send([]byte, netip.AddrPort) error { return nil }
+func (s *fakeProbeSocket) Close() error                      { return nil }

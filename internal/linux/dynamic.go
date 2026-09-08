@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 	"github.com/vishvananda/netlink"
@@ -35,6 +37,12 @@ func (b *Backend) PrepareDynamic(ctx context.Context, desired reconcile.LinkPlan
 	}()
 	if err := reconcileBootstrapAddress(device, desired.BootstrapAddress); err != nil {
 		return reconcile.LinkPlan{}, fmt.Errorf("assign dynamic bootstrap address: %w", err)
+	}
+	if desired.Probing {
+		if err := netlink.LinkSetDown(device); err != nil {
+			return reconcile.LinkPlan{}, err
+		}
+		return desired, nil
 	}
 	if err := netlink.LinkSetUp(device); err != nil {
 		return reconcile.LinkPlan{}, fmt.Errorf("set dynamic interface up: %w", err)
@@ -76,6 +84,38 @@ func (b *Backend) ConfigureDynamic(ctx context.Context, desired reconcile.LinkPl
 		return fmt.Errorf("open WireGuard control client: %w", err)
 	}
 	defer client.Close()
+	if desired.ReceiveOnly {
+		device, err := requireExactlyOwnedWireGuardInterface(desired.InterfaceName, desired.OwnerAlias)
+		if err != nil {
+			return err
+		}
+		if err = netlink.LinkSetDown(device); err != nil {
+			return err
+		}
+		if len(desired.Endpoints) != 1 {
+			return errors.New("handoff requires one endpoint")
+		}
+		endpoint, err := net.ResolveUDPAddr("udp", desired.Endpoints[0])
+		if err != nil {
+			return err
+		}
+		zero := time.Duration(0)
+		err = client.ConfigureDevice(desired.InterfaceName, wgtypes.Config{PrivateKey: &desired.PrivateKey, ListenPort: &desired.ListenPort, ReplacePeers: true, Peers: []wgtypes.PeerConfig{{PublicKey: desired.PeerPublicKey, PresharedKey: &desired.PresharedKey, Endpoint: endpoint, ReplaceAllowedIPs: true, AllowedIPs: []net.IPNet{}, PersistentKeepaliveInterval: &zero}}})
+		if err != nil {
+			return err
+		}
+		if err = netlink.LinkSetUp(device); err != nil {
+			return err
+		}
+		actual, err := client.Device(desired.InterfaceName)
+		if err != nil {
+			return err
+		}
+		if actual.ListenPort != desired.ListenPort {
+			return errors.New("handoff listen port changed")
+		}
+		return nil
+	}
 	return b.applyBootstrapLink(client, desired)
 }
 

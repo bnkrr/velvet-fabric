@@ -15,6 +15,7 @@ import (
 	"github.com/velvet-fabric/velvet-fabric/internal/spec"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/engine"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
+	"github.com/velvet-fabric/velvet-fabric/internal/vfp/probe"
 )
 
 const (
@@ -33,6 +34,7 @@ type dynamicAttemptState uint8
 const (
 	dynamicPreparing dynamicAttemptState = iota
 	dynamicProposing
+	dynamicProbing
 	dynamicAttempting
 	dynamicUp
 	dynamicRecovering
@@ -43,15 +45,17 @@ const (
 // timers and resource lifetime. It uses the existing Reconciler/backend and VFP
 // sessions directly; there is no separate state-aware runtime executor.
 //
-// prepare + baseline inference -> propose/accept -> connectivity -> commit -> up
+// prepare -> propose/accept -> UDP infer/observe/probe -> handoff -> WG/VFP -> up
 // Every failed Attempt stops and retains the existing routed path. Recovery uses
 // the same committed Link within its deadline; it never restarts inference.
 // See dynamic_engine.go for candidate preparation and the terminal decision.
 type dynamicLinkEngine struct {
-	runner  *Runner
-	ctx     context.Context
-	cancel  context.CancelFunc
-	workers sync.WaitGroup
+	listenProbe probeListener
+	probeSource func(netip.AddrPort) (netip.Addr, error)
+	runner      *Runner
+	ctx         context.Context
+	cancel      context.CancelFunc
+	workers     sync.WaitGroup
 
 	// Resource operations take resourceMu before mu. Keep it across removal
 	// and reuse of an interface, while releasing mu during kernel cleanup.
@@ -59,6 +63,7 @@ type dynamicLinkEngine struct {
 	stopped    bool
 
 	mu               sync.Mutex
+	observerLeases   map[*engine.Session]*observerLease
 	evidence         []inference.Evidence
 	targets          map[netip.Addr]*dynamicTarget
 	attempts         map[uuid.UUID]*dynamicAttempt
@@ -76,6 +81,7 @@ type dynamicTarget struct {
 }
 
 type dynamicAttempt struct {
+	udp           *udpAttempt
 	remote        uuid.UUID
 	operationID   [16]byte
 	localProposal bool
@@ -96,7 +102,11 @@ type dynamicCleanup struct {
 
 func newDynamicLinkEngine(runner *Runner) *dynamicLinkEngine {
 	return &dynamicLinkEngine{
-		runner:           runner,
+		runner:      runner,
+		probeSource: probe.Source,
+		listenProbe: func(ctx context.Context, local netip.AddrPort, r *probe.Receiver, f func(probe.Received)) (probeSocket, error) {
+			return probe.Listen(ctx, local, r, f)
+		},
 		targets:          make(map[netip.Addr]*dynamicTarget),
 		attempts:         make(map[uuid.UUID]*dynamicAttempt),
 		pendingCleanups:  make(map[uuid.UUID]*dynamicCleanup),

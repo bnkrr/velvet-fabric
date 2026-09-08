@@ -67,6 +67,14 @@ func (r *Reconciler) PrepareDynamic(ctx context.Context, state *DesiredState, re
 	return r.backend.PrepareDynamic(ctx, BuildDynamicLink(state, remote))
 }
 
+// PrepareProbe reserves only the interface; userspace owns the UDP port.
+func (r *Reconciler) PrepareProbe(ctx context.Context, state *DesiredState, remote spec.NodeUID, port int) (LinkPlan, error) {
+	plan := BuildDynamicLink(state, remote)
+	plan.ListenPort = port
+	plan.Probing = true
+	return r.backend.PrepareDynamic(ctx, plan)
+}
+
 func (r *Reconciler) ConfigureDynamic(ctx context.Context, state *DesiredState, plan LinkPlan, peerPublicKey wgtypes.Key, endpoint netip.AddrPort) (LinkPlan, error) {
 	if peerPublicKey == plan.PrivateKey.PublicKey() {
 		return LinkPlan{}, fmt.Errorf("dynamic peer WireGuard public key equals local public key")

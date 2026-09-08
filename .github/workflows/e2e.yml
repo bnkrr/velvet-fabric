@@ -19,7 +19,7 @@ jobs:
   linux-netns:
     name: Linux netns fabric
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out velvet-fabric
         uses: actions/checkout@v7
@@ -38,7 +38,7 @@ jobs:
       - name: Install network tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes iproute2 iputils-ping wireguard-tools
+          sudo apt-get install --yes iproute2 iputils-ping wireguard-tools nftables
           sudo modprobe wireguard
       - name: Build babel-rs
         working-directory: babel-rs
@@ -65,3 +65,9 @@ jobs:
           "$PWD/.local/bin/velvetd"
           "$PWD/../babel-rs/target/release/babel-rs"
           "$PWD/.local/bin/velvetctl"
+      - name: Test public UDP discovery over IPv4, IPv6, NAT44 and NAT66
+        working-directory: velvet-fabric
+        run: >-
+          sudo python3 tests/e2e/netns-udp-nat.py
+          "$PWD/.local/bin/velvetd"
+          "$PWD/../babel-rs/target/release/babel-rs"
