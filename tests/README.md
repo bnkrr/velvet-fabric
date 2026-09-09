@@ -185,6 +185,23 @@ Public probe keys are supplied over the existing trusted Fabric control path;
 this work does not add end-to-end identity protection against untrusted Fabric
 members.
 
+## Optional endless membership testing
+
+The [endless netns harness](endless/README.md) mixes public nodes with per-node
+NAT mapping/filter/allocation profiles. Every added member chooses one current
+public as bootstrap; public nodes also churn, with at least one remaining.
+An independent WG/FIB and real-packet verifier checks public direct Links,
+NAT direct or routed fallback, deletion cleanup and same-identity rejoin.
+The NAT emulator itself has an independent 72-case real-UDP IPv4/IPv6 check.
+`--rounds 0` is unlimited; a positive count uses the same path for bounded
+validation. It is opt-in and separate from privileged E2E `all`.
+
+```sh
+tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0
+tests/endless/run-on-vm.sh --nodes 4 --rounds 6 --underlay ipv6
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
+```
+
 ## VM test configuration
 
 Set `VELVET_VM_HOST` to your SSH destination and `VELVET_VM_REMOTE_ROOT`

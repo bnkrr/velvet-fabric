@@ -157,7 +157,7 @@ func TestManagerLifecycle(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				manager.SetLinkPrefixes("vl-test", []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24")})
+				manager.SetLinkState("vl-test", true, []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24")})
 				switch scenario {
 				case "check-reject", "reload-reject":
 					event := await("degraded")

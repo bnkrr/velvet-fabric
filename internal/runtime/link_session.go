@@ -92,7 +92,7 @@ func (r *Runner) commitLink(ctx context.Context, desired reconcile.LinkPlan, dyn
 	}
 	r.mu.Unlock()
 	if r.babel != nil {
-		r.babel.SetLinkPrefixes(desired.InterfaceName, localAddresses)
+		r.babel.SetLinkState(desired.InterfaceName, true, localAddresses)
 	}
 	event := "velvet-link-established"
 	if dynamic {
@@ -176,6 +176,35 @@ func (r *Runner) removeDynamicState(plan reconcile.LinkPlan) {
 	}
 	r.mu.Unlock()
 	if r.babel != nil {
-		r.babel.SetLinkPrefixes(plan.InterfaceName, nil)
+		r.babel.SetLinkState(plan.InterfaceName, false, nil)
 	}
+}
+
+// clearProvisionedState preserves the configured WG bootstrap interface while
+// withdrawing the state learned from its closed Link-bound VFP session. Keeping
+// the protocol-202 adjacency would shadow Babel's alternate path, particularly
+// when a returning node selects a different public bootstrap.
+func (r *Runner) clearProvisionedState(ctx context.Context, plan reconcile.LinkPlan) error {
+	r.dynamic.resourceMu.Lock()
+	defer r.dynamic.resourceMu.Unlock()
+	r.mu.RLock()
+	state, exists := r.states[plan.InterfaceName]
+	r.mu.RUnlock()
+	if !exists || state.dynamic || state.desired.OwnerAlias != plan.OwnerAlias {
+		return nil
+	}
+	if err := r.Reconciler.Materialize(ctx, r.Desired, plan, nil, nil); err != nil {
+		return err // Retain bookkeeping so runLink retries the withdrawal.
+	}
+	r.mu.Lock()
+	delete(r.states, plan.InterfaceName)
+	r.mu.Unlock()
+	r.dynamic.mu.Lock()
+	r.dynamic.removeEvidenceLocked(plan.InterfaceName)
+	r.dynamic.mu.Unlock()
+	if r.babel != nil {
+		r.babel.SetLinkState(plan.InterfaceName, false, nil)
+	}
+	r.log(Event{Event: "velvet-link-withdraw", Status: "success", Interface: plan.InterfaceName})
+	return nil
 }

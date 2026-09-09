@@ -1010,10 +1010,13 @@ effectively unchanged local configuration is permitted, while a changed
 configuration MAY cancel, remove, and relearn them from the surviving routed
 Fabric.
 
-Routing protocols may observe a tentative interface before VFP commit. Such a
-protocol forms no useful adjacency until the Link carries packets and must
-withdraw its state if the interface is removed. This does not change the VFP
-success condition and does not put routing messages inside VFP.
+Managed routing MUST NOT admit a tentative Dynamic Link before VFP commit.
+WG may already carry routing packets during final VFP validation; learning a
+preferred path on that temporary interface can disturb the existing fallback
+when validation subsequently fails. Admit the interface after commit and
+withdraw it when the Link is removed. The managed Babel integration uses exact
+committed interface names, not a wildcard that includes tentative devices.
+This does not put routing messages inside VFP.
 
 ### 8.15 `DISCOVERY_HELLO` and `DISCOVERY_HELLO_ACK`
 
@@ -1106,6 +1109,14 @@ session close/END. Cancellation and overflow terminate the affected operation;
 stale operation IDs/rounds cannot revive it. An accepted task retains its
 control session until handoff; losing it before then fails the attempt. Existing
 one-shot admission and smaller-UUID simultaneous-proposal arbitration remain.
+
+The local port reservation must cover the binding scope of the eventual WG
+listener. On Linux that includes wildcard IPv4 and IPv6, even for a probe using
+one source address/family. A wildcard userspace socket must pin its transmitted
+source and reject packets addressed to another local IP before consuming replay
+state. Reserving only a single local address can hide an existing conflicting
+socket until handoff. This reservation does not make close/rebind atomic against
+other processes; binding failure still terminates the attempt.
 
 Handoff closes the userspace primary socket, brings up the prepared WG device
 on the **same port**, with the actual reciprocal endpoint, empty AllowedIPs

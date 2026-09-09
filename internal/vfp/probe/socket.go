@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const MaxPackets = 12000
@@ -111,22 +113,36 @@ func (r *Receiver) Open(packet []byte, seen netip.AddrPort) (Received, bool) {
 }
 
 type Socket struct {
-	conn      *net.UDPConn
-	Local     netip.AddrPort
-	done      chan struct{}
-	closeOnce sync.Once
+	conn          *net.UDPConn
+	Local         netip.AddrPort
+	done          chan struct{}
+	closeOnce     sync.Once
+	sourceControl []byte
 }
 
 func Listen(ctx context.Context, local netip.AddrPort, r *Receiver, receive func(Received)) (*Socket, error) {
-	network := "udp6"
-	if local.Addr().Is4() {
-		network = "udp4"
+	if !local.IsValid() || local.Addr().IsUnspecified() || local.Addr().IsMulticast() {
+		return nil, errors.New("probe requires a concrete local address")
 	}
-	conn, err := net.ListenUDP(network, net.UDPAddrFromAddrPort(local))
+	// WireGuard binds the same wildcard port in IPv4 and IPv6. Reserve that
+	// scope now: a single-address bind can otherwise coexist with a discovery
+	// sender on another address/family and fail only after successful punching.
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero, Port: int(local.Port())})
 	if err != nil {
 		return nil, err
 	}
-	s := &Socket{conn: conn, Local: conn.LocalAddr().(*net.UDPAddr).AddrPort(), done: make(chan struct{})}
+	s := &Socket{conn: conn, Local: netip.AddrPortFrom(local.Addr(), conn.LocalAddr().(*net.UDPAddr).AddrPort().Port()), done: make(chan struct{})}
+	if local.Addr().Is4() {
+		err = ipv4.NewPacketConn(conn).SetControlMessage(ipv4.FlagDst, true)
+		s.sourceControl = (&ipv4.ControlMessage{Src: net.IP(local.Addr().AsSlice())}).Marshal()
+	} else {
+		err = ipv6.NewPacketConn(conn).SetControlMessage(ipv6.FlagDst, true)
+		s.sourceControl = (&ipv6.ControlMessage{Src: net.IP(local.Addr().AsSlice())}).Marshal()
+	}
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -137,12 +153,33 @@ func Listen(ctx context.Context, local netip.AddrPort, r *Receiver, receive func
 	go func() {
 		defer s.Close()
 		buffer := make([]byte, message.MaxDatagramLength+1)
+		control := make([]byte, len(ipv4.NewControlMessage(ipv4.FlagDst))+len(ipv6.NewControlMessage(ipv6.FlagDst)))
 		for {
-			n, from, err := conn.ReadFromUDPAddrPort(buffer)
+			n, controlLength, _, from, err := conn.ReadMsgUDPAddrPort(buffer, control)
 			if err != nil {
 				return
 			}
 			from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
+			// A wildcard reservation must not expand the measurement to other local
+			// addresses, or consume replay state for a packet on the wrong path.
+			var destination net.IP
+			if local.Addr().Is4() {
+				var cm ipv4.ControlMessage
+				if cm.Parse(control[:controlLength]) != nil {
+					continue
+				}
+				destination = cm.Dst
+			} else {
+				var cm ipv6.ControlMessage
+				if cm.Parse(control[:controlLength]) != nil {
+					continue
+				}
+				destination = cm.Dst
+			}
+			ip, ok := netip.AddrFromSlice(destination)
+			if !ok || ip.Unmap() != local.Addr().Unmap().WithZone("") {
+				continue
+			}
 			if v, ok := r.Open(buffer[:n], from); ok {
 				receive(v)
 			}
@@ -151,7 +188,11 @@ func Listen(ctx context.Context, local netip.AddrPort, r *Receiver, receive func
 	return s, nil
 }
 func (s *Socket) Send(packet []byte, dst netip.AddrPort) error {
-	_, err := s.conn.WriteToUDPAddrPort(packet, dst)
+	if dst.Addr().Is4() != s.Local.Addr().Is4() {
+		return errors.New("probe destination family differs from local address")
+	}
+	// Pin the measured source despite the wildcard bind and destination changes.
+	_, _, err := s.conn.WriteMsgUDPAddrPort(packet, s.sourceControl, dst)
 	return err
 }
 func (s *Socket) Close() error {

@@ -76,7 +76,7 @@ func TestBuildDesiredStateCompilesManagedBabel(t *testing.T) {
 			if plan == nil || plan.ManageRules || !plan.DeviceOnly || plan.Protocol != 203 {
 				t.Fatalf("invalid Babel ownership: %#v", plan)
 			}
-			interfaces := []string{"vl-*", "vdl-*"}
+			interfaces := []string{"vl-*"}
 			if interfaceName != "" {
 				interfaces = append(interfaces, interfaceName)
 			}

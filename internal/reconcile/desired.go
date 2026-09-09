@@ -271,8 +271,9 @@ func compileBabel(desired *DesiredState, nodeSpec *spec.NodeSpec) *BabelPlan {
 		ControlPath: filepath.Join(runtimeRoot, "babel-rs.ctl"),
 		StatePath:   filepath.Join(stateRoot, "babel-rs-state.toml"),
 		Protocol:    BabelDynamicProtocol, DeviceOnly: true, ManageRules: false,
-		Views:      []BabelView{{TableID: desired.FabricTableID}},
-		Interfaces: []string{"vl-*", "vdl-*"},
+		Views: []BabelView{{TableID: desired.FabricTableID}},
+		// Dynamic interfaces enter the managed routing set only after VFP commit.
+		Interfaces: []string{"vl-*"},
 	}
 	for _, link := range desired.Links {
 		if !strings.HasPrefix(link.InterfaceName, "vl-") {

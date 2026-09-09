@@ -185,6 +185,13 @@ overrides. Endpoint candidates are tried in order; a candidate without a fresh
 WireGuard handshake is rotated after a bounded interval, while a successful
 handshake retains the working endpoint.
 
+When a provisioned Link's VFP session closes, Velvet withdraws that session's
+negotiated addresses, protocol-202 adjacency routes and endpoint evidence before
+retrying discovery. The configured WireGuard interface remains available for
+bootstrap. This lets Babel's alternate path take over when a peer disappears
+or rejoins through a different public node, instead of leaving a stale direct
+route that shadows the working path.
+
 An omitted field that Velvet defines as derived still contributes its derived
 value to desired state. A setting left to the kernel, such as an omitted route
 metric or persistent keepalive, is neither written nor compared. Omitted route
@@ -256,12 +263,15 @@ The `babel` section is optional. When present, `enabled` is required and
 When enabled, `velvetd` generates and validates a strict `babel-rs`
 configuration, starts one process for all local WireGuard Links, and
 automatically originates the node loopback. It reloads the child online as
-Link origins change and restarts an unexpected exit with bounded exponential
+Link membership or origins change and restarts an unexpected exit with bounded exponential
 backoff. Parent death terminates the child.
 
 The current Velvet release targets `babel-rs` v0.4.1. Generated configuration
-uses structured `[[interfaces]]` rules with `match` patterns for static and
-dynamic Links. It explicitly selects the `wired` metric preset used by the
+uses structured `[[interfaces]]` rules with patterns for static Links and exact
+names for committed Dynamic Links. Tentative WG interfaces are excluded until
+VFP commit, including during final connectivity validation. Withdrawal removes
+the exact name through an online reload; a link-local-only Link needs no ordinary
+origin to participate. It explicitly selects the `wired` metric preset used by the
 previous integration; upgrading does not automatically enable RTT scoring.
 The generated daemon cleanup budget is five seconds; Fabric allows six seconds
 after an accepted shutdown request or fallback SIGTERM before forcing exit.
@@ -306,6 +316,10 @@ peer first, then other reachable observers. Observers only offer baseline
 listeners and never recursively upgrade.
 
 A reciprocal UDP path is handed to kernel WireGuard on the same local port.
+The probe reserves a wildcard port across IPv4 and IPv6, matching WG's bind
+scope. Packet metadata pins its measured source and restricts observations to
+the selected local address; another address/family cannot share the reserved
+port. The final close/rebind still fails cleanly if another process takes it.
 WG first binds with empty AllowedIPs and keepalive=0; the peers exchange
 WG_READY before enabling normal traffic. The Link commits only after the
 regular link-local VFP establishment and target identity validation succeed.

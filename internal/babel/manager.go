@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -63,27 +64,27 @@ func (m *Manager) Status() Status {
 	return m.status
 }
 
-// SetLinkPrefixes updates the ordinary origins for one materialized Link. It
-// is safe before or during Run; only routable negotiated prefixes are passed.
-func (m *Manager) SetLinkPrefixes(interfaceName string, prefixes []netip.Prefix) {
+// SetLinkState admits a materialized Link to managed routing and updates its
+// ordinary origins. Active link-local-only Links must remain in latest even
+// with no routable prefixes. Tentative Dynamic Links are never admitted.
+func (m *Manager) SetLinkState(interfaceName string, active bool, prefixes []netip.Prefix) {
 	clean := normalizePrefixes(prefixes)
 	m.mu.Lock()
 	previous, existed := m.latest[interfaceName]
-	if (!existed && len(clean) == 0) || prefixesEqual(previous, clean) {
+	if active == existed && (!active || prefixesEqual(previous, clean)) {
 		m.mu.Unlock()
 		return
 	}
-	if len(clean) == 0 {
-		delete(m.latest, interfaceName)
-	} else {
+	if active {
 		m.latest[interfaceName] = clean
+	} else {
+		delete(m.latest, interfaceName)
 	}
 	m.mu.Unlock()
 	select {
 	case m.updates <- linkUpdate{interfaceName: interfaceName, prefixes: clean}:
 	default:
-		// Run always takes a fresh snapshot from latest before rendering, so a
-		// full channel may coalesce redundant updates without losing state.
+		// Run renders the latest complete snapshot, so updates may coalesce.
 	}
 }
 
@@ -171,6 +172,9 @@ func (m *Manager) runOnce(ctx context.Context) error {
 			candidate, candidateDigest, prepareErr := m.prepare()
 			if prepareErr != nil {
 				m.recordError(prepareErr)
+				continue
+			}
+			if bytes.Equal(candidate, activeData) {
 				continue
 			}
 			if output, checkErr := exec.CommandContext(ctx, path, "check", "--config", m.plan.ConfigPath).CombinedOutput(); checkErr != nil {
@@ -272,6 +276,23 @@ func (m *Manager) prepare() ([]byte, string, error) {
 }
 
 func Render(plan *reconcile.BabelPlan, linkOrigins map[string][]netip.Prefix) []byte {
+	interfaces := append([]string(nil), plan.Interfaces...)
+	var admitted []string
+	for name := range linkOrigins {
+		matched := false
+		for _, pattern := range interfaces {
+			if ok, _ := path.Match(pattern, name); ok {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			admitted = append(admitted, name)
+		}
+	}
+	sort.Strings(admitted)
+	interfaces = append(interfaces, admitted...)
+
 	origins := append([]reconcile.BabelOrigin(nil), plan.Origins...)
 	for _, prefixes := range linkOrigins {
 		for _, prefix := range normalizePrefixes(prefixes) {
@@ -289,7 +310,7 @@ func Render(plan *reconcile.BabelPlan, linkOrigins map[string][]netip.Prefix) []
 	fmt.Fprintf(&output, "state_file = %s\n", strconv.Quote(plan.StatePath))
 	fmt.Fprintf(&output, "shutdown_timeout_ms = %d\n\n", daemonShutdownTimeout.Milliseconds())
 	output.WriteString("[[interfaces]]\nmatch = [")
-	for i, name := range plan.Interfaces {
+	for i, name := range interfaces {
 		if i != 0 {
 			output.WriteString(", ")
 		}

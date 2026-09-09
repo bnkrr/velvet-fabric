@@ -179,3 +179,117 @@ func FuzzPublicProbeEnvelope(f *testing.F) {
 		}
 	})
 }
+
+// WireGuard takes a wildcard port in both families. An address-specific probe
+// must not accept a port already occupied at another address or in IPv6.
+func TestProbeReservesWireGuardPortScope(t *testing.T) {
+	for _, occupied := range []string{"127.0.0.2", "::1"} {
+		t.Run(occupied, func(t *testing.T) {
+			host := netip.MustParseAddr(occupied)
+			network := "udp4"
+			if host.Is6() {
+				network = "udp6"
+			}
+			blocker, err := net.ListenUDP(network, net.UDPAddrFromAddrPort(netip.AddrPortFrom(host, 0)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Close()
+			port := blocker.LocalAddr().(*net.UDPAddr).AddrPort().Port()
+			receiver, err := NewReceiver([16]byte{9}, time.Now().Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			socket, err := Listen(context.Background(), netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port), receiver, func(Received) {})
+			if err == nil {
+				socket.Close()
+				t.Fatal("probe accepted a port that WireGuard cannot bind")
+			}
+		})
+	}
+}
+
+func TestProbePinsSourceAndRejectsOtherLocalAddresses(t *testing.T) {
+	for _, source := range []string{"127.0.0.2", "::1"} {
+		t.Run(source, func(t *testing.T) {
+			host := netip.MustParseAddr(source)
+			peerHost, network := netip.MustParseAddr("127.0.0.1"), "udp4"
+			if host.Is6() {
+				peerHost, network = host, "udp6"
+			}
+			peer, err := net.ListenUDP(network, net.UDPAddrFromAddrPort(netip.AddrPortFrom(peerHost, 0)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			receiver, err := NewReceiver([16]byte{10}, time.Now().Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			arrivals := make(chan Received, 2)
+			socket, err := Listen(context.Background(), netip.AddrPortFrom(host, 0), receiver, func(v Received) { arrivals <- v })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer socket.Close()
+			remote := peer.LocalAddr().(*net.UDPAddr).AddrPort()
+			if err := socket.Send([]byte("source-test"), remote); err != nil {
+				t.Fatal(err)
+			}
+			peer.SetReadDeadline(time.Now().Add(time.Second))
+			buffer := make([]byte, 100)
+			n, seen, err := peer.ReadFromUDPAddrPort(buffer)
+			if err != nil || seen != socket.Local || string(buffer[:n]) != "source-test" {
+				t.Fatalf("measurement source changed: seen %v, want %v, error %v", seen, socket.Local, err)
+			}
+			good, err := Seal(receiver.ID, receiver.Key, 1, 1, socket.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if host.Is4() {
+				wrong := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.3"), socket.Local.Port())
+				if _, err := peer.WriteToUDPAddrPort(good, wrong); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-arrivals:
+					t.Fatal("accepted a packet addressed to another local IP")
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			if _, err := peer.WriteToUDPAddrPort(good, socket.Local); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case v := <-arrivals:
+				if v.Seen != remote {
+					t.Fatal("observed source changed")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("valid path rejected or replay state consumed by wrong path")
+			}
+			// While listening, neither family nor another local address can take the
+			// future WG port; close releases both families for actual WG binding.
+			for _, endpoint := range []string{"127.0.0.3", "::1"} {
+				ip := netip.MustParseAddr(endpoint)
+				network := "udp4"
+				if ip.Is6() {
+					network = "udp6"
+				}
+				other, err := net.ListenUDP(network, net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, socket.Local.Port())))
+				if err == nil {
+					other.Close()
+					t.Fatal("another socket stole the reserved WG port")
+				}
+			}
+			socket.Close()
+			for _, network := range []string{"udp4", "udp6"} {
+				rebound, err := net.ListenUDP(network, &net.UDPAddr{Port: int(socket.Local.Port())})
+				if err != nil {
+					t.Fatal("wildcard port not released", err)
+				}
+				rebound.Close()
+			}
+		})
+	}
+}

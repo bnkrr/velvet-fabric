@@ -39,6 +39,8 @@ diagnose() {
     echo "--- ${node}: status and Dynamic Link events ---" >&2
     test ! -f "${runtime}/${node}.dynamic-status" || cat "${runtime}/${node}.dynamic-status" >&2
     test ! -f "${runtime}/${node}.log" || grep -E 'velvet-dynamic|panic|no such device|counterproposal' "${runtime}/${node}.log" | tail -n 100 >&2 || true
+    test ! -f "${runtime}/${node}.log" || tail -n 25 "${runtime}/${node}.log" >&2
+    ip -n "${ns}" -6 route show table 20000 >&2 2>/dev/null || true
     ip netns exec "${ns}" wg show >&2 2>/dev/null || true
   done
 }

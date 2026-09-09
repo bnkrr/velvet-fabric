@@ -16,6 +16,17 @@ import (
 func (r *Runner) runLink(ctx context.Context, desired reconcile.LinkPlan, established chan<- struct{}) {
 	var establishedOnce sync.Once
 	for ctx.Err() == nil {
+		// A previous VFP session may have ended while the provisioned WG
+		// interface remains available for bootstrap. Withdraw its negotiated
+		// adjacency before reconnecting, including retries after cleanup errors.
+		if err := r.clearProvisionedState(ctx, desired); err != nil {
+			r.log(Event{Event: "velvet-link-withdraw", Status: "failed", Interface: desired.InterfaceName, Error: err.Error()})
+			select {
+			case <-time.After(time.Second):
+			case <-ctx.Done():
+			}
+			continue
+		}
 		conn, err := r.discoverPeer(ctx, desired)
 		if err == nil {
 			err = r.serveSession(ctx, conn, desired, &establishedOnce, established)

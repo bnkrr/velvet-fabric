@@ -336,3 +336,37 @@ func (b *runtimeBackend) ObservedEndpoint(context.Context, string) (netip.AddrPo
 func (b *runtimeBackend) ReachableLoopbacks(context.Context, int, netip.Prefix) ([]netip.Addr, error) {
 	return append([]netip.Addr(nil), b.reachable...), nil
 }
+
+func TestClosedProvisionedSessionWithdrawsAdjacencyAndRetriesFailure(t *testing.T) {
+	backend := &runtimeBackend{}
+	plan := reconcile.LinkPlan{InterfaceName: "vl-bootstrap", OwnerAlias: "owner"}
+	remote := uuid.MustParse("20000000-0000-4000-8000-000000000002")
+	loopback := netip.MustParseAddr("fd00::2")
+	runner := &Runner{Desired: &reconcile.DesiredState{}, Reconciler: reconcile.New(backend),
+		states: map[string]materializedState{plan.InterfaceName: {desired: plan, remote: remote, peers: []netip.Addr{loopback}}}}
+	runner.dynamic = newDynamicLinkEngine(runner)
+	if err := runner.dynamic.setEvidence(plan.InterfaceName, 51000, netip.MustParseAddrPort("192.0.2.1:51000")); err != nil {
+		t.Fatal(err)
+	}
+	backend.materializeErr = errors.New("injected kernel error")
+	if err := runner.clearProvisionedState(context.Background(), plan); err == nil {
+		t.Fatal("withdrawal lost kernel failure")
+	}
+	if !runner.hasDirectLink(remote) || len(runner.dynamic.evidence) != 1 {
+		t.Fatal("failed withdrawal lost retry state")
+	}
+	backend.materializeErr = nil
+	if err := runner.clearProvisionedState(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	if runner.hasDirectLink(remote) || runner.hasDirectLinkToLoopback(loopback) || len(runner.dynamic.evidence) != 0 {
+		t.Fatal("closed session retained adjacency or endpoint evidence")
+	}
+	if len(backend.local) != 0 || len(backend.peers) != 0 || len(backend.removed) != 0 {
+		t.Fatal("withdrawal must clear materialized routes without deleting the provisioned WG interface")
+	}
+	calls := backend.materialized
+	if err := runner.clearProvisionedState(context.Background(), plan); err != nil || backend.materialized != calls {
+		t.Fatal("already withdrawn state was not idempotent")
+	}
+}
