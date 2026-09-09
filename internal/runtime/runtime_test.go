@@ -145,8 +145,8 @@ func TestRunnerStatus(t *testing.T) {
 	runner := &Runner{
 		Desired: &reconcile.DesiredState{UUID: uuid.MustParse("10000000-0000-4000-8000-000000000001"), Links: make([]reconcile.LinkPlan, 3)},
 		states: map[string]materializedState{
-			"vl-static": {remote: staticID, peers: []netip.Addr{netip.MustParseAddr("fd00::2")}},
-			"vdl-test":  {desired: dynamicPlan, remote: dynamicID, peers: []netip.Addr{netip.MustParseAddr("fd00::3")}, dynamic: true},
+			"vl-static": {active: true, remote: staticID, peers: []netip.Addr{netip.MustParseAddr("fd00::2")}},
+			"vdl-test":  {active: true, desired: dynamicPlan, remote: dynamicID, peers: []netip.Addr{netip.MustParseAddr("fd00::3")}, dynamic: true},
 		},
 	}
 	status := runner.Status()
@@ -200,7 +200,7 @@ func TestEvidenceStoreUpdateAndRemoval(t *testing.T) {
 
 func TestDialReservationExcludesSelfAndDirectPeers(t *testing.T) {
 	self, direct, target := netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2"), netip.MustParseAddr("fd00::3")
-	d := newDynamicLinkEngine(&Runner{Desired: &reconcile.DesiredState{LoopbackV6: self}, states: map[string]materializedState{"direct": {peers: []netip.Addr{direct}}}})
+	d := newDynamicLinkEngine(&Runner{Desired: &reconcile.DesiredState{LoopbackV6: self}, states: map[string]materializedState{"direct": {active: true, peers: []netip.Addr{direct}}}})
 	if d.reserveDial(self) || d.reserveDial(direct) || !d.reserveDial(target) || d.reserveDial(target) {
 		t.Fatal("incorrect reservation")
 	}
@@ -337,36 +337,37 @@ func (b *runtimeBackend) ReachableLoopbacks(context.Context, int, netip.Prefix) 
 	return append([]netip.Addr(nil), b.reachable...), nil
 }
 
-func TestClosedProvisionedSessionWithdrawsAdjacencyAndRetriesFailure(t *testing.T) {
+func TestExpiredLinkWithdrawsAdjacencyAndRetriesFailure(t *testing.T) {
 	backend := &runtimeBackend{}
 	plan := reconcile.LinkPlan{InterfaceName: "vl-bootstrap", OwnerAlias: "owner"}
 	remote := uuid.MustParse("20000000-0000-4000-8000-000000000002")
 	loopback := netip.MustParseAddr("fd00::2")
+	local := netip.MustParsePrefix("fd01::1/127")
 	runner := &Runner{Desired: &reconcile.DesiredState{}, Reconciler: reconcile.New(backend),
-		states: map[string]materializedState{plan.InterfaceName: {desired: plan, remote: remote, peers: []netip.Addr{loopback}}}}
+		states: map[string]materializedState{plan.InterfaceName: {active: true, desired: plan, local: []netip.Prefix{local}, remote: remote, peers: []netip.Addr{loopback}}}}
 	runner.dynamic = newDynamicLinkEngine(runner)
 	if err := runner.dynamic.setEvidence(plan.InterfaceName, 51000, netip.MustParseAddrPort("192.0.2.1:51000")); err != nil {
 		t.Fatal(err)
 	}
 	backend.materializeErr = errors.New("injected kernel error")
-	if err := runner.clearProvisionedState(context.Background(), plan); err == nil {
+	if err := runner.withdrawLinkAdjacency(context.Background(), plan); err == nil {
 		t.Fatal("withdrawal lost kernel failure")
 	}
 	if !runner.hasDirectLink(remote) || len(runner.dynamic.evidence) != 1 {
 		t.Fatal("failed withdrawal lost retry state")
 	}
 	backend.materializeErr = nil
-	if err := runner.clearProvisionedState(context.Background(), plan); err != nil {
+	if err := runner.withdrawLinkAdjacency(context.Background(), plan); err != nil {
 		t.Fatal(err)
 	}
 	if runner.hasDirectLink(remote) || runner.hasDirectLinkToLoopback(loopback) || len(runner.dynamic.evidence) != 0 {
-		t.Fatal("closed session retained adjacency or endpoint evidence")
+		t.Fatal("expired link retained adjacency or endpoint evidence")
 	}
-	if len(backend.local) != 0 || len(backend.peers) != 0 || len(backend.removed) != 0 {
-		t.Fatal("withdrawal must clear materialized routes without deleting the provisioned WG interface")
+	if len(backend.local) != 1 || backend.local[0] != local || len(backend.peers) != 0 || len(backend.removed) != 0 {
+		t.Fatal("withdrawal must clear peer routes while retaining local addresses and the WG interface")
 	}
 	calls := backend.materialized
-	if err := runner.clearProvisionedState(context.Background(), plan); err != nil || backend.materialized != calls {
+	if err := runner.withdrawLinkAdjacency(context.Background(), plan); err != nil || backend.materialized != calls {
 		t.Fatal("already withdrawn state was not idempotent")
 	}
 }

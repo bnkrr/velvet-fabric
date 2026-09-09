@@ -22,19 +22,23 @@ const (
 type Type uint8
 
 const (
-	Open                Type = 0x01
-	NodeState           Type = 0x02
-	LinkPropose         Type = 0x03
-	LinkAccept          Type = 0x04
-	EndpointObservation Type = 0x05
-	DynamicLinkPropose  Type = 0x06
-	DynamicLinkAccept   Type = 0x07
-	DynamicLinkDecline  Type = 0x08
-	DiscoveryHello      Type = 0x09
-	DiscoveryHelloAck   Type = 0x0a
-	DiscoveryControl    Type = 0x0b
-	PublicProbe         Type = 0x0c
+	Open        Type = 0x01
+	NodeState   Type = 0x02
+	LinkPropose Type = 0x03
+	LinkAccept  Type = 0x04
+	// 0x05 was ENDPOINT_OBSERVATION; observations now travel in LINK_PONG.
+	DynamicLinkPropose Type = 0x06
+	DynamicLinkAccept  Type = 0x07
+	DynamicLinkDecline Type = 0x08
+	DiscoveryHello     Type = 0x09
+	DiscoveryHelloAck  Type = 0x0a
+	DiscoveryControl   Type = 0x0b
+	PublicProbe        Type = 0x0c
+	LinkPing           Type = 0x0d
+	LinkPong           Type = 0x0e
 )
+
+func (t Type) IsLinkProbe() bool { return t == LinkPing || t == LinkPong }
 
 func (t Type) IsDiscovery() bool { return t == DiscoveryHello || t == DiscoveryHelloAck }
 
@@ -114,7 +118,7 @@ func Decode(frame []byte) (Message, error) {
 		return Message{}, ErrFrame
 	}
 	result := Message{Type: Type(frame[5])}
-	if result.Type < Open || result.Type > PublicProbe {
+	if result.Type < Open || result.Type > LinkPong || result.Type == 0x05 {
 		return Message{}, fmt.Errorf("%w: unknown message type 0x%02x", ErrFrame, frame[5])
 	}
 	selected := map[uint16][]byte{}
@@ -164,10 +168,15 @@ func Decode(frame []byte) (Message, error) {
 		}
 	case LinkAccept, DiscoveryHello, DiscoveryHelloAck:
 		// These messages have no used TLVs; structural validation still applies.
-	case EndpointObservation:
-		result.Endpoint, err = parseEndpoint(selected[WGEndpointTLV])
-		if err != nil || !result.Endpoint.IsValid() {
-			return Message{}, fmt.Errorf("%w: ENDPOINT_OBSERVATION requires a valid WG_ENDPOINT", ErrFrame)
+	case LinkPing, LinkPong:
+		if err = parseOperationID(selected[OperationIDTLV], &result.OperationID); err != nil || allZero(result.OperationID[:]) {
+			return Message{}, ErrFrame
+		}
+		if value, ok := selected[WGEndpointTLV]; ok && result.Type == LinkPong {
+			result.Endpoint, err = parseEndpoint(value)
+			if err != nil || !result.Endpoint.IsValid() {
+				return Message{}, ErrFrame
+			}
 		}
 	case DynamicLinkPropose, DynamicLinkAccept:
 		if len(selected[ProbeKeyTLV]) != 32 {
@@ -244,12 +253,18 @@ func Encode(m Message) ([]byte, error) {
 			body = tlv.Append(body, LinkPrefixV6TLV, value[:])
 		}
 	case LinkAccept, DiscoveryHello, DiscoveryHelloAck:
-	case EndpointObservation:
-		value, err := encodeEndpoint(m.Endpoint)
-		if err != nil {
-			return nil, err
+	case LinkPing, LinkPong:
+		if allZero(m.OperationID[:]) {
+			return nil, errors.New("Link probe requires nonzero challenge")
 		}
-		body = tlv.Append(body, WGEndpointTLV, value)
+		body = tlv.Append(body, OperationIDTLV, m.OperationID[:])
+		if m.Type == LinkPong && m.Endpoint.IsValid() {
+			value, err := encodeEndpoint(m.Endpoint)
+			if err != nil {
+				return nil, err
+			}
+			body = tlv.Append(body, WGEndpointTLV, value)
+		}
 	case DynamicLinkPropose, DynamicLinkAccept:
 		body = tlv.Append(body, OperationIDTLV, m.OperationID[:])
 		if allZero(m.WGPublicKey[:]) {
@@ -299,14 +314,14 @@ func DecodeDatagram(packet []byte) (Message, error) {
 	if err != nil {
 		return Message{}, err
 	}
-	if !m.Type.IsDiscovery() && m.Type != PublicProbe {
+	if !m.Type.IsDiscovery() && !m.Type.IsLinkProbe() && m.Type != PublicProbe {
 		return Message{}, fmt.Errorf("%w: message is not valid over UDP", ErrFrame)
 	}
 	return m, nil
 }
 
 func EncodeDatagram(m Message) ([]byte, error) {
-	if !m.Type.IsDiscovery() && m.Type != PublicProbe {
+	if !m.Type.IsDiscovery() && !m.Type.IsLinkProbe() && m.Type != PublicProbe {
 		return nil, fmt.Errorf("%w: message is not valid over UDP", ErrFrame)
 	}
 	frame, err := Encode(m)
@@ -317,7 +332,7 @@ func EncodeDatagram(m Message) ([]byte, error) {
 }
 
 func Write(w io.Writer, m Message) error {
-	if m.Type.IsDiscovery() || m.Type == PublicProbe {
+	if m.Type.IsDiscovery() || m.Type.IsLinkProbe() || m.Type == PublicProbe {
 		return fmt.Errorf("%w: discovery is not valid over TCP", ErrFrame)
 	}
 	frame, err := Encode(m)
@@ -344,8 +359,10 @@ func usedBy(messageType Type, tlvType uint16) bool {
 		return tlvType == LinkPrefixV4TLV || tlvType == LinkPrefixV6TLV
 	case LinkAccept:
 		return false
-	case EndpointObservation:
-		return tlvType == WGEndpointTLV
+	case LinkPing:
+		return tlvType == OperationIDTLV
+	case LinkPong:
+		return tlvType == OperationIDTLV || tlvType == WGEndpointTLV
 	case DynamicLinkPropose, DynamicLinkAccept:
 		return tlvType == OperationIDTLV || tlvType == WGPublicKeyTLV || tlvType == WGEndpointTLV || tlvType == ProbeKeyTLV
 	case DiscoveryControl:

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -31,8 +32,9 @@ var (
 type MessageType = message.Type
 
 type Observation struct {
-	Source netip.Addr
-	Type   MessageType
+	Source  netip.Addr
+	Type    MessageType
+	Message message.Message
 }
 
 // Encode uses the common VFP codec. Identity remains in WG-protected TCP sessions.
@@ -73,7 +75,10 @@ func Listen(interfaceName string, local netip.Addr, port int) (*Socket, error) {
 	if err != nil {
 		return nil, fmt.Errorf("look up discovery interface: %w", err)
 	}
-	destination := &net.UDPAddr{IP: net.IP(MulticastAddress.AsSlice()), Port: port, Zone: interfaceName}
+	// Go caches interface-name zones. A recreated same-name WG interface has a
+	// different index; numeric zones avoid binding/sending through the old one.
+	zone := strconv.Itoa(ifi.Index)
+	destination := &net.UDPAddr{IP: net.IP(MulticastAddress.AsSlice()), Port: port, Zone: zone}
 	listenConfig := net.ListenConfig{Control: bindToDevice(interfaceName, true)}
 	packetConn, err := listenConfig.ListenPacket(context.Background(), "udp6", fmt.Sprintf("[::]:%d", port))
 	if err != nil {
@@ -89,11 +94,11 @@ func Listen(interfaceName string, local netip.Addr, port int) (*Socket, error) {
 		_ = receiver.Close()
 		return nil, fmt.Errorf("join discovery multicast group: %w", err)
 	}
-	if err := receivePacket.SetControlMessage(ipv6.FlagInterface, true); err != nil {
+	if err := receivePacket.SetControlMessage(ipv6.FlagInterface|ipv6.FlagDst, true); err != nil {
 		_ = receiver.Close()
 		return nil, fmt.Errorf("enable discovery interface metadata: %w", err)
 	}
-	sender, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IP(local.AsSlice()), Zone: interfaceName})
+	sender, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IP(local.AsSlice()), Zone: zone})
 	if err != nil {
 		_ = receiver.Close()
 		return nil, fmt.Errorf("bind discovery sender: %w", err)
@@ -149,25 +154,38 @@ func (s *Socket) SendHello() error {
 
 func (s *Socket) SendAck(remote netip.Addr) error {
 	packet, _ := Encode(HelloAck)
-	destination := &net.UDPAddr{IP: net.IP(remote.AsSlice()), Port: s.destination.Port, Zone: s.interfaceName}
+	destination := &net.UDPAddr{IP: net.IP(remote.AsSlice()), Port: s.destination.Port, Zone: strconv.Itoa(s.interfaceIndex)}
 	if _, err := s.sender.WriteToUDP(packet[:], destination); err != nil {
 		return fmt.Errorf("send discovery Hello ACK: %w", err)
 	}
 	return nil
 }
 
-// ReadHello ignores unrelated or malformed datagrams and returns only a valid
-// link-local source received on the requested interface.
-func (s *Socket) ReadHello() (Observation, error) {
-	// The extra byte makes even a truncated oversized datagram exceed the cap.
+// Send transmits one link-local unicast datagram on the selected WG interface.
+func (s *Socket) Send(remote netip.Addr, m message.Message) error {
+	packet, err := message.EncodeDatagram(m)
+	if err != nil {
+		return err
+	}
+	_, err = s.sender.WriteToUDP(packet, &net.UDPAddr{IP: net.IP(remote.AsSlice()), Port: s.destination.Port, Zone: strconv.Itoa(s.interfaceIndex)})
+	return err
+}
+
+// Read validates both the receiving interface and the link-local scope. Public
+// probes and multicast liveness packets are never admitted on this socket.
+func (s *Socket) Read() (Observation, error) {
 	buffer := make([]byte, message.MaxDatagramLength+1)
 	for {
 		n, control, source, err := s.receivePacket.ReadFrom(buffer)
 		if err != nil {
 			return Observation{}, err
 		}
-		messageType, parseErr := Parse(buffer[:n])
-		if control == nil || control.IfIndex != s.interfaceIndex || parseErr != nil {
+		m, err := message.DecodeDatagram(buffer[:n])
+		if err != nil || (!m.Type.IsDiscovery() && !m.Type.IsLinkProbe()) || control == nil || control.IfIndex != s.interfaceIndex {
+			continue
+		}
+		dst, ok := netip.AddrFromSlice(control.Dst)
+		if !ok || (m.Type.IsLinkProbe() && !dst.IsLinkLocalUnicast()) {
 			continue
 		}
 		udp, ok := source.(*net.UDPAddr)
@@ -178,7 +196,16 @@ func (s *Socket) ReadHello() (Observation, error) {
 		if !ok || !address.Is6() || !address.IsLinkLocalUnicast() {
 			continue
 		}
-		return Observation{Source: address.Unmap(), Type: messageType}, nil
+		return Observation{Source: address.Unmap(), Type: m.Type, Message: m}, nil
+	}
+}
+
+func (s *Socket) ReadHello() (Observation, error) {
+	for {
+		v, err := s.Read()
+		if err != nil || v.Type.IsDiscovery() {
+			return v, err
+		}
 	}
 }
 

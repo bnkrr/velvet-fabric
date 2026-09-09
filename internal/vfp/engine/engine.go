@@ -171,11 +171,6 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 				}
 				return err
 			}
-			if outbound != nil {
-				if err := send(*outbound); err != nil {
-					return err
-				}
-			}
 			if result := fsm.takeCommit(); result != nil {
 				if e.config.Commit != nil {
 					if err := e.config.Commit(*result); err != nil {
@@ -183,16 +178,14 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 					}
 				}
 				fsm.markEstablished()
-				if err := conn.SetDeadline(time.Time{}); err != nil {
-					return fmt.Errorf("clear VFP establishment deadline: %w", err)
+			}
+			if outbound != nil {
+				if err := send(*outbound); err != nil {
+					return err
 				}
-				if !establishmentTimer.Stop() {
-					select {
-					case <-establishmentTimer.C:
-					default:
-					}
-				}
-				establishmentDeadline = nil
+			}
+			if fsm.operational && e.config.Context == LinkBoundSession {
+				return nil
 			}
 			if fsm.operational && !operationalNotified {
 				currentWriteTimeout = writeTimeout
@@ -260,9 +253,7 @@ func writeLoop(ctx context.Context, conn net.Conn, input <-chan writeRequest) {
 			if err == nil {
 				err = message.Write(conn, request.message)
 			}
-			if clearErr := conn.SetWriteDeadline(time.Time{}); err == nil {
-				err = clearErr
-			}
+			_ = conn.SetWriteDeadline(time.Time{}) // Cleanup failure cannot undo a completed write.
 			request.done <- err
 			if err != nil {
 				return
@@ -464,7 +455,7 @@ func validOperationalMessage(context SessionContext, kind message.Type) bool {
 	if context == RoutedSession {
 		return kind == message.DynamicLinkPropose || kind == message.DynamicLinkAccept || kind == message.DynamicLinkDecline || kind == message.DiscoveryControl
 	}
-	return kind == message.EndpointObservation
+	return false
 }
 
 func proposalMessage(p link.Proposal) message.Message {

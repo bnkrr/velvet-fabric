@@ -80,10 +80,10 @@ including when a returning member's previous public is still alive. The host
 model owns this selection; the test does not infer desired membership from WG
 or Babel's current observations.
 
-A closed provisioned VFP session must withdraw its materialized adjacency route
-and evidence while preserving its configured bootstrap WG interface. Otherwise
+An expired provisioned Link must withdraw its materialized adjacency route
+and evidence while preserving its configured bootstrap WG interface and local addresses. Otherwise
 an old public's protocol-202 route would blackhole traffic after a member changes
-bootstrap. Static committed counts reflect current materialized sessions; unused
+bootstrap. Static committed counts reflect current live adjacencies; unused
 public receiver interfaces intentionally do not count as established.
 
 ## Verifier and convergence
@@ -120,8 +120,10 @@ NAT fallback can traverse the member being removed, so survivor forwarding may
 reconverge within the same finite phase deadline. Unlike the former all-public
 full-mesh fixture, this harness does not assume every survivor path is unaffected.
 Transient mismatches reset the stable window; a phase that never converges fails.
-A VFP recovery deadline is not the entire failure-detection deadline: TCP failure
-detection happens first. Production timers are retained, not shortened by tests.
+A Dynamic Link recovery deadline is not the entire failure-detection deadline:
+the 30-second Link-local UDP liveness budget comes before the additional 30-second
+recovery window. TCP negotiation closes on completion and does not own established
+Link liveness. Production timers are retained, not shortened by tests.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

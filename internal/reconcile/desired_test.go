@@ -76,11 +76,7 @@ func TestBuildDesiredStateCompilesManagedBabel(t *testing.T) {
 			if plan == nil || plan.ManageRules || !plan.DeviceOnly || plan.Protocol != 203 {
 				t.Fatalf("invalid Babel ownership: %#v", plan)
 			}
-			interfaces := []string{"vl-*"}
-			if interfaceName != "" {
-				interfaces = append(interfaces, interfaceName)
-			}
-			if diff := cmp.Diff(interfaces, plan.Interfaces); diff != "" {
+			if diff := cmp.Diff([]string{desired.Links[0].InterfaceName}, plan.Interfaces); diff != "" {
 				t.Fatal(diff)
 			}
 			src4, src6 := netip.MustParsePrefix("10.100.1.0/24"), netip.MustParsePrefix("fd10:100:1::/64")

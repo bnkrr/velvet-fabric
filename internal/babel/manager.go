@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -29,12 +30,13 @@ type Event struct {
 }
 
 type Manager struct {
-	plan    *reconcile.BabelPlan
-	updates chan linkUpdate
-	log     func(Event)
-	mu      sync.Mutex
-	latest  map[string][]netip.Prefix
-	status  Status
+	plan      *reconcile.BabelPlan
+	updates   chan linkUpdate
+	log       func(Event)
+	mu        sync.Mutex
+	latest    map[string][]netip.Prefix
+	withdrawn map[string]bool
+	status    Status
 }
 
 type Status struct {
@@ -55,7 +57,7 @@ type linkUpdate struct {
 }
 
 func New(plan *reconcile.BabelPlan, log func(Event)) *Manager {
-	return &Manager{plan: plan, updates: make(chan linkUpdate, len(plan.Interfaces)+1), log: log, latest: make(map[string][]netip.Prefix), status: Status{State: "starting"}}
+	return &Manager{plan: plan, updates: make(chan linkUpdate, len(plan.Interfaces)+1), log: log, latest: make(map[string][]netip.Prefix), withdrawn: make(map[string]bool), status: Status{State: "starting"}}
 }
 
 func (m *Manager) Status() Status {
@@ -77,8 +79,12 @@ func (m *Manager) SetLinkState(interfaceName string, active bool, prefixes []net
 	}
 	if active {
 		m.latest[interfaceName] = clean
+		delete(m.withdrawn, interfaceName)
 	} else {
 		delete(m.latest, interfaceName)
+		if slices.Contains(m.plan.Interfaces, interfaceName) {
+			m.withdrawn[interfaceName] = true
+		}
 	}
 	m.mu.Unlock()
 	select {
@@ -266,8 +272,15 @@ func (m *Manager) prepare() ([]byte, string, error) {
 	for name, prefixes := range m.latest {
 		linkOrigins[name] = append([]netip.Prefix(nil), prefixes...)
 	}
+	plan := *m.plan
+	plan.Interfaces = nil
+	for _, name := range m.plan.Interfaces {
+		if !m.withdrawn[name] {
+			plan.Interfaces = append(plan.Interfaces, name)
+		}
+	}
 	m.mu.Unlock()
-	data := Render(m.plan, linkOrigins)
+	data := Render(&plan, linkOrigins)
 	if err := writeAtomic(m.plan.ConfigPath, data, 0o600); err != nil {
 		return nil, "", err
 	}
@@ -292,6 +305,11 @@ func Render(plan *reconcile.BabelPlan, linkOrigins map[string][]netip.Prefix) []
 	}
 	sort.Strings(admitted)
 	interfaces = append(interfaces, admitted...)
+	if len(interfaces) == 0 {
+		// The pinned Babel config requires a nonempty selector. This literal
+		// exceeds Linux's 15-byte interface-name limit, so it cannot admit a device.
+		interfaces = []string{"velvet-no-active-links"}
+	}
 
 	origins := append([]reconcile.BabelOrigin(nil), plan.Origins...)
 	for _, prefixes := range linkOrigins {

@@ -4,8 +4,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/velvet-fabric/velvet-fabric/internal/link"
@@ -14,48 +12,27 @@ import (
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
 )
 
-func (r *Runner) serveSession(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, once *sync.Once, established chan<- struct{}) error {
-	return r.serveLinkSession(ctx, conn, desired, nil, 0, func(engine.Result) {
-		once.Do(func() { established <- struct{}{} })
-	})
-}
-
-func (r *Runner) serveLinkSession(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, attempt *dynamicAttempt, timeout time.Duration, onCommit func(engine.Result)) error {
+// negotiateLink ends after local installation and LINK_ACCEPT. Link liveness
+// is owned by the caller's UDP supervisor, never by this TCP connection.
+func (r *Runner) negotiateLink(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, install func(engine.Result) error) error {
 	protocol := engine.New(engine.Config{
 		Context:         engine.LinkBoundSession,
 		LocalUID:        message.UID{UUID: r.Desired.UUID, Name: r.Desired.UID.Name},
 		LocalLoopbackV6: r.Desired.LoopbackV6,
-		LinkPoolV4:      r.Desired.LinkPoolV4,
-		LinkPoolV6:      r.Desired.LinkPoolV6,
 		LoopbackPoolV6:  r.Desired.LoopbackPoolV6,
-		FabricPSK:       r.Desired.FabricPSK,
-		LinkOverrides:   desired.LinkOverrides,
+		LinkPoolV4:      r.Desired.LinkPoolV4, LinkPoolV6: r.Desired.LinkPoolV6,
+		FabricPSK: r.Desired.FabricPSK, LinkOverrides: desired.LinkOverrides,
 		Accept: func(remote message.UID, proposal link.Proposal) bool {
 			if !link.MatchesOverrides(proposal, desired.LinkOverrides) {
 				return false
 			}
-			localAddresses, _ := link.EndpointAddresses(proposal, r.Desired.UUID, remote.UUID)
-			return r.Reconciler.ProposalAvailable(ctx, desired, proposal, localAddresses)
+			local, _ := link.EndpointAddresses(proposal, r.Desired.UUID, remote.UUID)
+			return r.Reconciler.ProposalAvailable(ctx, desired, proposal, local)
 		},
-		Commit: func(result engine.Result) error {
-			if attempt != nil {
-				return r.dynamic.commitLink(ctx, attempt, result)
-			}
-			return r.commitLink(ctx, desired, false, result, onCommit)
-		},
-		Operational: func(session *engine.Session) error {
-			return r.startEndpointObserver(session, desired.InterfaceName)
-		},
-		OperationalMessage: func(_ *engine.Session, value message.Message) error {
-			if value.Type == message.EndpointObservation {
-				return r.recordEndpointEvidence(ctx, desired.InterfaceName, value.Endpoint)
-			}
-			return nil
-		},
+		Commit: install,
 		FrameError: func(err error) {
 			r.log(Event{Event: "velvet-frame", Status: "discarded", Peer: desired.PeerName, Error: err.Error()})
 		},
-		EstablishmentTimeout: timeout,
 	})
 	return protocol.Run(ctx, conn)
 }
@@ -89,6 +66,7 @@ func (r *Runner) commitLink(ctx context.Context, desired reconcile.LinkPlan, dyn
 		peers:   append([]netip.Addr(nil), peerLoopbacks...),
 		remote:  result.RemoteUID.UUID,
 		dynamic: dynamic,
+		active:  true,
 	}
 	r.mu.Unlock()
 	if r.babel != nil {
@@ -105,51 +83,11 @@ func (r *Runner) commitLink(ctx context.Context, desired reconcile.LinkPlan, dyn
 	return nil
 }
 
-func (r *Runner) startEndpointObserver(session *engine.Session, interfaceName string) error {
-	var last netip.AddrPort
-	if endpoint, ok, err := r.Reconciler.ObservedEndpoint(session.Context, interfaceName); err != nil {
-		return err
-	} else if ok {
-		if err := session.Send(message.Message{Type: message.EndpointObservation, Endpoint: endpoint}); err != nil {
-			return err
-		}
-		last = endpoint
-	}
-	go r.observeEndpoints(session, interfaceName, last)
-	return nil
-}
-
-func (r *Runner) observeEndpoints(session *engine.Session, interfaceName string, last netip.AddrPort) {
-	ticker := time.NewTicker(endpointObservationInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-session.Context.Done():
-			return
-		case <-ticker.C:
-			endpoint, ok, err := r.Reconciler.ObservedEndpoint(session.Context, interfaceName)
-			if err != nil {
-				r.log(Event{Event: "velvet-endpoint-observation", Status: "failed", Interface: interfaceName, Error: err.Error()})
-				_ = session.Close()
-				return
-			}
-			if !ok || endpoint == last {
-				continue
-			}
-			if err := session.Send(message.Message{Type: message.EndpointObservation, Endpoint: endpoint}); err != nil {
-				_ = session.Close()
-				return
-			}
-			last = endpoint
-		}
-	}
-}
-
 func (r *Runner) hasDirectLink(remote uuid.UUID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, state := range r.states {
-		if state.remote == remote {
+		if state.active && state.remote == remote {
 			return true
 		}
 	}
@@ -160,6 +98,9 @@ func (r *Runner) hasDirectLinkToLoopback(loopback netip.Addr) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, state := range r.states {
+		if !state.active {
+			continue
+		}
 		for _, peer := range state.peers {
 			if peer == loopback {
 				return true
@@ -180,24 +121,24 @@ func (r *Runner) removeDynamicState(plan reconcile.LinkPlan) {
 	}
 }
 
-// clearProvisionedState preserves the configured WG bootstrap interface while
-// withdrawing the state learned from its closed Link-bound VFP session. Keeping
-// the protocol-202 adjacency would shadow Babel's alternate path, particularly
-// when a returning node selects a different public bootstrap.
-func (r *Runner) clearProvisionedState(ctx context.Context, plan reconcile.LinkPlan) error {
+// withdrawLinkAdjacency withdraws an expired adjacency, retaining WG and local
+// addresses for recovery. It is also used by dynamic Link supervision.
+func (r *Runner) withdrawLinkAdjacency(ctx context.Context, plan reconcile.LinkPlan) error {
 	r.dynamic.resourceMu.Lock()
 	defer r.dynamic.resourceMu.Unlock()
 	r.mu.RLock()
 	state, exists := r.states[plan.InterfaceName]
 	r.mu.RUnlock()
-	if !exists || state.dynamic || state.desired.OwnerAlias != plan.OwnerAlias {
+	if !exists || !state.active || state.desired.OwnerAlias != plan.OwnerAlias {
 		return nil
 	}
-	if err := r.Reconciler.Materialize(ctx, r.Desired, plan, nil, nil); err != nil {
+	if err := r.Reconciler.Materialize(ctx, r.Desired, plan, state.local, nil); err != nil {
 		return err // Retain bookkeeping so runLink retries the withdrawal.
 	}
 	r.mu.Lock()
-	delete(r.states, plan.InterfaceName)
+	state.active = false
+	state.peers = nil
+	r.states[plan.InterfaceName] = state
 	r.mu.Unlock()
 	r.dynamic.mu.Lock()
 	r.dynamic.removeEvidenceLocked(plan.InterfaceName)

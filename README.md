@@ -185,12 +185,22 @@ overrides. Endpoint candidates are tried in order; a candidate without a fresh
 WireGuard handshake is rotated after a bounded interval, while a successful
 handshake retains the working endpoint.
 
-When a provisioned Link's VFP session closes, Velvet withdraws that session's
-negotiated addresses, protocol-202 adjacency routes and endpoint evidence before
-retrying discovery. The configured WireGuard interface remains available for
-bootstrap. This lets Babel's alternate path take over when a peer disappears
-or rejoins through a different public node, instead of leaving a stale direct
-route that shadows the working path.
+Link-bound VFP/TCP is a short negotiation: OPEN/NODE_STATE and Link-address
+agreement, then close. Closing or resetting TCP does not withdraw an established
+Link. Each Link sends VFP LINK_PING over its own WG interface every 10 seconds;
+a fresh matching LINK_PONG confirms bidirectional reachability and can carry the
+current endpoint observation. Unknown, late and duplicate replies are ignored.
+
+After 30 seconds without confirmation, Velvet withdraws the protocol-202 peer
+adjacency route, usable endpoint evidence and managed Babel admission, allowing
+the alternate Fabric path to take over. WG and negotiated local addresses remain
+for recovery. Static Links keep trying while configured; Dynamic Links allow a
+further 30 seconds before removal. Discovery/TCP can renegotiate peer state,
+while valid PONGs can restore the retained Link without reopening TCP. Initial
+successful negotiation establishes the Link; `--once` may then exit and provides
+no ongoing supervision. Static interfaces retain configuration-based initial
+Babel admission; expired ones are excluded until recovery. No Babel dependency
+is required for Link liveness.
 
 An omitted field that Velvet defines as derived still contributes its derived
 value to desired state. A setting left to the kernel, such as an omitted route

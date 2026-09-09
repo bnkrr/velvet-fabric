@@ -105,7 +105,7 @@ killing a correctly shutting-down daemon before it finishes cleanup.
 with a public static bootstrap observer and either directly addressed WAN
 nodes, one Linux conntrack NAT, or two NATs. Public addresses here belong to an
 isolated documentation-prefix WAN; no packets are sent to the Internet. The
-original IPv4 cases remain:
+original IPv4 cases and dual-stack lifecycle checks are:
 
 | Case | Required result |
 |---|---|
@@ -116,7 +116,7 @@ original IPv4 cases remain:
 | `control-loss` | Routed VFP is reset during an accepted attempt; no commit, resources released, multi-hop ping works |
 | `random` | Broad randomized SNAT allocation produces bounded fallback with cleanup and multi-hop ping |
 | `observer-fallback` | Static observer cannot receive measurements; a second public Fabric observer supplies evidence needed to connect |
-| `lifecycle` | Established VFP recovers on the same WG interface; disable with a lost close notification still cleans up via TCP failure detection and restores multi-hop routing; re-enable rebuilds |
+| `lifecycle`, `v6-lifecycle` | TCP failure preserves the Link; UDP expiry withdraws adjacency, then fresh UDP recovers the same WG interface. Disable cleans up through UDP timeout and restores multi-hop routing; re-enable rebuilds |
 
 Twenty further cases cover address families and asymmetric reachability:
 
@@ -143,14 +143,19 @@ case checks data-plane ping in both directions. Failed cases check the absence
 of tentative WG interfaces and primary probe sockets. Router WAN input drops
 unsolicited UDP so router-local ICMP handling does not create unintended conntrack reservations.
 
-The lifecycle case deliberately drops outbound UDP to the peer during local
-shutdown, so a TCP close notification cannot be relied on. Its remote cleanup
-bound includes the existing TCP keepalive configuration (30s idle, three probes
-10s apart), then the separate 30s Dynamic Link recovery budget. The test allows
-105s including scheduling margin; it must not mistake the 30s recovery timer
-for the entire failure-detection time.
+The `lifecycle` and `v6-lifecycle` cases assert that link-local TCP closes after
+negotiation, then block TCP while checking the direct route and actual traffic
+for longer than the UDP health deadline. They subsequently block only Link-local
+VFP UDP, verify both protocol-202 adjacency withdrawals, and restore UDP while TCP is
+still blocked: the same WG ifindex must recover. Finally, disabling one endpoint
+must reclaim the remote Dynamic Link within 30 seconds of UDP failure detection
+plus 30 seconds of recovery (75 seconds including scheduling margin), restore
+multi-hop routing and carry real traffic. Babel convergence and same-WG recovery
+are checked separately so routing convergence does not consume the recovery
+window. IPv6 uses
+real NAT66 underlay, not only an IPv6 overlay inside IPv4 WG.
 
-The privileged CI suite and VM helper include all 28 cases:
+The privileged CI suite and VM helper include all 29 cases:
 
 ```sh
 tests/e2e/run-on-vm.sh all

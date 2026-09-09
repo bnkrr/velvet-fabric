@@ -32,6 +32,7 @@ def run(*args, input=None, check=True):
 CASES = {name: {"mode": name} for name in (
     "preserve", "remap", "delayed-remap", "blocked", "control-loss", "random",
     "observer-fallback", "lifecycle")}
+CASES["v6-lifecycle"] = {"family": 6, "mode": "lifecycle"}
 for family in (4, 6):
     for allocation in ("preserve", "remap", "random"):
         for origin, initiator in (("public", "a"), ("nat", "b")):
@@ -244,7 +245,7 @@ def scenario(case):
         else:
             raise AssertionError("dynamic discovery deadline")
         for node, source, target in (("a", 1, 2), ("b", 2, 1)):
-            ns(node, "ping", "-6", "-I", f"fd78:7777::{source}", "-c", "3", "-W", "2", f"fd78:7777::{target}")
+            ns(node, "ping", "-n", "-6", "-I", f"fd78:7777::{source}", "-c", "3", "-W", "2", f"fd78:7777::{target}")
         for node in ("a", "b"):
             interfaces = ns(node, "wg", "show", "interfaces").split()
             dynamic = [name for name in interfaces if name.startswith("vdl-")]
@@ -291,6 +292,10 @@ def scenario(case):
             route = ip("a", "-6", "route", "show", "table", "20000", "exact", "fd78:7777::2/128")
             assert "dev vdl-b-7100" in route, f"traffic did not choose the new direct Link: {route}"
         if mode == "lifecycle":
+            started = time.monotonic()
+            def stage(name):
+                print(f"{case}: {name} at {time.monotonic() - started:.1f}s", flush=True)
+
             def wait_for(predicate, description, seconds=45):
                 until = time.monotonic() + seconds
                 while time.monotonic() < until:
@@ -302,16 +307,59 @@ def scenario(case):
             device = "vdl-b-7100"
             original_index = json.loads(ip("a", "-j", "link", "show", device))[0]["ifindex"]
             local = json.loads(ip("a", "-j", "-6", "addr", "show", "dev", device))[0]["addr_info"][0]["local"]
+            # Completed Links carry no established link-local TCP. Blocking
+            # control TCP must not withdraw a healthy UDP-confirmed adjacency.
+            assert not ns("a", "ss", "-H", "-6", "-t", "state", "established", "src", f"[{local}]"), "link-local TCP remained established"
+            ns("a", "nft", "-f", "-", input=f"""table inet velvet_tcp_only {{
+ chain input {{ type filter hook input priority -20; policy accept;
+ iifname "{device}" tcp dport 58420 counter drop
+ }}
+ chain output {{ type filter hook output priority -20; policy accept;
+ oifname "{device}" tcp dport 58420 counter drop
+ }}
+}}""")
             ns("a", "ss", "-K", "-6", "-t", "src", f"[{local}]")
-            wait_for(lambda: any(e.get("event") == "velvet-dynamic-link" and e.get("status") == "recovered" for e in events("a")), "same-Link VFP recovery failed")
+            # Request a fresh negotiation from the higher-address endpoint.
+            # TCP will fail, while the existing Link must remain usable.
+            b_device = "vdl-a-7100"
+            b_local = next(a["local"] for a in json.loads(ip("b", "-j", "-6", "addr", "show", "dev", b_device))[0]["addr_info"] if a["scope"] == "link")
+            if ipaddress.IPv6Address(local) < ipaddress.IPv6Address(b_local):
+                sender, source, destination, outgoing = "b", b_local, local, b_device
+            else:
+                sender, source, destination, outgoing = "a", local, b_local, device
+            ns(sender, "python3", "-c", "import socket,sys; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); i=socket.if_nametoindex(sys.argv[3]); s.bind((sys.argv[1],0,0,i)); s.sendto(bytes.fromhex('5646500001090008'),(sys.argv[2],58420,0,i))", source, destination, outgoing)
+            until = time.monotonic() + 35
+            while time.monotonic() < until:
+                ns("a", "ping", "-n", "-6", "-I", "fd78:7777::1", "-c", "1", "-W", "2", "fd78:7777::2")
+                assert f"dev {device}" in ip("a", "-6", "route", "show", "table", "20000", "exact", "fd78:7777::2/128")
+                assert not any(e.get("event") == "velvet-dynamic-link" and e.get("status") == "recovering" for e in events("a")), "TCP-only loss caused Link recovery"
+                time.sleep(1)
+            assert any(e.get("event") == "velvet-link-negotiation" and e.get("status") == "failed" for n in ("a", "b") for e in events(n)), "TCP fault did not exercise renegotiation"
+            stage("TCP fault tolerated")
+            # Now fail only link-local VFP UDP, retaining WG data and TCP block.
+            ns("a", "nft", "-f", "-", input=f"""table inet velvet_link_udp_loss {{
+ chain input {{ type filter hook input priority -20; policy accept;
+ iifname "{device}" udp dport 58420 counter drop
+ }}
+}}""")
+            wait_for(lambda: all(any(e.get("event") == "velvet-dynamic-link" and e.get("status") == "recovering" for e in events(n)) for n in ("a", "b")), "UDP liveness failure did not withdraw both adjacencies")
+            stage("UDP adjacency withdrawn")
+            # Protocol-202 withdrawal is synchronous; Babel convergence has its
+            # own clock. Verify same-WG recovery before its finite window ends.
+            # The subsequent shutdown fault separately requires routed fallback.
+            for node, target in (("a", 2), ("b", 1)):
+                assert "proto 202" not in ip(node, "-6", "route", "show", "table", "20000", "exact", f"fd78:7777::{target}/128"), "expired adjacency route was not withdrawn"
+            ns("a", "nft", "delete", "table", "inet", "velvet_link_udp_loss")
+            stage("UDP restored after both adjacency withdrawals")
+            wait_for(lambda: all(any(e.get("event") == "velvet-dynamic-link" and e.get("status") == "recovered" for e in events(n)) for n in ("a", "b")), "same-WG UDP recovery failed", seconds=25)
             assert json.loads(ip("a", "-j", "link", "show", device))[0]["ifindex"] == original_index, "recovery replaced the Link"
-            ns("a", "ping", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
+            assert f"dev {device}" in ip("a", "-6", "route", "show", "table", "20000", "exact", "fd78:7777::2/128")
+            stage("same-WG recovery confirmed with TCP blocked")
+            ns("a", "nft", "delete", "table", "inet", "velvet_tcp_only")
             config_path = runtime / "a.json"
             config = json.loads(config_path.read_text())
-            # Model a lost close notification before deleting the local WG
-            # interface. The remote must detect the dead TCP path itself:
-            # configureTCP allows 30s idle + 3*10s probes, then Link recovery
-            # has its own 30s budget. A 45s end-to-end assertion was incorrect.
+            # No TCP close is needed: UDP failure detection (30s) followed
+            # by the separate 30s recovery window must reclaim the remote Link.
             ns("a", "nft", "-f", "-", input=f"""table inet velvet_shutdown_loss {{
  chain output {{ type filter hook output priority -20; policy accept;
  {address_match} daddr {observed_address("b")} meta l4proto udp drop
@@ -320,8 +368,8 @@ def scenario(case):
             config["dynamic_links"]["mode"] = "off"
             config_path.write_text(json.dumps(config))
             processes[0].send_signal(signal.SIGHUP)
-            wait_for(lambda: all(not any(i.startswith("vdl-") for i in ns(n, "wg", "show", "interfaces").split()) for n in ("a", "b")), "changed configuration left dynamic resources after TCP detection and recovery", seconds=105)
-            ns("a", "ping", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
+            wait_for(lambda: all(not any(i.startswith("vdl-") for i in ns(n, "wg", "show", "interfaces").split()) for n in ("a", "b")), "changed configuration left dynamic resources after UDP detection and recovery", seconds=75)
+            ns("a", "ping", "-n", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
             assert "dev vl-a-c" in ip("a", "-6", "route", "show", "table", "20000", "exact", "fd78:7777::2/128"), "routed fallback did not reconverge"
             counts = {n: sum(e.get("event") == "velvet-dynamic-link" and e.get("status") == "up" for e in events(n)) for n in ("a", "b")}
             ns("a", "nft", "delete", "table", "inet", "velvet_shutdown_loss")
@@ -329,7 +377,7 @@ def scenario(case):
             config_path.write_text(json.dumps(config))
             processes[0].send_signal(signal.SIGHUP)
             wait_for(lambda: all(sum(e.get("event") == "velvet-dynamic-link" and e.get("status") == "up" for e in events(n)) > counts[n] for n in ("a", "b")), "new configuration did not relearn the Link")
-            ns("a", "ping", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
+            ns("a", "ping", "-n", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
         print(f"velvet real UDP / IPv{family} / WG handoff ({case}): PASS", flush=True)
     except BaseException:
         for node in nodes:
@@ -337,6 +385,7 @@ def scenario(case):
             if path.exists():
                 print(f"--- {node} ---\n{path.read_text()}", file=sys.stderr)
             print(ns(node, "wg", "show", check=False), file=sys.stderr)
+            print(ns(node, "ip", "-6", "route", "show", "table", "20000", check=False), file=sys.stderr)
         raise
     finally:
         for p in processes:

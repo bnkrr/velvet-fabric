@@ -41,9 +41,9 @@ func TestRenderManagedConfig(t *testing.T) {
 	}
 }
 
-func TestOnlyCommittedDynamicLinksEnterManagedRouting(t *testing.T) {
+func TestRuntimeRoutingAdmissionAndWithdrawal(t *testing.T) {
 	dir := t.TempDir()
-	manager := New(&reconcile.BabelPlan{ConfigPath: filepath.Join(dir, "babel.toml"), StatePath: filepath.Join(dir, "state"), Interfaces: []string{"vl-*"}}, nil)
+	manager := New(&reconcile.BabelPlan{ConfigPath: filepath.Join(dir, "babel.toml"), StatePath: filepath.Join(dir, "state"), Interfaces: []string{"vl-static"}}, nil)
 	render := func() string {
 		t.Helper()
 		data, _, err := manager.prepare()
@@ -52,15 +52,21 @@ func TestOnlyCommittedDynamicLinksEnterManagedRouting(t *testing.T) {
 		}
 		return string(data)
 	}
-	if strings.Contains(render(), "vdl-") {
-		t.Fatal("tentative dynamic interfaces admitted by default")
+	initial := render()
+	if !strings.Contains(initial, `match = ["vl-static"]`) {
+		t.Fatal("configured static Link lost initial admission")
+	}
+	manager.SetLinkState("vl-static", true, nil)
+	if render() != initial {
+		t.Fatal("unnumbered static commit needlessly reloaded routing")
 	}
 	// A default unnumbered Link has no ordinary origin. Its committed interface
 	// must still enter routing; filtering link-local origins must not erase it.
 	manager.SetLinkState("vdl-second", true, []netip.Prefix{netip.MustParsePrefix("fe80::2/64")})
 	manager.SetLinkState("vdl-first", true, nil)
+	manager.SetLinkState("vl-static", true, nil)
 	committed := render()
-	if !strings.Contains(committed, `match = ["vl-*", "vdl-first", "vdl-second"]`) || strings.Contains(committed, "fe80::") {
+	if !strings.Contains(committed, `match = ["vl-static", "vdl-first", "vdl-second"]`) || strings.Contains(committed, "fe80::") {
 		t.Fatalf("committed link-local routing set incorrect:\n%s", committed)
 	}
 	manager.SetLinkState("vdl-first", true, nil)
@@ -73,7 +79,12 @@ func TestOnlyCommittedDynamicLinksEnterManagedRouting(t *testing.T) {
 		t.Fatal("withdrawal removed wrong committed interface")
 	}
 	manager.SetLinkState("vdl-second", false, nil)
-	if strings.Contains(render(), "vdl-") {
-		t.Fatal("withdrawn dynamic Link retained in routing")
+	manager.SetLinkState("vl-static", false, nil)
+	if !strings.Contains(render(), `match = ["velvet-no-active-links"]`) {
+		t.Fatal("withdrawn Link retained in routing")
+	}
+	manager.SetLinkState("vl-static", true, nil)
+	if render() != initial {
+		t.Fatal("recovered static Link did not regain routing admission")
 	}
 }

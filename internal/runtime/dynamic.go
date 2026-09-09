@@ -19,14 +19,13 @@ import (
 )
 
 const (
-	dynamicResponseTimeout      = 10 * time.Second
-	dynamicConnectivityTimeout  = 30 * time.Second
-	dynamicDiscoveryInterval    = time.Second
-	endpointObservationInterval = time.Second
-	maxRoutedSessions           = 128
-	maxDynamicLinks             = 128
-	maxDynamicTargets           = 4096
-	maxRoutedDialAttempts       = 3
+	dynamicResponseTimeout     = 10 * time.Second
+	dynamicConnectivityTimeout = 30 * time.Second
+	dynamicDiscoveryInterval   = time.Second
+	maxRoutedSessions          = 128
+	maxDynamicLinks            = 128
+	maxDynamicTargets          = 4096
+	maxRoutedDialAttempts      = 3
 )
 
 type dynamicAttemptState uint8

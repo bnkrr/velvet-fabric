@@ -146,13 +146,13 @@ VFP route messages.
 ### 4.1 Transport
 
 VFP uses the same common header and TLV encoding over TCP and UDP, as defined
-in Section 5. TCP carries stateful sessions. UDP carries link-local Discovery
-on configured WireGuard Links, or authenticated public probes under Section
-8.16. Message Type and socket context determine which procedure may run.
+in Section 5. TCP carries stateful sessions. UDP carries Link-local discovery
+and liveness on configured WireGuard Links, or authenticated public probes under
+Section 8.16. Message Type and socket context determine which procedure may run.
 
 TCP provides ordered, reliable octets; VFP framing provides message boundaries.
 UDP preserves datagram boundaries; retransmission is specific to the procedure
-(Section 4.2 for Discovery), not a generic reliable-UDP session layer.
+(Sections 4.2 and 8.10 for Link-local procedures), not a generic reliable-UDP session layer.
 
 The default VFP TCP port is 58420. A deployment MAY override this port through
 out-of-band configuration. Both endpoints of a Link MUST agree on the effective
@@ -204,14 +204,17 @@ invalid source addresses, and datagrams received on another interface are
 silently ignored. The message carries no Node UID, WireGuard key, port, or
 resource. Node identity remains an `OPEN` property after TCP is established.
 
-A node sends one Hello immediately and repeats it with jittered exponential
-backoff bounded at two seconds while the interface has no active TCP session.
+The initial runtime sends one Hello immediately and repeats at one-second
+intervals while it needs negotiation and no negotiation is already running.
 Receiving a multicast `HELLO` triggers one unicast `HELLO_ACK` to its actual
 source address on the effective discovery port. A receiver MUST NOT reply to
 `HELLO_ACK`; consequently replies cannot form a loop or Fabric-wide flood.
-Either valid type discovers the sender. Once a TCP session is chosen, both
-Hello send and receive activity for the Link stop. Discovery restarts after
-session failure or interface reactivation.
+Either valid type discovers the sender. Hello announcements stop after successful negotiation, even when TCP closes.
+The Link-local UDP receiver and TCP listener remain available for peer discovery
+and renegotiation. A valid peer HELLO may request renegotiation, subject to local
+rate limits; it does not itself withdraw an established adjacency. Unknown or
+malformed datagrams never request renegotiation. Discovery resumes when local
+negotiated state is absent, or the adjacency has failed its UDP liveness check.
 
 After learning the actual remote source address, both endpoints compare the
 two IPv6 addresses as unsigned 128-bit integers. The endpoint with the lower
@@ -374,7 +377,7 @@ accepted. Invalid Magic, Version, length, TLV structure, or transport context
 causes silent datagram discard; there is no generic UDP error response.
 
 After datagram validation, apply the schema allowed on that socket: link-local
-Discovery on a known WG interface (Section 4.2), or authenticated PUBLIC_PROBE
+discovery/liveness on a known WG interface (Sections 4.2 and 8.10), or authenticated PUBLIC_PROBE
 on a leased underlay socket (Section 8.16). Public probes require one canonical
 sealed TLV and authenticate it before plaintext decoding. Session messages MUST
 NOT be processed over UDP. There is no UDP OPEN exchange or generic reliability
@@ -480,7 +483,7 @@ points.
 | `0x02` | `NODE_STATE` | Publish the sending node's IPv6 loopback |
 | `0x03` | `LINK_PROPOSE` | Propose a complete replacement Link-address set |
 | `0x04` | `LINK_ACCEPT` | Accept the one currently outstanding Link proposal |
-| `0x05` | `ENDPOINT_OBSERVATION` | Report the receiving node's endpoint as observed on a direct Link |
+| `0x05` | Reserved | Former TCP ENDPOINT_OBSERVATION; no longer accepted |
 | `0x06` | `DYNAMIC_LINK_PROPOSE` | Propose one Dynamic-Link operation and the initiator's parameters |
 | `0x07` | `DYNAMIC_LINK_ACCEPT` | Accept an operation and return the acceptor's parameters |
 | `0x08` | `DYNAMIC_LINK_DECLINE` | Decline participation in one Dynamic-Link operation |
@@ -488,14 +491,17 @@ points.
 | `0x0a` | `DISCOVERY_HELLO_ACK` | Reply to a Discovery Hello without causing another reply |
 | `0x0b` | `DISCOVERY_CONTROL` | Coordinate candidates, observations and WG handoff over routed TCP |
 | `0x0c` | `PUBLIC_PROBE` | Authenticated one-way probe on a leased public UDP socket |
+| `0x0d` | `LINK_PING` | Fresh challenge on one negotiated WireGuard Link |
+| `0x0e` | `LINK_PONG` | Echo a Link challenge and optionally report the observed endpoint |
 
 Types `0x01` and `0x02` are TCP messages in both link-bound and routed sessions.
-Types `0x03` through `0x05` are TCP messages in link-bound sessions only; Types
+Types `0x03` and `0x04` are TCP messages in link-bound sessions only; Types
 `0x06` through `0x08` are TCP messages in operational routed sessions only.
 Their state restrictions remain in Sections 8.3 through 8.14. Types `0x09` and
 `0x0a` are UDP-only, valid solely in the link-local Discovery context of
 Section 4.2. Type `0x0b` is operational routed TCP only; `0x0c` is public
-UDP only, under Section 8.16.
+UDP only, under Section 8.16. Types `0x0d` and `0x0e` are UDP-only
+inside a specific WireGuard Link, under Section 8.10. No new TLV is allocated.
 
 There is no `OPEN_ACK`, `LINK_REJECT`, or generic error Message Type.
 Dynamic discovery results and termination are DISCOVERY_CONTROL records. A valid peer `OPEN` completes the
@@ -512,7 +518,7 @@ proposal held by session state.
 | `0x0003` | `LOOPBACK_V6` | 16 | Node-owned IPv6 loopback address; `/128` is implicit |
 | `0x0004` | `LINK_PREFIX_V4` | 4 | Network address of a proposed point-to-point IPv4 `/30` |
 | `0x0005` | `LINK_PREFIX_V6` | 16 | Network address of a proposed point-to-point IPv6 `/126` |
-| `0x0006` | `OPERATION_ID` | 16 | Opaque identifier correlating one operation's messages |
+| `0x0006` | `OPERATION_ID` | 16 | Opaque identifier correlating an operation or one Link ping challenge |
 | `0x0007` | `WG_PUBLIC_KEY` | 32 | Sender's WireGuard public key for one Link Attempt |
 | `0x0008` | `WG_ENDPOINT` | 8 or 20 | A WireGuard underlay endpoint whose role is defined by the Message Type |
 | `0x0009` | `PROBE_KEY` | 32 | Fresh operation/direction receive key |
@@ -624,7 +630,7 @@ The value contains no DNS name, scope identifier, priority, NAT type, or
 inference metadata.
 
 The enclosing Message Type defines the endpoint's role. In
-`ENDPOINT_OBSERVATION`, it is the receiver endpoint observed by the sender. In
+`LINK_PONG`, it is the requester endpoint observed by the responder. In
 `DYNAMIC_LINK_PROPOSE` or `DYNAMIC_LINK_ACCEPT`, it is the sender's Candidate
 that the receiver is asked to try for the current Attempt. Observation and
 Candidate remain distinct protocol concepts but do not require distinct wire
@@ -737,12 +743,15 @@ family, transaction ID, status, or reason. It is valid only when the receiver
 of `LINK_ACCEPT` has exactly one outstanding proposal and the sender of
 `LINK_ACCEPT` is the endpoint whose turn was to evaluate it.
 
-On a valid `LINK_ACCEPT`, both endpoints' desired Link state becomes the
-complete accepted proposal. The acceptor reaches that state when it sends
-`LINK_ACCEPT`; the proposer reaches it when it receives and validates
-`LINK_ACCEPT`. If the TCP session fails between those events, normal
-reconciliation on the next session MUST converge kernel state again; VFP does
-not add a distributed commit exchange for this temporary failure window.
+On a valid `LINK_ACCEPT`, both endpoints' negotiated Link state becomes the
+complete accepted proposal. The acceptor installs that state before sending
+`LINK_ACCEPT`; the proposer installs it after receiving and validating
+`LINK_ACCEPT`. If the TCP session fails between those events, ordinary
+TCP negotiation MUST converge state again when needed; EOF is not completion
+proof. The acceptor installs local parameters before sending LINK_ACCEPT; the
+proposer installs them after validating it. Each side then closes TCP; successful negotiation permits initial adjacency
+commit. Subsequent liveness is checked independently with Link-local UDP. An unnegotiated peer
+does not answer LINK_PING. VFP adds no distributed commit message.
 
 `LINK_ACCEPT` is not idempotent within one negotiation. After it is processed,
 there is no outstanding proposal, so a second `LINK_ACCEPT` is invalid in the
@@ -785,15 +794,16 @@ The static-phase sequence is therefore:
 3. Each endpoint derives only its local scoped link-local address, opens a TCP
    listener, and sends Discovery Hello over link-local multicast.
 4. Each endpoint learns the actual remote source address. The lower-address
-   endpoint initiates the single TCP connection; discovery then stops.
+   endpoint initiates one TCP negotiation; periodic announcements pause while
+   it runs, and listeners remain available after successful negotiation.
 5. Both endpoints exchange `OPEN`, learning each other's Node UID.
 6. Both endpoints exchange `NODE_STATE`, learning each other's IPv6 node
    loopback.
 7. The lower-UUID endpoint sends the initial complete `LINK_PROPOSE`.
 8. The peers exchange counterproposals until one side sends `LINK_ACCEPT`.
-9. Both sides reconcile any accepted Link addresses and the direct `/128`
-   route to the adjacent peer's IPv6 loopback. An empty proposal adds no routed
-   address to the Link.
+9. Both sides install accepted Link addresses. Successful negotiation installs
+   the direct `/128` route and admits the Link to managed routing, then closes
+   TCP. An empty proposal adds no numbered Link address.
 
 No VFP field carries the Fabric PSK, WireGuard keys, endpoint candidates,
 listen port, persistent keepalive, local Peer name, or local interface name.
@@ -812,8 +822,9 @@ Every VFP/TCP session first exchanges `OPEN` and `NODE_STATE`. The transport
 path assigns one of two local contexts; no `SESSION_TYPE` field is sent:
 
 - A **link-bound session** is established by Section 4.2 on a known direct
-  WireGuard interface. It then performs Sections 8.5 through 8.7 and, after
-  commit, accepts only `ENDPOINT_OBSERVATION` as an operational message.
+  WireGuard interface. It then performs Sections 8.5 through 8.7 and ends successfully after local
+  negotiation completes. It has no long-lived operational message phase.
+  Closing this TCP connection does not withdraw an established Link.
 - A **routed session** is opened from one node loopback to another through an
   already routed Fabric path. After `NODE_STATE`, it immediately becomes
   operational and accepts only `DYNAMIC_LINK_PROPOSE`,
@@ -830,41 +841,64 @@ operations correlated by `OPERATION_ID`; the session is not placed into one
 monolithic per-Attempt state. Version 1 nevertheless permits at most one
 active Link Attempt for a given Node pair.
 
-### 8.10 `ENDPOINT_OBSERVATION`
+### 8.10 Link-local UDP liveness and endpoint observations
 
-`ENDPOINT_OBSERVATION` is valid only on an operational link-bound session. It
-reports the WireGuard endpoint at which the sender currently observes the
-receiver on the Link carrying that session.
+LINK_PING and LINK_PONG use the common VFP datagram framing, inside the
+carrying WireGuard interface only. They MUST NOT be exposed on the public
+underlay or forwarded through an alternate Fabric route. Receive validation
+requires the exact interface, a link-local unicast destination, and the remote
+link-local source learned by successful link-bound TCP negotiation. Multicast
+is reserved for discovery, not liveness. Invalid, unknown and unsolicited
+responses are silently discarded without allocating state or changing Link
+lifetime. These messages add neither LINK_ID nor LINK_STATE.
 
-| TLV | Cardinality | Meaning |
-|---|---:|---|
-| `WG_ENDPOINT` | `1` | Receiver endpoint observed by the sender |
+| Message | TLV | Cardinality | Meaning |
+|---|---|---|---|
+| LINK_PING | OPERATION_ID | 1 | Fresh nonzero random 16-octet challenge |
+| LINK_PONG | OPERATION_ID | 1 | Exact challenge copied from LINK_PING |
+| LINK_PONG | WG_ENDPOINT | 0..1 | Requester's current endpoint observed on this WG Link |
 
-The canonical body contains exactly one `WG_ENDPOINT`. The message does
-not carry Node UID, Link ID, operation ID, timestamp, lease, or expiry: the
-established session identifies both nodes and its carrying Link.
+The receiver replies only while it has locally installed negotiated Link
+parameters for that source. A PONG never elicits another response. Failure to
+read an endpoint omits WG_ENDPOINT; it does not claim the Link is dead.
 
-Upon entering operational state, each endpoint MUST read the carrying
-WireGuard interface's current peer endpoint. If present, it MUST immediately
-send one Observation. If absent, the initial sending obligation remains until
-the endpoint first becomes available. While the session remains operational,
-the sender MUST send a new Observation whenever the endpoint value changes and
-MUST NOT periodically repeat an unchanged value. Every replacement
-link-bound session creates a new initial sending obligation.
+Each direction keeps at most one outstanding challenge, with a local expiry.
+A new request replaces the old challenge; consuming a matching PONG consumes
+that challenge. Unmatched, expired, duplicate, wrong-source or wrong-interface
+PONGs neither refresh liveness nor update evidence. Challenge values are fresh
+across process restarts and negotiations; no persistent generation field is
+needed. Receiving PING alone proves no bidirectional reachability.
 
-Observation has no acknowledgement or response Message. TCP supplies reliable
-ordered delivery; a send failure fails the session, and its replacement sends
-the current value again. A receiver synchronously replaces the Evidence entry
-for the carrying Link before processing a later frame. An inability to retain
-that fixed-size entry fails the session.
+The initial profile sends PING immediately after successful negotiation/installation,
+then every 10 seconds, with a 10-second response validity. An established
+adjacency expires after 30 seconds without a matching PONG. Timers are local;
+no timer TLV is exchanged. Successful TCP negotiation confirms initial
+reachability and permits adjacency route installation and managed Babel
+admission; the liveness clock starts then.
+A fresh PONG renews that confirmation or recovers a withdrawn adjacency. TCP EOF,
+TCP keepalive and merely reconnecting do not refresh or expire this timer.
+Completing a new negotiation may confirm the newly installed state. The
+provisioning-only --once mode may exit after initial local commit; it provides
+no subsequent supervision.
 
-Evidence is keyed by the direct Link, not the transient TCP session. Each
-entry associates the received Observation with the actual local WireGuard
-listen port of that carrying Link at receipt time, forming the local mapping
-`(Link, Local Listen Port, Observed Endpoint)`. The listen port is already
-known locally and is not carried in the Observation. Session failure does not
-expire Evidence; deleting the Link deletes it. A stale Observation is only an
-input to inference, and direct connectivity validation remains authoritative.
+A matching PONG's optional WG_ENDPOINT replaces the evidence for the Link and
+its current local WG listen port. Every reply can repeat the current endpoint;
+subsequent PINGs naturally recover lost reports. Evidence is never updated by
+an unsolicited datagram. Withdrawal of an expired adjacency removes its usable
+evidence; a later fresh PONG can restore it. Deleting/reconfiguring the Link
+also invalidates its evidence and outstanding challenge.
+
+Configured static interfaces may enter managed routing before initial VFP
+negotiation, preserving their configuration-based startup semantics. Dynamic
+interfaces require successful negotiation before admission.
+
+On expiry, withdraw negotiated adjacency routes and managed routing admission
+before relying on the alternate Fabric path. Preserve the WG interface and
+negotiated addresses while recovering; normal reconciliation MUST NOT reinstall
+withdrawn adjacency routes. Static Links continue recovery while configured.
+Dynamic Links allow a further 30-second recovery window, then remove their
+resources. A fresh matching PONG may recover the existing negotiated Link;
+when peer state is absent or uncertain, rerun ordinary TCP negotiation.
 
 ### 8.11 Baseline discovery, selection, and inference
 
@@ -958,9 +992,9 @@ installed only after reciprocal probes and handoff agreement. The Link PSK is
 derived outside VFP from Fabric state and both public keys.
 
 After both WG_READY records, run Discovery, TCP, OPEN, NODE_STATE,
-LINK_PROPOSE and LINK_ACCEPT. Commit only when that new link-bound session is
-operational and its Node UID equals the routed-session target. UDP success and
-WG readiness alone cannot commit a Link.
+LINK_PROPOSE and LINK_ACCEPT. Commit only after successful negotiation and
+local installation with the routed-session target Node UID. Subsequent health
+follows Section 8.10. UDP success and WG readiness alone cannot commit a Link.
 
 The initiator has a ten-second response timeout after writing Proposal. UDP
 preparation through handoff has a 30-second local deadline from preparation.
@@ -987,13 +1021,12 @@ IDLE -> PROPOSING -> PROBING/HANDOFF -> ATTEMPTING -> UP -> RECOVERING -> UP
                                       (deadline, cleanup, routed path retained)
 ```
 
-Loss of the operational link-bound session after commit moves the local
-Attempt to `RECOVERING`; it does not create a new routed Proposal. The endpoint
-reruns the standard link-bound establishment procedure over the committed
-WireGuard interface with a fresh 30-second Connectivity Deadline. Reaching
-operational state with the same remote Node UID returns to `UP`. If the
-deadline wins, the endpoint removes the Dynamic Link and its materialized
-routing state. This recovery is local behavior and adds no wire Message.
+Loss of TCP after negotiation is not a Link failure. LINK_PING/PONG owns
+adjacency health under Section 8.10. After UDP liveness expires, transition to
+RECOVERING, withdraw adjacency routes/admission, and give the retained WG
+interface a fresh 30-second recovery deadline. Fresh UDP confirmation after
+retained or renewed negotiation returns it to UP. On expiry remove the Dynamic
+Link. This is not a new routed Proposal and does not reset one-shot admission.
 
 Version 1 sends no retransmitted Proposal on one session and defines no
 cancel, success, failure, rollback, or generic error Message. A future

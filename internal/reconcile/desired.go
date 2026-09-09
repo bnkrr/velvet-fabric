@@ -5,7 +5,6 @@ import (
 	"net/netip"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -272,13 +271,12 @@ func compileBabel(desired *DesiredState, nodeSpec *spec.NodeSpec) *BabelPlan {
 		StatePath:   filepath.Join(stateRoot, "babel-rs-state.toml"),
 		Protocol:    BabelDynamicProtocol, DeviceOnly: true, ManageRules: false,
 		Views: []BabelView{{TableID: desired.FabricTableID}},
-		// Dynamic interfaces enter the managed routing set only after VFP commit.
-		Interfaces: []string{"vl-*"},
 	}
+	// Provisioned Links retain configuration-based initial routing admission.
+	// Exact owned names let runtime withdraw an expired Link without a wildcard
+	// continuing to admit it. Dynamic Links still enter only at commit.
 	for _, link := range desired.Links {
-		if !strings.HasPrefix(link.InterfaceName, "vl-") {
-			plan.Interfaces = append(plan.Interfaces, link.InterfaceName)
-		}
+		plan.Interfaces = append(plan.Interfaces, link.InterfaceName)
 	}
 	plan.Origins = append(plan.Origins, BabelOrigin{Destination: netip.PrefixFrom(desired.LoopbackV6, 128)})
 	for _, announcement := range nodeSpec.Fabric.Announcements {

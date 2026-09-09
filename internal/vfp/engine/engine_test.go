@@ -50,10 +50,12 @@ func TestTwoEndpointFSMConvergesThroughCounterproposal(t *testing.T) {
 	if bChecks.Load() < 2 {
 		t.Fatal("counterproposal path was not exercised")
 	}
-	cancel()
 	for range 2 {
 		select {
-		case <-errors:
+		case err := <-errors:
+			if err != nil {
+				t.Fatalf("negotiation failed: %v", err)
+			}
 		case <-time.After(time.Second):
 			t.Fatal("engine did not stop")
 		}
@@ -238,7 +240,7 @@ func TestOperationalSessionDiscardsBadFramesAndContinues(t *testing.T) {
 	if _, err := remote.Write([]byte("VFP\x00\x01\xff\x00\x08")); err != nil {
 		t.Fatal(err)
 	}
-	if err := message.Write(remote, message.Message{Type: message.EndpointObservation, Endpoint: netip.MustParseAddrPort("192.0.2.1:5000")}); err != nil {
+	if err := message.Write(remote, message.Message{Type: message.NodeState, LoopbackV6: netip.MustParseAddr("fd41::2")}); err != nil {
 		t.Fatal(err)
 	}
 	// A UDP-only discovery frame must also be discarded without a reply.

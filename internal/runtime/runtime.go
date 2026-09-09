@@ -51,6 +51,7 @@ type materializedState struct {
 	peers   []netip.Addr
 	remote  uuid.UUID
 	dynamic bool
+	active  bool
 }
 
 func (r *Runner) Run(ctx context.Context, once bool) error {
@@ -178,6 +179,9 @@ func (r *Runner) Status() Status {
 	r.mu.RLock()
 	var established, dynamic int
 	for _, state := range r.states {
+		if !state.active {
+			continue
+		}
 		if state.dynamic {
 			dynamic++
 		} else {

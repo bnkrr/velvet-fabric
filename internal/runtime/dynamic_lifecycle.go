@@ -20,35 +20,9 @@ func (d *dynamicLinkEngine) startConnectivityLocked(attempt *dynamicAttempt) {
 }
 
 func (d *dynamicLinkEngine) establishDynamic(ctx context.Context, attempt *dynamicAttempt) {
-	// Discovery/TCP/VFP may reconnect within this Attempt's deadline. This is
-	// connectivity work on the frozen Candidate, not another inference round.
-	for ctx.Err() == nil {
-		conn, err := d.runner.discoverPeer(ctx, attempt.plan)
-		if err == nil {
-			err = d.runner.serveLinkSession(ctx, conn, attempt.plan, attempt, dynamicConnectivityTimeout, nil)
-		}
-		if ctx.Err() != nil {
-			break
-		}
-		d.mu.Lock()
-		current := d.attempts[attempt.remote]
-		if current != attempt {
-			d.mu.Unlock()
-			return
-		}
-		if attempt.state == dynamicUp {
-			attempt.state = dynamicRecovering
-			d.armConnectivityDeadlineLocked(attempt, ctx)
-			d.runner.log(Event{Event: "velvet-dynamic-link", Status: "recovering", RemoteUID: attempt.remote.String(), Interface: attempt.plan.InterfaceName, Error: errorText(err)})
-		}
-		d.mu.Unlock()
-		select {
-		case <-time.After(time.Second):
-		case <-ctx.Done():
-		}
-	}
+	err := d.runner.manageLink(ctx, attempt.plan, attempt, nil)
 	if d.ctx.Err() == nil {
-		d.failAttempt(attempt, "connectivity deadline", dynamicAttempting, dynamicRecovering)
+		d.failAttempt(attempt, "Link supervision: "+errorText(err), dynamicAttempting, dynamicRecovering, dynamicUp)
 	}
 }
 

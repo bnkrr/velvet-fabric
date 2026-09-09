@@ -34,7 +34,7 @@ func TestMessageRoundTripAndUnknownTLV(t *testing.T) {
 
 func TestOperationalMessagesRoundTrip(t *testing.T) {
 	for _, endpoint := range []string{"192.0.2.9:49152", "[2001:db8::1]:51820"} {
-		for _, kind := range []Type{EndpointObservation, DynamicLinkPropose, DynamicLinkAccept, DynamicLinkDecline} {
+		for _, kind := range []Type{LinkPong, DynamicLinkPropose, DynamicLinkAccept, DynamicLinkDecline} {
 			if kind == DynamicLinkDecline && endpoint != "192.0.2.9:49152" {
 				continue
 			}
@@ -42,9 +42,7 @@ func TestOperationalMessagesRoundTrip(t *testing.T) {
 			if kind != DynamicLinkDecline {
 				want.Endpoint = netip.MustParseAddrPort(endpoint)
 			}
-			if kind != EndpointObservation {
-				want.OperationID = [16]byte{1, 2, 3}
-			}
+			want.OperationID = [16]byte{1, 2, 3}
 			if kind == DynamicLinkPropose || kind == DynamicLinkAccept {
 				want.WGPublicKey = [32]byte{4, 5, 6}
 			}
@@ -65,7 +63,7 @@ func TestObservationAndCandidateUseWGEndpointTLV(t *testing.T) {
 	key := [32]byte{2}
 	endpoint := netip.MustParseAddrPort("192.0.2.9:49152")
 	for _, value := range []Message{
-		{Type: EndpointObservation, Endpoint: endpoint},
+		{Type: LinkPong, OperationID: operation, Endpoint: endpoint},
 		{Type: DynamicLinkPropose, OperationID: operation, WGPublicKey: key, Endpoint: endpoint},
 		{Type: DynamicLinkAccept, OperationID: operation, WGPublicKey: key, Endpoint: endpoint},
 	} {
@@ -112,7 +110,7 @@ func TestObservationAndCandidateUseWGEndpointTLV(t *testing.T) {
 }
 
 func TestDynamicMessageRequiresCompleteParameters(t *testing.T) {
-	if _, err := Encode(Message{Type: EndpointObservation, Endpoint: netip.MustParseAddrPort("[fe80::1]:1")}); err == nil {
+	if _, err := Encode(Message{Type: LinkPong, Endpoint: netip.MustParseAddrPort("[fe80::1]:1")}); err == nil {
 		t.Fatal("scoped IPv6 endpoint without a zone was accepted")
 	}
 	if _, err := Encode(Message{Type: DynamicLinkPropose, Endpoint: netip.MustParseAddrPort("192.0.2.1:1")}); err == nil {
@@ -152,12 +150,12 @@ func TestProposalMayBeEmpty(t *testing.T) {
 }
 
 // A literal protocol vector prevents encoder and decoder from sharing a wire-format bug.
-func TestEndpointObservationWireVector(t *testing.T) {
-	frame, err := hex.DecodeString("5646500001050014000800080001c000c0000209")
+func TestLinkPongWireVector(t *testing.T) {
+	frame, err := hex.DecodeString("56465000010e00280006001001000000000000000000000000000000000800080001c000c0000209")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Message{Type: EndpointObservation, Endpoint: netip.MustParseAddrPort("192.0.2.9:49152")}
+	want := Message{Type: LinkPong, OperationID: [16]byte{1}, Endpoint: netip.MustParseAddrPort("192.0.2.9:49152")}
 	got, err := Decode(frame)
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("decode: %#v %v", got, err)
@@ -198,7 +196,7 @@ func TestReadValidatesHeaderBeforeBody(t *testing.T) {
 
 func TestReadPreservesStreamBoundaries(t *testing.T) {
 	first := []byte("VFP\x00\x01\x04\x00\x08")
-	second, _ := hex.DecodeString("5646500001050014000800080001c000c0000209")
+	second, _ := hex.DecodeString("56465000010e00280006001001000000000000000000000000000000000800080001c000c0000209")
 	stream := append(bytes.Clone(first), second...)
 	for _, fragmented := range []bool{false, true} {
 		reader := bytes.NewReader(stream)
@@ -280,7 +278,7 @@ func TestDecodeRequiresEachDynamicParameter(t *testing.T) {
 }
 
 func FuzzMessageDecode(f *testing.F) {
-	for _, seed := range []string{"5646500001040008", "5646500001050014000800080001c000c0000209", "5646500001ff0008", "5646500001010008", "5646500001090008", "01040004"} {
+	for _, seed := range []string{"5646500001040008", "56465000010e00280006001001000000000000000000000000000000000800080001c000c0000209", "5646500001ff0008", "5646500001010008", "5646500001090008", "01040004"} {
 		data, _ := hex.DecodeString(seed)
 		f.Add(data)
 	}
@@ -302,4 +300,32 @@ func FuzzMessageDecode(f *testing.F) {
 			t.Fatalf("unstable message: %#v => %#v: %v", value, again, err)
 		}
 	})
+}
+
+func TestLinkProbeTransportAndMalformedChallenges(t *testing.T) {
+	for _, kind := range []Type{LinkPing, LinkPong} {
+		m := Message{Type: kind, OperationID: [16]byte{7}}
+		packet, err := EncodeDatagram(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := DecodeDatagram(packet); err != nil || !reflect.DeepEqual(got, m) {
+			t.Fatalf("round trip: %#v %v", got, err)
+		}
+		if err := Write(&bytes.Buffer{}, m); err == nil {
+			t.Fatal("Link probe accepted over TCP")
+		}
+		for _, n := range []int{0, 15, 16, 17} {
+			// The 16-byte variant is all-zero, also invalid.
+			body := tlv.Append(nil, OperationIDTLV, make([]byte, n))
+			bad := append(append([]byte(nil), packet[:HeaderLength]...), body...)
+			binary.BigEndian.PutUint16(bad[6:8], uint16(len(bad)))
+			if _, err := DecodeDatagram(bad); err == nil {
+				t.Fatalf("accepted malformed challenge length %d", n)
+			}
+		}
+	}
+	if _, err := Decode([]byte{0x56, 0x46, 0x50, 0, 1, 5, 0, 8}); err == nil {
+		t.Fatal("retired TCP observation accepted")
+	}
 }
