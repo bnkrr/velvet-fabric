@@ -36,23 +36,29 @@ const (
 	PublicProbe        Type = 0x0c
 	LinkPing           Type = 0x0d
 	LinkPong           Type = 0x0e
+	PolicyQuery        Type = 0x0f
+	PolicyUpdate       Type = 0x10
 )
+
+func (t Type) IsPolicy() bool { return t == PolicyQuery || t == PolicyUpdate }
 
 func (t Type) IsLinkProbe() bool { return t == LinkPing || t == LinkPong }
 
 func (t Type) IsDiscovery() bool { return t == DiscoveryHello || t == DiscoveryHelloAck }
 
 const (
-	NodeUIDTLV       uint16 = 0x0001
-	LoopbackV6TLV    uint16 = 0x0003
-	LinkPrefixV4TLV  uint16 = 0x0004
-	LinkPrefixV6TLV  uint16 = 0x0005
-	OperationIDTLV   uint16 = 0x0006
-	WGPublicKeyTLV   uint16 = 0x0007
-	WGEndpointTLV    uint16 = 0x0008
-	ProbeKeyTLV      uint16 = 0x0009
-	DiscoveryDataTLV uint16 = 0x000a
-	SealedProbeTLV   uint16 = 0x000b
+	NodeUIDTLV           uint16 = 0x0001
+	LoopbackV6TLV        uint16 = 0x0003
+	LinkPrefixV4TLV      uint16 = 0x0004
+	LinkPrefixV6TLV      uint16 = 0x0005
+	OperationIDTLV       uint16 = 0x0006
+	WGPublicKeyTLV       uint16 = 0x0007
+	WGEndpointTLV        uint16 = 0x0008
+	ProbeKeyTLV          uint16 = 0x0009
+	DiscoveryDataTLV     uint16 = 0x000a
+	SealedProbeTLV       uint16 = 0x000b
+	DeclineReasonTLV     uint16 = 0x000c
+	DynamicLinkPolicyTLV uint16 = 0x000d
 )
 
 var ErrFrame = errors.New("invalid VFP frame")
@@ -63,17 +69,32 @@ type UID struct {
 	Name string
 }
 
+type DeclineReason uint8
+
+const (
+	DeclineOrdinary DeclineReason = iota
+	DeclinePolicy
+)
+
+// DynamicLinkPolicy is the publisher's versioned admission for the recipient.
+type DynamicLinkPolicy struct {
+	Revision uint64
+	Accept   bool
+}
+
 type Message struct {
-	Type         Type
-	ProbeKey     [32]byte
-	Data         []byte
-	UID          *UID
-	LoopbackV6   netip.Addr
-	LinkPrefixV4 netip.Prefix
-	LinkPrefixV6 netip.Prefix
-	OperationID  [16]byte
-	WGPublicKey  [32]byte
-	Endpoint     netip.AddrPort
+	DeclineReason DeclineReason
+	Policy        *DynamicLinkPolicy
+	Type          Type
+	ProbeKey      [32]byte
+	Data          []byte
+	UID           *UID
+	LoopbackV6    netip.Addr
+	LinkPrefixV4  netip.Prefix
+	LinkPrefixV6  netip.Prefix
+	OperationID   [16]byte
+	WGPublicKey   [32]byte
+	Endpoint      netip.AddrPort
 }
 
 func Read(r io.Reader) ([]byte, error) {
@@ -118,7 +139,7 @@ func Decode(frame []byte) (Message, error) {
 		return Message{}, ErrFrame
 	}
 	result := Message{Type: Type(frame[5])}
-	if result.Type < Open || result.Type > LinkPong || result.Type == 0x05 {
+	if result.Type < Open || result.Type > PolicyUpdate || result.Type == 0x05 {
 		return Message{}, fmt.Errorf("%w: unknown message type 0x%02x", ErrFrame, frame[5])
 	}
 	selected := map[uint16][]byte{}
@@ -139,16 +160,25 @@ func Decode(frame []byte) (Message, error) {
 		}
 	}
 	switch result.Type {
-	case Open:
+	case Open, PolicyQuery, PolicyUpdate:
 		value, ok := selected[NodeUIDTLV]
 		if !ok {
-			return Message{}, fmt.Errorf("%w: OPEN requires NODE_UID", ErrFrame)
+			return Message{}, fmt.Errorf("%w: message requires NODE_UID", ErrFrame)
 		}
 		uid, parseErr := parseUID(value)
 		if parseErr != nil {
 			return Message{}, fmt.Errorf("%w: %v", ErrFrame, parseErr)
 		}
+		if result.Type.IsPolicy() {
+			uid.Name = ""
+		} // Policy identity ignores display names.
 		result.UID = &uid
+		if result.Type == PolicyUpdate {
+			result.Policy, err = parseDynamicLinkPolicy(selected[DynamicLinkPolicyTLV])
+			if err != nil {
+				return Message{}, err
+			}
+		}
 	case NodeState:
 		result.LoopbackV6, err = parseAddress(selected[LoopbackV6TLV], false)
 		if err != nil {
@@ -207,6 +237,20 @@ func Decode(frame []byte) (Message, error) {
 			return Message{}, ErrFrame
 		}
 	case DynamicLinkDecline:
+		reason := selected[DeclineReasonTLV]
+		if len(reason) != 1 || reason[0] > byte(DeclinePolicy) {
+			return Message{}, ErrFrame
+		}
+		result.DeclineReason = DeclineReason(reason[0])
+		if value, ok := selected[DynamicLinkPolicyTLV]; ok {
+			result.Policy, err = parseDynamicLinkPolicy(value)
+			if err != nil {
+				return Message{}, err
+			}
+		}
+		if result.DeclineReason == DeclinePolicy && (result.Policy == nil || result.Policy.Accept) {
+			return Message{}, ErrFrame
+		}
 		if err = parseOperationID(selected[OperationIDTLV], &result.OperationID); err != nil {
 			return Message{}, fmt.Errorf("%w: %v", ErrFrame, err)
 		}
@@ -217,15 +261,26 @@ func Decode(frame []byte) (Message, error) {
 func Encode(m Message) ([]byte, error) {
 	body := make([]byte, 0, 64)
 	switch m.Type {
-	case Open:
+	case Open, PolicyQuery, PolicyUpdate:
 		if m.UID == nil {
-			return nil, errors.New("OPEN requires UID")
+			return nil, errors.New("message requires NODE_UID")
 		}
-		value, err := encodeUID(*m.UID)
+		uid := *m.UID
+		if m.Type.IsPolicy() {
+			uid.Name = ""
+		}
+		value, err := encodeUID(uid)
 		if err != nil {
 			return nil, err
 		}
 		body = tlv.Append(body, NodeUIDTLV, value)
+		if m.Type == PolicyUpdate {
+			value, err := encodeDynamicLinkPolicy(m.Policy)
+			if err != nil {
+				return nil, err
+			}
+			body = tlv.Append(body, DynamicLinkPolicyTLV, value)
+		}
 	case NodeState:
 		if m.LoopbackV6.IsValid() {
 			if !m.LoopbackV6.Is6() {
@@ -289,7 +344,18 @@ func Encode(m Message) ([]byte, error) {
 		}
 		body = tlv.Append(body, SealedProbeTLV, m.Data)
 	case DynamicLinkDecline:
+		if m.DeclineReason > DeclinePolicy || (m.DeclineReason == DeclinePolicy && (m.Policy == nil || m.Policy.Accept)) {
+			return nil, ErrFrame
+		}
 		body = tlv.Append(body, OperationIDTLV, m.OperationID[:])
+		body = tlv.Append(body, DeclineReasonTLV, []byte{byte(m.DeclineReason)})
+		if m.Policy != nil {
+			value, err := encodeDynamicLinkPolicy(m.Policy)
+			if err != nil {
+				return nil, err
+			}
+			body = tlv.Append(body, DynamicLinkPolicyTLV, value)
+		}
 	default:
 		return nil, errors.New("unknown message type")
 	}
@@ -314,14 +380,14 @@ func DecodeDatagram(packet []byte) (Message, error) {
 	if err != nil {
 		return Message{}, err
 	}
-	if !m.Type.IsDiscovery() && !m.Type.IsLinkProbe() && m.Type != PublicProbe {
+	if !m.Type.IsDiscovery() && !m.Type.IsLinkProbe() && !m.Type.IsPolicy() && m.Type != PublicProbe {
 		return Message{}, fmt.Errorf("%w: message is not valid over UDP", ErrFrame)
 	}
 	return m, nil
 }
 
 func EncodeDatagram(m Message) ([]byte, error) {
-	if !m.Type.IsDiscovery() && !m.Type.IsLinkProbe() && m.Type != PublicProbe {
+	if !m.Type.IsDiscovery() && !m.Type.IsLinkProbe() && !m.Type.IsPolicy() && m.Type != PublicProbe {
 		return nil, fmt.Errorf("%w: message is not valid over UDP", ErrFrame)
 	}
 	frame, err := Encode(m)
@@ -332,7 +398,7 @@ func EncodeDatagram(m Message) ([]byte, error) {
 }
 
 func Write(w io.Writer, m Message) error {
-	if m.Type.IsDiscovery() || m.Type.IsLinkProbe() || m.Type == PublicProbe {
+	if m.Type.IsDiscovery() || m.Type.IsLinkProbe() || m.Type.IsPolicy() || m.Type == PublicProbe {
 		return fmt.Errorf("%w: discovery is not valid over TCP", ErrFrame)
 	}
 	frame, err := Encode(m)
@@ -351,8 +417,10 @@ func Write(w io.Writer, m Message) error {
 
 func usedBy(messageType Type, tlvType uint16) bool {
 	switch messageType {
-	case Open:
+	case Open, PolicyQuery:
 		return tlvType == NodeUIDTLV
+	case PolicyUpdate:
+		return tlvType == NodeUIDTLV || tlvType == DynamicLinkPolicyTLV
 	case NodeState:
 		return tlvType == LoopbackV6TLV
 	case LinkPropose:
@@ -370,7 +438,7 @@ func usedBy(messageType Type, tlvType uint16) bool {
 	case PublicProbe:
 		return tlvType == SealedProbeTLV
 	case DynamicLinkDecline:
-		return tlvType == OperationIDTLV
+		return tlvType == OperationIDTLV || tlvType == DeclineReasonTLV || tlvType == DynamicLinkPolicyTLV
 	default:
 		return false
 	}
@@ -536,4 +604,23 @@ func allZero(value []byte) bool {
 		}
 	}
 	return true
+}
+
+func parseDynamicLinkPolicy(value []byte) (*DynamicLinkPolicy, error) {
+	if len(value) != 9 || value[8] > 1 || binary.BigEndian.Uint64(value[:8]) == 0 {
+		return nil, ErrFrame
+	}
+	return &DynamicLinkPolicy{Revision: binary.BigEndian.Uint64(value[:8]), Accept: value[8] == 1}, nil
+}
+
+func encodeDynamicLinkPolicy(p *DynamicLinkPolicy) ([]byte, error) {
+	if p == nil || p.Revision == 0 {
+		return nil, ErrFrame
+	}
+	value := make([]byte, 9)
+	binary.BigEndian.PutUint64(value, p.Revision)
+	if p.Accept {
+		value[8] = 1
+	}
+	return value, nil
 }

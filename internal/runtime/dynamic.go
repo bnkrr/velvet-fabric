@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/velvet-fabric/velvet-fabric/internal/spec"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/engine"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/message"
+	"github.com/velvet-fabric/velvet-fabric/internal/vfp/policy"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/probe"
 )
 
@@ -25,7 +27,6 @@ const (
 	maxRoutedSessions          = 128
 	maxDynamicLinks            = 128
 	maxDynamicTargets          = 4096
-	maxRoutedDialAttempts      = 3
 )
 
 type dynamicAttemptState uint8
@@ -68,15 +69,29 @@ type dynamicLinkEngine struct {
 	attempts         map[uuid.UUID]*dynamicAttempt
 	pendingCleanups  map[uuid.UUID]*dynamicCleanup
 	listener         *net.TCPListener
+	policySocket     policyTransport
+	policyRevision   uint64
+	policyCursor     int
+	dialWindow       time.Time
+	dialCount        int
 	errors           chan error
 	inboundSessions  chan struct{}
 	outboundSessions chan struct{}
 }
 
 type dynamicTarget struct {
-	dialing   bool
-	attempted bool
-	failures  uint8
+	dialing       bool
+	uid           uuid.UUID
+	bound         bool // learned through OPEN/NODE_STATE, not a UDP query
+	failures      uint8
+	nextAttempt   time.Time
+	nextQuery     time.Time
+	nextUpdate    time.Time
+	policy        *message.DynamicLinkPolicy
+	pendingUpdate bool
+	pendingQuery  bool
+	reachable     bool
+	lastSeen      time.Time
 }
 
 type dynamicAttempt struct {
@@ -125,14 +140,39 @@ func (d *dynamicLinkEngine) start(ctx context.Context) error {
 		return fmt.Errorf("listen for routed VFP on %s: %w", address, err)
 	}
 	d.listener = listener
+	dir := d.runner.PolicyStateDir
+	if dir == "" {
+		dir = "/var/lib/velvet"
+	}
+	revision, err := reservePolicyRevision(filepath.Join(dir, d.runner.Desired.UUID.String(), "dynamic-link-revision"))
+	if err != nil {
+		listener.Close()
+		d.cancel()
+		return fmt.Errorf("reserve policy revision: %w", err)
+	}
+	d.policyRevision = revision
+	ps, err := policy.Listen(d.runner.Desired.LoopbackV6, d.runner.Desired.LoopbackPoolV6, d.runner.Desired.VFPPort, d.policyIngress)
+	if err != nil {
+		listener.Close()
+		d.cancel()
+		return fmt.Errorf("listen for routed policy: %w", err)
+	}
+	d.policySocket = ps
+	d.targets = d.runner.policySeed
+	if d.targets == nil {
+		d.targets = make(map[netip.Addr]*dynamicTarget)
+	}
+	for _, target := range d.targets {
+		target.pendingUpdate = target.uid != uuid.Nil
+	}
+	d.workers.Go(func() { d.readPolicy(ctx) })
 	d.workers.Go(func() {
 		<-ctx.Done()
 		_ = listener.Close()
+		_ = ps.Close()
 	})
 	d.workers.Go(func() { d.acceptRouted(ctx) })
-	if d.active() {
-		d.workers.Go(func() { d.discoverLoopbacks(ctx) })
-	}
+	d.workers.Go(func() { d.discoverLoopbacks(ctx) })
 	return nil
 }
 
@@ -142,6 +182,9 @@ func (d *dynamicLinkEngine) stop() {
 	}
 	if d.listener != nil {
 		_ = d.listener.Close()
+	}
+	if d.policySocket != nil {
+		_ = d.policySocket.Close()
 	}
 	d.resourceMu.Lock()
 	d.mu.Lock()
@@ -198,4 +241,10 @@ func errorText(err error) string {
 		return "Link establishment stopped"
 	}
 	return err.Error()
+}
+
+type policyTransport interface {
+	Read() (netip.Addr, message.Message, error)
+	Send(netip.Addr, message.Message) error
+	Close() error
 }

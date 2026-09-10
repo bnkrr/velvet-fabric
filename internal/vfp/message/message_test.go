@@ -282,6 +282,10 @@ func FuzzMessageDecode(f *testing.F) {
 		data, _ := hex.DecodeString(seed)
 		f.Add(data)
 	}
+	for _, kind := range []Type{PolicyQuery, PolicyUpdate, DynamicLinkDecline} {
+		seed, _ := Encode(Message{Type: kind, UID: &UID{UUID: uuid.MustParse("10000000-0000-4000-8000-000000000001")}, Policy: &DynamicLinkPolicy{Revision: 7, Accept: false}})
+		f.Add(seed)
+	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > MaxFrameLength+1 {
 			return

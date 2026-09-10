@@ -10,6 +10,7 @@ import subprocess as sp
 import sys
 import tempfile
 import time
+import uuid
 
 os.umask(0o077)
 
@@ -48,6 +49,14 @@ for allocation in ("preserve", "remap", "blocked", "random"):
     CASES[f"v6-dual-{allocation}"] = {"family": 6, "mode": allocation}
 
 
+
+for family in (4, 6):
+    for fault in ("retry-blackout", "policy-wakeup", "policy-restart-query"):
+        CASES[f"v{family}-{fault}"] = {
+            "family": family, "mode": "preserve", "public": ("a", "b"),
+            "initiator": "a", "retry_fault": fault}
+
+
 def endpoint(address, port):
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
 
@@ -75,12 +84,16 @@ def scenario(case):
         return f"fd42:77:{index}::{host}" if family == 6 else f"10.77.{index}.{host}"
 
     suffix = str(os.getpid())
+    # Keep interface-name prefix 7100 while isolating persistent/control state
+    # between independent concurrent test runs.
+    uid_group = uuid.uuid4().hex[:4]
     nodes = ("a", "b", "c", "d") if mode == "observer-fallback" else ("a", "b", "c")
     names = {node: f"vun-{node}-{suffix}" for node in (*nodes, *("r" + n for n in ("a", "b") if n not in public_nodes))}
     bridge = f"vunbr{suffix}"
     runtime = Path(tempfile.mkdtemp(prefix="velvet-udp-nat-"))
     runtime.chmod(0o700)
     processes, logs, uuids, root_links = [], [], [], []
+    succeeded = False
 
     def ns(node, *args, **kw):
         return run("ip", "netns", "exec", names[node], *args, **kw)
@@ -192,7 +205,7 @@ def scenario(case):
         pubs = {node: run("wg", "pubkey", input=key + "\n") for node, key in keys.items()}
         psk = run("wg", "genpsk")
         for index, node in enumerate(nodes, 1):
-            uid = f"71000000-0000-4000-8000-{index:012d}"
+            uid = f"71000000-{uid_group}-4000-8000-{index:012d}"
             uuids.append(uid)
             peers = []
             for peer in (("a", "b", "d") if node == "c" and mode == "observer-fallback" else ("a", "b") if node == "c" else ("c",)):
@@ -211,12 +224,76 @@ def scenario(case):
                     "peers": peers, "babel": {"enabled": True, "executable": BABEL}}
             if node in ("a", "b"):
                 spec["dynamic_links"] = {"mode": "active" if config.get("initiator", node) == node else "passive", "allow_candidate_prefixes": [wan_prefix]}
+            if node == "b" and config.get("retry_fault", "").startswith("policy-"):
+                spec["dynamic_links"]["mode"] = "off"
+            if node == "a" and config.get("retry_fault") == "retry-blackout":
+                ns("a", "nft", "-f", "-", input=f"""table inet velvet_retry_fault {{
+ chain input {{ type filter hook input priority -20; policy accept;
+ {address_match} saddr {observed_address("b")} meta l4proto udp @th,64,32 {{ 0x01000000, 0x02000000, 0x04000000 }} counter drop
+ }}
+}}""")
             (runtime / f"{node}.json").write_text(json.dumps(spec))
             log = (runtime / f"{node}.log").open("w")
             logs.append(log)
             processes.append(sp.Popen(["ip", "netns", "exec", names[node], DAEMON, "--config", str(runtime / f"{node}.json"), "--reconcile-interval", "1s"], stdout=log, stderr=sp.STDOUT))
         def tentative_clean():
             return all(not any(i.startswith("vdl-") for i in ns(n, "wg", "show", "interfaces").split()) for n in ("a", "b"))
+
+        retry_fault = config.get("retry_fault")
+        if retry_fault:
+            def wait_retry(predicate, description, seconds):
+                until = time.monotonic() + seconds
+                while time.monotonic() < until:
+                    if any(p.poll() is not None for p in processes):
+                        raise AssertionError("velvetd exited during retry test")
+                    if predicate():
+                        return
+                    time.sleep(0.2)
+                raise AssertionError(description)
+
+            def peer_events(kind, status):
+                return [e for e in events("a") if e.get("event") == kind and
+                        e.get("status") == status and e.get("remote_uid") == uuids[1]]
+
+            if retry_fault == "retry-blackout":
+                # Let the complete first attempt fail; a later attempt must use
+                # fresh resources, not just resume a successful UDP handoff.
+                wait_retry(lambda: bool(peer_events("velvet-dynamic-attempt", "failed")),
+                           "WG blackout did not fail first Attempt", 60)
+                assert not connected("a"), "blackout allowed false commit"
+                ns("a", "ping", "-n", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
+                ns("a", "nft", "delete", "table", "inet", "velvet_retry_fault")
+                print(f"{case}: first Attempt failed, fallback works, WG restored", flush=True)
+            else:
+                wait_retry(lambda: bool(peer_events("velvet-dynamic-policy", "denied")),
+                           "policy Decline did not enter denied state", 45)
+                count = len(peer_events("velvet-dynamic-attempt", "proposed"))
+                # Longer than the first retry budget: denial must suppress
+                # proposals without suppressing the UDP query channel.
+                time.sleep(18)
+                assert len(peer_events("velvet-dynamic-attempt", "proposed")) == count, "policy refusal caused repeated proposals"
+                assert tentative_clean(), "policy refusal retained tentative resources"
+                config_path = runtime / "b.json"
+                b_config = json.loads(config_path.read_text())
+                b_config["dynamic_links"]["mode"] = "passive"
+                config_path.write_text(json.dumps(b_config))
+                if retry_fault == "policy-wakeup":
+                    processes[1].send_signal(signal.SIGHUP)
+                    wait_retry(lambda: bool(peer_events("velvet-dynamic-policy", "allowed")),
+                               "passive reload failed to push allowance", 45)
+                else:
+                    # A already consumed its immediate QUERY while B was off.
+                    # Restart B without any peer cache. No push is possible;
+                    # the normal five-minute QUERY must recover admission.
+                    processes[1].terminate()
+                    processes[1].wait(timeout=15)
+                    processes[1] = sp.Popen(["ip", "netns", "exec", names["b"], DAEMON,
+                        "--config", str(config_path), "--reconcile-interval", "1s"],
+                        stdout=logs[1], stderr=sp.STDOUT)
+                    print(f"{case}: B restarted passive without peer cache; waiting for normal query budget", flush=True)
+                    wait_retry(lambda: bool(peer_events("velvet-dynamic-policy", "allowed")),
+                               "periodic query did not recover after publisher restart", 400)
+                print(f"{case}: received versioned allowance", flush=True)
 
         fault_at = None
         deadline = time.monotonic() + 65
@@ -260,11 +337,13 @@ def scenario(case):
                 hs = ns(node, "wg", "show", dynamic[0], "latest-handshakes")
                 assert int(hs.split()[1]) > 0, "missing real WG handshake"
                 handoff = [e for e in events(node) if e.get("event") == "velvet-udp-probe" and e.get("status") == "handoff"]
-                assert len(handoff) == 1, "WG was not preceded by UDP discovery"
-                assert ns(node, "wg", "show", dynamic[0], "listen-port") == handoff[0]["local_endpoint"].rsplit(":", 1)[1], "handoff changed local port"
+                assert handoff, "WG was not preceded by UDP discovery"
+                if retry_fault == "retry-blackout":
+                    assert len(handoff) >= 2, "failed WG attempt was resumed without new UDP discovery"
+                assert ns(node, "wg", "show", dynamic[0], "listen-port") == handoff[-1]["local_endpoint"].rsplit(":", 1)[1], "handoff changed local port"
                 peer = "b" if node == "a" else "a"
-                local_address, _ = split_endpoint(handoff[0]["local_endpoint"])
-                remote_address, remote_port = split_endpoint(handoff[0]["remote_ip"])
+                local_address, _ = split_endpoint(handoff[-1]["local_endpoint"])
+                remote_address, remote_port = split_endpoint(handoff[-1]["remote_ip"])
                 expected_local = wan_addresses[node] if node in public_nodes else lan_address(1 if node == "a" else 2, 2)
                 assert local_address == ipaddress.ip_address(expected_local), "handoff changed source address/family"
                 assert remote_address == ipaddress.ip_address(observed_address(peer)), "handoff did not use expected underlay family/address"
@@ -283,6 +362,8 @@ def scenario(case):
             assert any(e.get("event") == "velvet-dynamic-attempt" and e.get("status") == "proposed" for e in events(initiator)), "selected initiator did not propose"
             assert not any(e.get("event") == "velvet-dynamic-attempt" and e.get("status") == "proposed" for e in events(passive)), "passive node initiated"
             assert any(e.get("event") == "velvet-dynamic-attempt" and e.get("status") == "accepted" for e in events(passive)), "passive node did not accept"
+        if retry_fault:
+            assert len(peer_events("velvet-dynamic-attempt", "proposed")) >= 2, "no new budgeted Proposal"
         if mode == "observer-fallback":
             for node in ("a", "b"):
                 prepared = [e["remote_uid"] for e in events(node) if e.get("event") == "velvet-udp-observe" and e.get("status") == "prepared"]
@@ -379,6 +460,7 @@ def scenario(case):
             wait_for(lambda: all(sum(e.get("event") == "velvet-dynamic-link" and e.get("status") == "up" for e in events(n)) > counts[n] for n in ("a", "b")), "new configuration did not relearn the Link")
             ns("a", "ping", "-n", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
         print(f"velvet real UDP / IPv{family} / WG handoff ({case}): PASS", flush=True)
+        succeeded = True
     except BaseException:
         for node in nodes:
             path = runtime / f"{node}.log"
@@ -411,7 +493,10 @@ def scenario(case):
         for uid in uuids:
             for root in ("/run/velvet", "/var/lib/velvet"):
                 shutil.rmtree(Path(root) / uid, ignore_errors=True)
-        shutil.rmtree(runtime)
+        if succeeded:
+            shutil.rmtree(runtime)
+        else:
+            print(f"failure evidence retained in {runtime}", file=sys.stderr)
 
 
 selected = sys.argv[3:] or CASES

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/inference"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
@@ -108,6 +109,13 @@ func (d *dynamicLinkEngine) commitLink(ctx context.Context, attempt *dynamicAtte
 func (d *dynamicLinkEngine) commitAttemptLocked(attempt *dynamicAttempt) {
 	recovered := attempt.state == dynamicRecovering
 	attempt.state = dynamicUp
+	if t := d.targetForPeerLocked(attempt.remote); t != nil {
+		t.failures = 0
+		t.nextAttempt = time.Time{}
+	}
+	if attempt.localProposal && attempt.session != nil {
+		_ = attempt.session.Close()
+	}
 	if attempt.deadlineTimer != nil {
 		attempt.deadlineTimer.Stop()
 	}
@@ -120,8 +128,8 @@ func (d *dynamicLinkEngine) commitAttemptLocked(attempt *dynamicAttempt) {
 
 // fallbackLocked is the terminal failure decision after a discovery task:
 // stop this Attempt, release its Link, and leave the existing routed path alone.
-// It does not start another task or reset the automatic target's one-shot
-// decision. A stale result cannot stop a replacement Attempt.
+// It schedules a future budgeted opportunity without starting another task.
+// A stale result cannot stop a replacement Attempt.
 //
 // Requires mu. The returned plan must be removed under resourceMu after releasing
 // mu. Decline alone defers removal to allow a crossing winning Proposal to reuse
@@ -131,6 +139,15 @@ func (d *dynamicLinkEngine) fallbackLocked(attempt *dynamicAttempt, reason strin
 		return nil
 	}
 	d.discardAttemptLocked(attempt.remote, attempt)
+	if t := d.targetForPeerLocked(attempt.remote); t != nil {
+		next := time.Now().Add(retryDelay(t.failures))
+		if next.After(t.nextAttempt) {
+			t.nextAttempt = next
+		}
+	}
+	if attempt.localProposal && attempt.session != nil {
+		_ = attempt.session.Close()
+	}
 	d.runner.log(Event{Event: "velvet-dynamic-attempt", Status: "failed", RemoteUID: attempt.remote.String(), Error: reason})
 	if attempt.plan.InterfaceName == "" {
 		return nil

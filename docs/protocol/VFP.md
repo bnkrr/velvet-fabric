@@ -4,7 +4,12 @@
 
 Status: Development protocol specification; wire format not frozen
 Wire version: 1
-Last updated: 2026-09-07
+Last updated: 2026-09-10
+
+This development revision implements the directed policy exchange in Section
+8.17, classified Decline in Section 8.12, and continuous retry in Section 8.11.
+The former one-shot admission profile and operation-ID-only Decline are retired;
+wire Version remains 1 and participating nodes must be upgraded together.
 
 ## Abstract
 
@@ -57,7 +62,8 @@ VFP carries distributed control information between `velvetd` nodes. Version
 - session establishment and peer identity over TCP;
 - node resources, including a node loopback address;
 - Link address negotiation and Link state changes;
-- control information required to establish a Dynamic Link.
+- control information required to establish a Dynamic Link;
+- directed Dynamic-Link admission queries and notifications over routed UDP.
 
 This is one protocol with multiple well-bounded exchanges. A Message Type
 identifies a protocol action or state-machine event. TLVs carry the data needed
@@ -147,8 +153,9 @@ VFP route messages.
 
 VFP uses the same common header and TLV encoding over TCP and UDP, as defined
 in Section 5. TCP carries stateful sessions. UDP carries Link-local discovery
-and liveness on configured WireGuard Links, or authenticated public probes under
-Section 8.16. Message Type and socket context determine which procedure may run.
+and liveness on configured WireGuard Links, authenticated public probes under
+Section 8.16, or routed admission datagrams under Section 8.17. Message Type
+and socket context determine which procedure may run.
 
 TCP provides ordered, reliable octets; VFP framing provides message boundaries.
 UDP preserves datagram boundaries; retransmission is specific to the procedure
@@ -168,6 +175,10 @@ node loopback to the target node loopback through an already working Fabric
 path. A routed session uses the same effective VFP port and common framing as a
 link-bound session. The transport context, rather than a wire field,
 distinguishes the two session kinds.
+
+Admission queries and notifications use UDP between node loopbacks on the same
+effective VFP port. They require neither a TCP session nor a direct Link
+between the endpoints. Section 8.17 defines this separate routed UDP binding.
 
 ### 4.2 Static-Link discovery
 
@@ -255,6 +266,10 @@ authentication, confidentiality, integrity, or replay protection. Matching the
 peer's `NODE_STATE` loopback to the routed target is an internal consistency
 check, not cryptographic authentication. Deployments that do not trust every
 Fabric member MUST NOT enable version-1 Dynamic Links.
+
+Routed policy UDP inherits this same trust boundary. Its source/UID checks and
+policy versions do not add cryptographic authentication or replay protection.
+It MUST NOT be exposed on the public underlay.
 
 ### 4.4 Protocol state
 
@@ -377,8 +392,9 @@ accepted. Invalid Magic, Version, length, TLV structure, or transport context
 causes silent datagram discard; there is no generic UDP error response.
 
 After datagram validation, apply the schema allowed on that socket: link-local
-discovery/liveness on a known WG interface (Sections 4.2 and 8.10), or authenticated PUBLIC_PROBE
-on a leased underlay socket (Section 8.16). Public probes require one canonical
+discovery/liveness on a known WG interface (Sections 4.2 and 8.10), authenticated PUBLIC_PROBE
+on a leased underlay socket (Section 8.16), or routed policy messages addressed
+to the local Fabric loopback (Section 8.17). Public probes require one canonical
 sealed TLV and authenticate it before plaintext decoding. Session messages MUST
 NOT be processed over UDP. There is no UDP OPEN exchange or generic reliability
 layer; each procedure defines its own loss, replay and timing rules.
@@ -493,6 +509,8 @@ points.
 | `0x0c` | `PUBLIC_PROBE` | Authenticated one-way probe on a leased public UDP socket |
 | `0x0d` | `LINK_PING` | Fresh challenge on one negotiated WireGuard Link |
 | `0x0e` | `LINK_PONG` | Echo a Link challenge and optionally report the observed endpoint |
+| `0x0f` | `POLICY_QUERY` | Ask for the sender's Dynamic-Link admission at the destination node |
+| `0x10` | `POLICY_UPDATE` | Publish the sender's Dynamic-Link admission decision for the recipient |
 
 Types `0x01` and `0x02` are TCP messages in both link-bound and routed sessions.
 Types `0x03` and `0x04` are TCP messages in link-bound sessions only; Types
@@ -501,7 +519,8 @@ Their state restrictions remain in Sections 8.3 through 8.14. Types `0x09` and
 `0x0a` are UDP-only, valid solely in the link-local Discovery context of
 Section 4.2. Type `0x0b` is operational routed TCP only; `0x0c` is public
 UDP only, under Section 8.16. Types `0x0d` and `0x0e` are UDP-only
-inside a specific WireGuard Link, under Section 8.10. No new TLV is allocated.
+inside a specific WireGuard Link, under Section 8.10. Types `0x0f` and `0x10`
+are routed UDP only, under Section 8.17; they are not Link PING/PONG extensions.
 
 There is no `OPEN_ACK`, `LINK_REJECT`, or generic error Message Type.
 Dynamic discovery results and termination are DISCOVERY_CONTROL records. A valid peer `OPEN` completes the
@@ -524,6 +543,8 @@ proposal held by session state.
 | `0x0009` | `PROBE_KEY` | 32 | Fresh operation/direction receive key |
 | `0x000a` | `DISCOVERY_DATA` | 45..717 | Bounded discovery control record (Section 8.16) |
 | `0x000b` | `SEALED_PROBE` | 50 or 62 | Context, nonce counter and authenticated ciphertext (Section 8.16) |
+| `0x000c` | `DECLINE_REASON` | 1 | Ordinary or policy rejection of a Dynamic-Link Proposal |
+| `0x000d` | `DYNAMIC_LINK_POLICY` | 9 | Publisher revision and directed Dynamic-Link admission decision |
 
 The following subsections define the complete value syntax. Addresses are
 encoded as network-order octets without text, address-family, or prefix-length
@@ -635,6 +656,29 @@ The enclosing Message Type defines the endpoint's role. In
 that the receiver is asked to try for the current Attempt. Observation and
 Candidate remain distinct protocol concepts but do not require distinct wire
 types.
+
+#### 8.2.8 `DECLINE_REASON`
+
+The value is exactly one octet: `0` means ORDINARY and `1` means POLICY.
+Other values are invalid in this revision. ORDINARY rejects only the current
+Attempt, without asserting a change in admission. POLICY asserts that the
+sender does not currently accept Dynamic-Link negotiation from the recipient.
+Section 8.12 defines the required accompanying fields.
+
+#### 8.2.9 `DYNAMIC_LINK_POLICY`
+
+The value is exactly nine octets, without padding:
+
+```text
+Revision (u64, network byte order) | Accept (u8: 0 or 1)
+```
+
+Revision MUST be nonzero. Accept `0` means not allowed and `1` means allowed;
+other values are invalid. For a message from B to A, the value describes
+`B.accept(A)`, not B's willingness to initiate and not its policy toward other
+nodes. Allowing negotiation does not guarantee candidates, resources, or
+connectivity. No prefixes, candidates, retry delay, expiry or NAT classification
+are encoded. Section 8.17 defines version ownership and merge rules.
 
 ### 8.3 `OPEN`
 
@@ -926,18 +970,18 @@ Subsequent candidates and measurements follow Section 8.16. With no
 Evidence it cannot propose or accept an Attempt. The protocol carries no
 Candidate priority, confidence, source, or NAT classification.
 
-The current automatic profile is one-shot after Node UID binding: an active
-node makes at most one Dynamic-Link decision for each reachable remote `/128`
-in the Fabric loopback prefix per configuration generation, excluding itself
-and existing direct peers. Establishing the routed VFP session used for UID
-binding MAY use up to three total connection attempts to tolerate transient
-route or TCP convergence; failure after that bound exhausts the target for the
-generation.
-Once that routed session reaches operational state, policy refusal, resource
-failure, failed Proposal, or Decline retains the routed path but creates no
-automatic retry in that generation. Passive nodes only respond; disabled nodes
-still send Observations on their existing Links and can serve bounded observer
-leases, but neither propose nor accept Dynamic Links.
+The automatic profile treats local `want_link(peer)` as persistent intent,
+independent of any finite Attempt. A failed Attempt retains the routed fallback
+and releases its tentative resources. While intent remains, failures before or
+after UID binding are eligible for bounded retries under Section 8.17. Policy
+refusal instead selects the lower-frequency UDP query path. A failed Attempt
+MUST NOT permanently exhaust the peer for the configuration generation.
+
+Active nodes produce local intent; passive nodes allow inbound negotiation
+but do not automatically initiate. Disabled nodes neither propose nor accept
+Dynamic Links. Passive and disabled nodes still run the policy UDP receiver;
+disabled nodes remain silent on queries but may publish the transition to
+denial. Existing-Link Observations and bounded observer leases remain available.
 
 ### 8.12 Dynamic-Link messages
 
@@ -964,20 +1008,37 @@ acceptor's frozen parameters:
 | `WG_ENDPOINT` | `1` | Acceptor initial hint |
 | `PROBE_KEY` | `1` | Acceptor fresh receive key |
 
-`DYNAMIC_LINK_DECLINE` states only that the receiver will not participate in
-this Attempt:
+`DYNAMIC_LINK_DECLINE` rejects the current Attempt and classifies the rejection:
 
 | TLV | Cardinality | Meaning |
 |---|---:|---|
 | `OPERATION_ID` | `1` | Exact value copied from the declined Proposal |
+| `DECLINE_REASON` | `1` | ORDINARY (`0`) or POLICY (`1`) |
+| `DYNAMIC_LINK_POLICY` | `0..1` | MUST be present with Accept=0 for POLICY; MAY be present for ORDINARY |
 
-Decline carries no reason, retry delay, policy detail, or NAT classification.
-It ends the initiator's wait without closing a routed session that may carry
-other operations. A receiver sends Decline if local participation or Candidate
-policy rejects the Proposal, a direct Link already exists, resources or a
-complete local Candidate are unavailable, or the two WireGuard keys are
-equal. If an initiator rejects the Candidate returned in an otherwise valid
-Accept, it locally fails the Attempt. END terminates an accepted UDP task.
+For reason POLICY, a missing DYNAMIC_LINK_POLICY or Accept=1 makes the frame
+invalid. For reason ORDINARY, the sender MAY include DYNAMIC_LINK_POLICY as a
+snapshot of its current admission decision and revision, or omit it. Any
+included snapshot MUST satisfy Section 8.2.9. The reason classifies rejection
+of the Attempt; TLV presence alone does not classify it. Decline ends the
+initiator's wait without closing a routed
+session that may carry other operations. An operation-ID-only Decline is no
+longer valid in this internal development revision.
+
+A receiver uses POLICY only when `B.accept(A)` is false, independent of the
+offered candidates and current Attempt resources. Candidate rejection, resource
+or evidence shortage, an existing direct Link, equal WireGuard keys and losing
+simultaneous-proposal arbitration use ORDINARY. The ORDINARY reason alone MUST
+NOT change cached admission; an accompanying DYNAMIC_LINK_POLICY is merged
+independently. An initiator rejecting a candidate in an
+otherwise valid Accept locally fails the Attempt; END still terminates an
+accepted UDP task without publishing policy.
+
+A valid Decline carrying DYNAMIC_LINK_POLICY also supplies the Section 8.17
+cache merge input, using the peer identity established on this routed session.
+An older policy value
+does not overwrite a newer cached decision, but the Decline still ends its
+current Attempt. No Decline carries a remote-controlled retry delay.
 
 Accept and Decline MUST be sent on the routed session that carried the
 Proposal. A response whose `OPERATION_ID` is unknown, ended, or belongs to a
@@ -1001,9 +1062,9 @@ preparation through handoff has a 30-second local deadline from preparation.
 Routed-session loss before completed handoff fails the task. After handoff,
 standard Link establishment has its own 30-second Connectivity Deadline.
 Expiration or local failure removes tentative state and ignores late results;
-the existing routed path remains available. One-shot admission still applies
-after an entire task ends, while its internal rounds may update candidates and
-obtain new evidence within Section 8.16's limits.
+the existing routed path remains available. Section 8.17 controls admission to
+a subsequent Attempt, while internal rounds may update candidates and obtain
+new evidence within Section 8.16's limits.
 
 Either node may initiate. If both initiate concurrently, both retain the
 Attempt whose initiator Node UUID is lexicographically smaller; the larger
@@ -1026,12 +1087,12 @@ adjacency health under Section 8.10. After UDP liveness expires, transition to
 RECOVERING, withdraw adjacency routes/admission, and give the retained WG
 interface a fresh 30-second recovery deadline. Fresh UDP confirmation after
 retained or renewed negotiation returns it to UP. On expiry remove the Dynamic
-Link. This is not a new routed Proposal and does not reset one-shot admission.
+Link. This is not a new routed Proposal and does not reset the retry budget.
 
 Version 1 sends no retransmitted Proposal on one session and defines no
-cancel, success, failure, rollback, or generic error Message. A future
-continuous `want_link` policy MAY apply bounded backoff locally, but it must
-not alter these wire messages or cause a tight retry loop.
+cancel, success, failure, rollback, or generic error Message. A subsequent
+Attempt uses a fresh operation ID and resources, subject to Section 8.17;
+retrying MUST NOT revive a completed operation or cause a tight retry loop.
 
 ### 8.14 Dynamic-Link local resources
 
@@ -1141,7 +1202,8 @@ batch, 12000 transmitted probes, 64 measurements, 8 observer sessions per task,
 session close/END. Cancellation and overflow terminate the affected operation;
 stale operation IDs/rounds cannot revive it. An accepted task retains its
 control session until handoff; losing it before then fails the attempt. Existing
-one-shot admission and smaller-UUID simultaneous-proposal arbitration remain.
+smaller-UUID simultaneous-proposal arbitration remains; admission to subsequent
+Attempts follows Section 8.17.
 
 The local port reservation must cover the binding scope of the eventual WG
 listener. On Linux that includes wildcard IPv4 and IPv6, even for a probe using
@@ -1160,6 +1222,156 @@ final validation commits the Link. Preserve the source address, family, routing
 context and namespace across handoff; if the route would choose a different
 source, fail. Auxiliary sockets and their evidence are released. Every failure
 cleans tentative resources and retains the existing routed Fabric path.
+
+### 8.17 Directed Dynamic-Link policy exchange
+
+This procedure exchanges only a node's admission decision for its recipient.
+There is no global policy database, flooding, subscription handshake, lease,
+ACK, operation ID, query-response correlation, or reliable UDP session. An
+UPDATE is useful independently of any QUERY. Nodes MUST NOT forward received
+updates as their own policy or apply B's decision for A to another recipient.
+
+#### 8.17.1 Routed UDP binding and identity
+
+Both messages use the common Version-1 framing and Section 5.4 datagram limits.
+Each node binds the effective VFP UDP port (default 58420) on its Fabric IPv6
+loopback. Both source and destination ports MUST be the effective VFP port;
+both addresses MUST be Fabric node loopbacks. A reply targets the validated
+sender loopback on that fixed port, never a supplied address or arbitrary
+source port. Normal routing supplies the path; no hop-limit-1 or same-Link
+restriction applies.
+
+An implementation MUST restrict reception to the local Fabric loopback and
+traffic carried by its Fabric Links, and reject external underlay ingress even
+if the packet claims a Fabric source. This listener accepts only POLICY_QUERY
+and POLICY_UPDATE. Other UDP bindings MUST NOT process these messages. It MUST
+remain available independently of active/passive/off mode and link-bound TCP.
+
+Each message carries the sender's NODE_UID. An UPDATE receiver MUST require a
+known UUID/loopback binding learned through VFP OPEN/NODE_STATE and match it to
+the actual datagram source. Unknown UPDATE publishers are silently discarded;
+an UPDATE cannot create a new automatic target or replace an identity binding.
+An initial ordinary routed TCP negotiation learns the binding even if its
+Proposal is declined. Knowing a binding does not require retaining TCP.
+
+A QUERY receiver checks any known binding for consistency. If no binding is
+cached, it MAY evaluate the claimed sender UUID and actual Fabric source under
+Section 4.3's same trusted-member assertion model as OPEN, using bounded local
+storage. The query supplies a return context, not an authenticated identity or
+a committed Link. An allowed peer MUST NOT be denied replies indefinitely
+solely because the publisher restarted or evicted its identity cache; the
+implementation must support such reevaluation. A conflicting known binding,
+self-identity, invalid source/destination context or malformed datagram is
+silently discarded without altering identity state or replying.
+
+These checks provide internal consistency under Section 4.3's trusted-Fabric
+model, not end-to-end authentication. No additional public port, credential
+exchange or encryption envelope is defined by this procedure.
+
+#### 8.17.2 Message schemas
+
+POLICY_QUERY (`0x0f`) asks whether B currently accepts negotiation from A:
+
+| TLV | Cardinality | Meaning |
+|---|---:|---|
+| NODE_UID | `1` | Query sender A |
+
+POLICY_UPDATE (`0x10`) publishes B's current decision for A:
+
+| TLV | Cardinality | Meaning |
+|---|---:|---|
+| NODE_UID | `1` | Policy publisher B |
+| DYNAMIC_LINK_POLICY | `1` | B's revision and B.accept(A) |
+
+The recipient is the owner of the destination loopback; it is not repeated in
+a TLV. Canonical ordering is ascending TLV type. Senders omit the optional
+NODE_UID name in these datagrams; receivers accept its existing Section 8.2.1
+syntax. Canonical frame lengths are 28 octets for QUERY and 41 for UPDATE.
+Neither message creates an Attempt, reserves UDP/WG resources, or commits a
+Link. A valid UPDATE MUST NOT elicit a protocol reply.
+
+#### 8.17.3 Publisher behavior and revision ownership
+
+B maintains or evaluates its local accept set over known peer identities.
+On a false-to-true transition for A it SHOULD send one UPDATE with Accept=1;
+on a true-to-false transition it SHOULD send one UPDATE with Accept=0. Both
+are subject to bounded per-peer and node-wide send limits. Pending changes MAY
+be coalesced to the latest decision; no unbounded notification history is kept.
+
+For a valid QUERY, B sends its current Accept=1 UPDATE when A is allowed,
+subject to send limits. When A is not allowed, B silently discards the QUERY.
+Repeated queries do not themselves change admission or revision. While A
+remains allowed, reachable and querying, send scheduling SHOULD eventually
+permit a reply; rate limiting MUST NOT deliberately starve that peer forever.
+This is not a guarantee of datagram delivery. No policy value is inferred from
+silence.
+
+B owns one nonzero unsigned 64-bit revision counter for its Node UUID. Before
+publishing any changed admission result, it MUST advance and durably reserve
+the counter, then use that revision in DYNAMIC_LINK_POLICY on UDP UPDATE and
+any TCP Decline carrying that TLV.
+One atomic change affecting several recipients MAY use one revision. Decisions
+for different recipients may differ at that revision; a decision for the same
+recipient MUST NOT change at the same revision. A reply uses the current
+revision, even if the most recent change concerned another peer.
+
+B MUST advance the persisted counter before publishing after each process
+restart or policy-runtime recreation. It MUST NOT reset or wrap the counter
+under the same UUID, nor derive it from an unprotected wall clock. Persistence
+failure or exhaustion MUST prevent publication of a version it cannot safely
+reserve. Storage rollback under a retained UUID requires restoring a counter
+above previously published values; silently starting at 1 is not recovery.
+B MUST NOT adopt remote policy content or raise its own revision in response
+to a peer claiming a newer version of B's state.
+
+#### 8.17.4 Receiver merge and local scheduling
+
+A caches the latest policy per publisher UUID for its own local identity.
+The same merge rule applies to DYNAMIC_LINK_POLICY in a validated UPDATE or
+Decline, including an optional snapshot on an ORDINARY Decline:
+
+- No cached value, or a larger revision: accept the new value.
+- Smaller revision: ignore the policy value.
+- Equal revision and equal decision: duplicate, with no additional effect.
+- Equal revision and different decision: invalid policy input; retain the
+  cached decision. A structurally valid Decline still ends its Attempt.
+
+A larger revision with the same decision updates the stored revision but MUST
+NOT reset retry or query budgets. Even a change to Accept=1 only makes local
+scheduling eligible; it MUST NOT bypass backoff, concurrency or rate limits.
+TCP operation/session validation precedes policy merging: a late or unknown
+operation's Decline cannot inject a cache update. Rejected UDP datagrams have
+no state effect.
+
+A maintains two independent sending budgets: one for complete Link Attempts
+(including routed TCP connection failures), and a slower one for policy
+queries. Both need bounded rates and jitter; reception and cache merging are
+not gated by either send budget. Exact intervals are local implementation
+parameters, not negotiated fields. The scheduler follows this table:
+
+| Local condition | Action |
+|---|---|
+| No want_link, an existing usable Link, or a current Attempt | Do not start another Attempt or query |
+| No usable routed Fabric path | Pause sends; route recovery permits reevaluation within the budgets |
+| Unknown remote admission | Permit an initial ordinary negotiation under the Attempt budget |
+| Remote admission allowed | Permit negotiation under the Attempt budget |
+| Remote admission denied | Do not propose; send QUERY under the slower query budget |
+
+Network failure, timeout and candidate rejection do not assert denial. An
+ORDINARY Decline without DYNAMIC_LINK_POLICY leaves admission unchanged; if
+the TLV is present, only its versioned decision can update the cache.
+A later policy change does not extend an in-flight Attempt's
+deadline. This exchange controls admission and future scheduling; it does not
+replace Link liveness or define teardown of an already established Link.
+
+Lost allowance notifications are recovered by later queries; lost denial
+notifications are recovered when a later Proposal receives policy Decline.
+No finite recovery deadline is promised under packet loss or disconnection.
+Peer/cache storage MUST be bounded. Eviction or loss of the local cache
+returns the peer to unknown and MAY cause a new budgeted initial negotiation;
+policy versions only order observations while that local comparison state is
+retained. Cache eviction MUST NOT repeatedly erase the independent send budget
+to create an unbounded stream of fresh attempts.
 
 ## 9. Error Handling
 

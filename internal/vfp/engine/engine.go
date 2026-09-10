@@ -52,7 +52,12 @@ type Session struct {
 }
 
 func (s *Session) Send(value message.Message) error { return s.send(value) }
-func (s *Session) Close() error                     { return s.close() }
+func (s *Session) Close() error {
+	if s.close == nil {
+		return nil
+	}
+	return s.close()
+}
 
 type Result struct {
 	RemoteUID        message.UID

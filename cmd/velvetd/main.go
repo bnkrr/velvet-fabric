@@ -195,11 +195,14 @@ func loadDesired(path string) (*reconcile.DesiredState, error) {
 	return reconcile.BuildDesiredState(nodeSpec)
 }
 
-func startRunner(ctx context.Context, desired *reconcile.DesiredState, interval time.Duration, once bool, logEvent func(velvetruntime.Event)) (*running, error) {
+func startRunner(ctx context.Context, desired *reconcile.DesiredState, interval time.Duration, once bool, logEvent func(velvetruntime.Event), previous ...*velvetruntime.Runner) (*running, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	ready := make(chan error, 1)
 	done := make(chan error, 1)
 	runner := &velvetruntime.Runner{Desired: desired, Reconciler: reconcile.New(linuxbackend.New()), Interval: interval, Log: logEvent, Ready: ready}
+	if len(previous) > 0 {
+		runner.InheritDynamic(previous[0])
+	}
 	go func() { done <- runner.Run(runCtx, once) }()
 	select {
 	case err := <-ready:
@@ -256,7 +259,7 @@ func reload(ctx context.Context, path string, active *running, interval time.Dur
 	}
 	return reloadCandidate(candidate, active,
 		func(desired *reconcile.DesiredState) (*running, error) {
-			return startRunner(ctx, desired, interval, once, logEvent)
+			return startRunner(ctx, desired, interval, once, logEvent, active.runner)
 		},
 		stopRunner, setStatus)
 }

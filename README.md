@@ -316,9 +316,32 @@ omitting the section is equivalent to `off`. The allow-list checks the IP of eve
 offers. Nodes with Dynamic Links off can still serve bounded observer leases
 through their existing Fabric sessions.
 
-For each target, velvetd admits one discovery task per effective configuration
-generation. It first exchanges baseline hints and fresh UDP receive keys over
-routed VFP. Each endpoint then runs its own inference over local evidence,
+For each target, active mode maintains a continuing desire to establish a
+Link. Ordinary failures retry with exponential backoff (10 seconds to a
+five-minute base, plus 0–25% jitter). A policy rejection pauses proposals;
+a separate UDP query budget checks again every five minutes plus jitter.
+Versioned allowance updates make retries eligible without resetting backoff.
+There is at most one live Attempt per peer, with at most four new routed dials
+per second per node. An unavailable Fabric route pauses sends.
+
+Admission uses VFP UDP between Fabric loopbacks, on the VFP port, protected by
+the existing Fabric Links. Passive and off nodes keep this receiver: allowed
+queries receive an update, denied queries are silent. Changed admission is
+also pushed to known peers on effective reload. These are best-effort datagrams,
+not a subscription or a global database. Policy replies have a five-second
+per-peer cooldown and all policy sends share a 16-datagram budget per discovery
+tick (normally once per second).
+The bounded peer cache retains unreachable inactive peers for 30 minutes;
+reload preserves its decisions and independent retry/query budgets.
+
+The publisher revision is durably advanced before runtime startup/reload in
+`/var/lib/velvet/<node-uuid>/dynamic-link-revision`. Preserve this counter with
+the node identity. An invalid/unwritable counter prevents startup rather than
+publishing an older revision. Receiver caches are in memory; after process
+restart an unknown peer can be negotiated again within the local budget.
+
+Each discovery task first exchanges baseline hints and fresh UDP receive keys
+over routed VFP. Each endpoint then runs its own inference over local evidence,
 exchanges bounded candidate batches, and sends encrypted one-way public UDP
 probes. Observation reports return through Fabric; invalid and replayed probes
 receive no response. Failed candidate rounds may actively measure the static

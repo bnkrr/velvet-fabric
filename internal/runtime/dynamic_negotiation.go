@@ -12,8 +12,11 @@ import (
 
 func (d *dynamicLinkEngine) startOutbound(session *engine.Session) error {
 	attempt, err := d.prepareOutbound(session)
-	if err != nil || attempt == nil {
+	if err != nil {
 		return err
+	}
+	if attempt == nil {
+		return session.Close()
 	}
 	if err := session.Send(dynamicLinkMessage(message.DynamicLinkPropose, attempt)); err != nil {
 		d.failAttempt(attempt, "send Proposal failed", dynamicProposing)
@@ -48,15 +51,17 @@ func (d *dynamicLinkEngine) prepareOutbound(session *engine.Session) (*dynamicAt
 	}
 	remoteID := session.RemoteUID.UUID
 	remoteLoopback := session.RemoteLoopbackV6
-	// Reaching operational state completes UID binding. The Dynamic Link
-	// decision is one-shot for this configuration generation.
+	// A policy update may arrive during TCP establishment. Recheck admission
+	// before allocating a fresh Attempt; receipt cannot reset its retry budget.
 	target := d.targets[remoteLoopback]
 	if target == nil {
 		target = &dynamicTarget{}
 		d.targets[remoteLoopback] = target
 	}
-	target.attempted = true
-	target.failures = 0
+	target.uid, target.bound = remoteID, true
+	if !d.active() || (target.policy != nil && !target.policy.Accept) {
+		return nil, nil
+	}
 	if d.runner.hasDirectLink(remoteID) || d.attempts[remoteID] != nil {
 		return nil, nil
 	}
@@ -99,7 +104,12 @@ func (d *dynamicLinkEngine) handleRoutedMessage(session *engine.Session, value m
 func (d *dynamicLinkEngine) handleProposal(session *engine.Session, value message.Message) error {
 	attempt := d.prepareInbound(session, value)
 	if attempt == nil {
-		return session.Send(message.Message{Type: message.DynamicLinkDecline, OperationID: value.OperationID})
+		decline := message.Message{Type: message.DynamicLinkDecline, OperationID: value.OperationID}
+		if !d.allowsInbound() {
+			decline.DeclineReason = message.DeclinePolicy
+			decline.Policy = &message.DynamicLinkPolicy{Revision: d.policyRevision, Accept: false}
+		}
+		return session.Send(decline)
 	}
 	if err := session.Send(dynamicLinkMessage(message.DynamicLinkAccept, attempt)); err != nil {
 		d.failAttempt(attempt, "send Accept failed", dynamicProbing)
@@ -198,6 +208,9 @@ func (d *dynamicLinkEngine) handleDecline(session *engine.Session, value message
 	if attempt == nil {
 		d.runner.log(Event{Event: "velvet-frame", Status: "discarded", Error: "DYNAMIC_LINK_DECLINE references an unknown operation"})
 		return
+	}
+	if target := d.targets[session.RemoteLoopbackV6]; target != nil {
+		d.mergePolicyLocked(target, value.Policy)
 	}
 	// The peer's winning simultaneous Proposal can cross this DECLINE. Delay
 	// deletion so it can reuse the ifindex and avoid a stale IPv6 zone cache.

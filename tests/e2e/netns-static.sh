@@ -28,6 +28,21 @@ cleanup() {
   test -z "${pid_b}" || kill "${pid_b}" 2>/dev/null || true
   ip netns del "${ns_a}" 2>/dev/null || true
   ip netns del "${ns_b}" 2>/dev/null || true
+  python3 - "${runtime}" <<'PYCLEAN'
+import json, pathlib, sys, uuid
+for path in pathlib.Path(sys.argv[1]).glob("*.json"):
+    try:
+        uid = str(uuid.UUID(json.loads(path.read_text())["node"]["uid"]["uuid"]))
+    except (ValueError, KeyError):
+        continue
+    directory = pathlib.Path("/var/lib/velvet") / uid
+    for name in ("dynamic-link-revision", "dynamic-link-revision.lock"):
+        (directory / name).unlink(missing_ok=True)
+    try:
+        directory.rmdir()
+    except OSError:
+        pass
+PYCLEAN
   rm -rf -- "${runtime}"
 }
 trap cleanup EXIT INT TERM

@@ -363,7 +363,7 @@ func TestDynamicCandidateRemainsFrozenAfterEvidenceUpdate(t *testing.T) {
 // Exercise the real routed VFP callbacks and response timer. Only the kernel
 // backend and the remote peer's decision are faked; no connectivity sockets are
 // needed for these failures before an accepted Attempt starts connectivity.
-func TestDynamicRoutedFailureRetainsPathWithoutRetry(t *testing.T) {
+func TestDynamicRoutedFailureRetainsPathAndAllowsBudgetedRetry(t *testing.T) {
 	for _, scenario := range []string{"timeout", "decline", "closed", "rejected-candidate"} {
 		t.Run(scenario, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -412,11 +412,18 @@ func TestDynamicRoutedFailureRetainsPathWithoutRetry(t *testing.T) {
 				if err := d.setEvidence(seed.InterfaceName, 51000, netip.MustParseAddrPort("192.0.2.9:63000")); err != nil {
 					t.Fatal(err)
 				}
-				d.scanLoopbacks(d.ctx)
-				synctest.Wait()
-				if backend.prepared != 1 || len(d.outboundSessions) != 0 || !d.targets[remote.RemoteLoopbackV6].attempted {
-					t.Fatal("store update or discovery restarted the failed target")
+				state := d.targets[remote.RemoteLoopbackV6]
+				state.nextAttempt = time.Now().Add(time.Minute)
+				if d.reserveDial(remote.RemoteLoopbackV6) {
+					t.Fatal("Evidence bypassed backoff")
 				}
+				time.Sleep(time.Minute)
+				if !d.reserveDial(remote.RemoteLoopbackV6) {
+					t.Fatal("failed target never became eligible again")
+				}
+				<-d.outboundSessions
+				d.finishRoutedDial(remote.RemoteLoopbackV6, false)
+
 			})
 		})
 	}

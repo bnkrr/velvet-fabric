@@ -106,14 +106,23 @@ func TestDynamicCleanupDoesNotHoldStateLock(t *testing.T) {
 
 func TestDynamicRoutedDialRetriesAreBounded(t *testing.T) {
 	target := netip.MustParseAddr("fd41::2")
-	dynamic := newDynamicLinkEngine(&Runner{})
-	for attempt := 1; attempt <= maxRoutedDialAttempts; attempt++ {
-		dynamic.targets[target] = &dynamicTarget{dialing: true, failures: uint8(attempt - 1)}
-		dynamic.finishRoutedDial(target, true)
-		exhausted := dynamic.targets[target].attempted
-		if exhausted != (attempt == maxRoutedDialAttempts) {
-			t.Fatalf("attempt %d exhausted=%v", attempt, exhausted)
+	d := newDynamicLinkEngine(&Runner{Desired: &reconcile.DesiredState{LoopbackV6: netip.MustParseAddr("fd41::1")}})
+	for attempt := 1; attempt <= 12; attempt++ {
+		if !d.reserveDial(target) {
+			t.Fatalf("retry %d was permanently exhausted", attempt)
 		}
+		<-d.outboundSessions
+		d.finishRoutedDial(target, true)
+		state := d.targets[target]
+		remaining := time.Until(state.nextAttempt)
+		if remaining < dynamicRetryBase || remaining > dynamicRetryMax*5/4 {
+			t.Fatalf("unbounded delay: %v", remaining)
+		}
+		if d.reserveDial(target) {
+			t.Fatal("retry bypassed backoff")
+		}
+		state.nextAttempt = time.Time{}
+		d.dialWindow = time.Time{}
 	}
 }
 
@@ -122,10 +131,10 @@ func TestRunnerOnceWithoutLinks(t *testing.T) {
 	runner := &Runner{
 		Desired: &reconcile.DesiredState{
 			UUID: uuid.MustParse("10000000-0000-4000-8000-000000000001"),
-			UID:  spec.NodeUID{Name: "test"}, LoopbackV6: netip.MustParseAddr("::1"),
+			UID:  spec.NodeUID{Name: "test"}, LoopbackV6: netip.MustParseAddr("::1"), LoopbackPoolV6: netip.MustParsePrefix("::1/128"),
 		},
 		Reconciler: reconcile.New(backend),
-		Ready:      make(chan error, 1),
+		Ready:      make(chan error, 1), PolicyStateDir: t.TempDir(),
 	}
 	if err := runner.Run(context.Background(), true); err != nil {
 		if strings.Contains(err.Error(), "operation not permitted") {

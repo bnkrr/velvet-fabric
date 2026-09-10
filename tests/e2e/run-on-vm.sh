@@ -70,7 +70,8 @@ case ${1:-all} in
       case ${nat_case} in
         preserve|remap|delayed-remap|blocked|control-loss|random|observer-fallback|lifecycle|v6-lifecycle) remote_tests+=" '${nat_case}'" ;;
         *)
-          if [[ ${nat_case} =~ ^v[46]-single-(preserve|remap|random)-(public|nat)-init$ ||
+          if [[ ${nat_case} =~ ^v[46]-(retry-blackout|policy-wakeup|policy-restart-query)$ ||
+                ${nat_case} =~ ^v[46]-single-(preserve|remap|random)-(public|nat)-init$ ||
                 ${nat_case} =~ ^v6-(native|filtered)-(a|b)-init$ ||
                 ${nat_case} =~ ^v6-dual-(preserve|remap|blocked|random)$ ]]; then
             remote_tests+=" '${nat_case}'"

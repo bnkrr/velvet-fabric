@@ -97,8 +97,10 @@ for node in ${nodes}; do wait_babel "${node}"; done
 
 attempt=0
 while :; do
-  ip netns exec "$(namespace ea)" "${velvetctl}" status --config "${runtime}/ea.json" >"${runtime}/ea.status"
-  grep -q '"ready":true' "${runtime}/ea.status" && break
+  # Babel's ready log precedes velvetd's control socket. A connection miss
+  # belongs inside the existing bounded readiness loop, not shell set -e.
+  if ip netns exec "$(namespace ea)" "${velvetctl}" status --config "${runtime}/ea.json" >"${runtime}/ea.status" 2>"${runtime}/ea.status-error" &&
+     grep -q '"ready":true' "${runtime}/ea.status"; then break; fi
   attempt=$((attempt + 1)); test "${attempt}" -lt 30 || { echo "velvetd did not become ready" >&2; exit 1; }; sleep 1
 done
 grep -q '"state":"running"' "${runtime}/ea.status"

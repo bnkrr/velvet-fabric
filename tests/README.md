@@ -12,7 +12,7 @@ A UDP probe or an algorithm simulation alone does not establish this result.
 | Requirement | Formal coverage |
 |---|---|
 | Existing sparse Fabric becomes a direct mesh | `e2e/netns-dynamic.sh`: eight nodes, eight static and twenty dynamic Links; all 56 directed loopback pings, Domain traffic and routes using dynamic interfaces |
-| Distributed admission and lifecycle | Runtime regressions cover UID validation before commit, simultaneous proposals, reservation reuse and one-shot failure; netns covers passive mode and equivalent reload |
+| Distributed admission and lifecycle | Runtime regressions cover UID validation before commit, simultaneous proposals, reservation reuse, versioned permission and independent retry/query budgets; netns covers passive mode, equivalent reload and retry after failure |
 | Independent local inference and evidence progress | `internal/linkdiscovery/peer_matrix_test.go`: actual `RunPeer` on both sides, separate stores, candidate/round barriers and independent NAT ground truth |
 | IPv4/IPv6 underlay and single public peer | Netns covers native IPv6, IPv6 stateful filtering, single-sided NAT44/NAT66 with both proposal origins, and dual NAT66; packet counters distinguish VFP probes from WG traffic |
 | Active measurement and further candidate rounds | Real dual NAT with forced port translation; delayed control reports; unavailable static observer followed by another Fabric observer |
@@ -155,7 +155,21 @@ are checked separately so routing convergence does not consume the recovery
 window. IPv6 uses
 real NAT66 underlay, not only an IPv6 overlay inside IPv4 WG.
 
-The privileged CI suite and VM helper include all 29 cases:
+Six additional cases cover continuous retry, using the production budgets:
+
+| Cases | Required result |
+|---|---|
+| `v{4,6}-retry-blackout` | WG traffic is blocked until the first Attempt fails while Fabric fallback remains usable; after restoration a fresh Proposal and UDP handoff establish the real direct WG Link |
+| `v{4,6}-policy-wakeup` | Active A receives a policy Decline from off B, does not keep proposing, and releases tentative resources; B reloads passive and its UDP update wakes A before the next slow query |
+| `v{4,6}-policy-restart-query` | B restarts passive without its former peer cache; A recovers permission through its ordinary five-minute-plus-jitter query, without restarting A or accelerating its budget |
+
+The successful retry verifier checks the current WG listen port and endpoint
+against the last handoff, rather than assuming exactly one historical handoff.
+The blackout case additionally requires multiple handoffs. Failed test logs and
+configuration remain in the reported private runtime directory after network
+resources are cleaned up.
+
+The privileged CI suite and VM helper include all 35 cases:
 
 ```sh
 tests/e2e/run-on-vm.sh all
@@ -174,9 +188,20 @@ in the simulator. Mapping expiry, hairpinning, nested NAT, arbitrary route
 changes, background mapping contention and long-duration stability are not
 established by this suite. IPv6 coverage uses one chosen underlay family per
 task; it does not establish dual-stack family selection, NAT64 or NPTv6 behavior.
-The lifecycle case tests a broken VFP connection and deliberate disable/re-enable; it does not prove automatic
-reconnection after arbitrary crashes. Fully failed attempts still follow the
-specified one-shot-per-generation policy.
+Lifecycle and retry cases test deliberate faults, admission transitions and
+publisher restart. They do not prove recovery after arbitrary crashes or
+long-term stability under every network change. Complete failed attempts now
+return to the bounded retry scheduler rather than exhausting a configuration
+generation.
+
+A 2026-09-10 regression run reproduced a separate failure in the eight-node
+`netns-dynamic.sh` managed-Babel SIGKILL recovery step: a remote unreachable
+route remained after the existing 120-second budget. It also reproduced with
+unmodified velvetd `f0898f1` and the same required Babel pin. The complete
+combined suite therefore is not currently green. A supplemental run omitting
+only that crash injection passed the mesh routing, connectivity and equivalent
+reload checks; the formal test retains the crash check and its original budget.
+This does not identify the underlying Babel recovery cause.
 
 Observer listeners are public in these scenarios, including a deliberately
 unavailable bootstrap observer. General observer discovery behind NAT and its
@@ -206,6 +231,18 @@ tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0
 tests/endless/run-on-vm.sh --nodes 4 --rounds 6 --underlay ipv6
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
 ```
+
+## Directed admission protocol regressions
+
+`internal/vfp/message/policy_test.go` checks required/optional admission snapshots,
+classified Decline, invalid revisions, extension handling and transport separation.
+`internal/vfp/policy/socket_test.go` checks destination, source port, Fabric prefix
+and ingress metadata, including underlay traffic claiming a Fabric address.
+Runtime policy tests cover concurrent durable revision reservation, corruption,
+restart, missing publisher cache, source/UUID conflicts, stale/duplicate snapshots,
+late operations, independent budgets, reply coalescing, fairness and bounded caches.
+The ordinary routed failure regressions retain the actual VFP session callbacks,
+response timer and cleanup checks while requiring future retry eligibility.
 
 ## VM test configuration
 

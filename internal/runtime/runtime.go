@@ -25,11 +25,13 @@ type Event struct {
 }
 
 type Runner struct {
-	Desired    *reconcile.DesiredState
-	Reconciler *reconcile.Reconciler
-	Interval   time.Duration
-	Log        func(Event)
-	Ready      chan<- error
+	Desired        *reconcile.DesiredState
+	Reconciler     *reconcile.Reconciler
+	Interval       time.Duration
+	Log            func(Event)
+	Ready          chan<- error
+	PolicyStateDir string // default /var/lib/velvet; persistent across runtime reloads
+	policySeed     map[netip.Addr]*dynamicTarget
 
 	mu      sync.RWMutex
 	states  map[string]materializedState
@@ -241,5 +243,26 @@ func (r *Runner) materializedStates() []materializedState {
 func (r *Runner) log(event Event) {
 	if r.Log != nil {
 		r.Log(event)
+	}
+}
+
+// InheritDynamic preserves peer identity, remote policy and independent budgets
+// across an effective configuration reload. The previous runtime must be stopped.
+func (r *Runner) InheritDynamic(previous *Runner) {
+	if previous == nil || previous.dynamic == nil {
+		return
+	}
+	d := previous.dynamic
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	r.policySeed = make(map[netip.Addr]*dynamicTarget)
+	if r.Desired.UUID != previous.Desired.UUID || r.Desired.LoopbackV6 != previous.Desired.LoopbackV6 || r.Desired.LoopbackPoolV6 != previous.Desired.LoopbackPoolV6 {
+		return
+	}
+	for addr, target := range d.targets {
+		copy := *target
+		copy.dialing = false
+		copy.pendingQuery = false
+		r.policySeed[addr] = &copy
 	}
 }
