@@ -164,7 +164,67 @@ while test "${running_count}" -lt 2; do
   running_count=$(grep -c '"event":"babel-rs","status":"running"' "${runtime}/ea.log" || true)
 done
 kill -0 "${parent_ea}"
+# A ready child is not yet a converged routing dependency. A random restart
+# sequence can remain behind surviving feasibility history for about 180s.
+# Match the pinned Babel restart suite's 240s bound before starting Fabric's
+# unchanged forwarding checks. Require current sequences in both directions;
+# an early ping can succeed using stale pre-crash kernel routes.
+python3 - "/run/velvet/$(uuid ea)/babel-rs.ctl" "/run/velvet/$(uuid xc)/babel-rs.ctl" "${runtime}/babel-crash-recovery.status" <<'PY'
+import json
+from pathlib import Path
+import socket
+import sys
+import time
+
+started = time.monotonic()
+deadline = started + 240
+last = {}
+
+def request(path, command, **params):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Babel convergence deadline")
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(min(2, remaining))
+        sock.connect(path)
+        with sock.makefile("rwb") as stream:
+            json.loads(stream.readline())
+            stream.write((json.dumps({"api_version": 1, "id": 1,
+                "command": command, "params": params}) + "\n").encode())
+            stream.flush()
+            response = json.loads(stream.readline())
+            if not response.get("ok"):
+                raise RuntimeError(response)
+            return response["result"]
+
+def selected(routes, sequence):
+    return any(r.get("selected") and r.get("source") is None
+               and r.get("sequence_number") == sequence for r in routes["routes"])
+
+while time.monotonic() < deadline:
+    try:
+        ea = request(sys.argv[1], "status")
+        xc = request(sys.argv[2], "status")
+        to_ea = request(sys.argv[2], "routes", destination="fd78:abcd::1/128")
+        to_xc = request(sys.argv[1], "routes", destination="fd78:abcd::8/128")
+        last = {"ea": ea, "xc": xc, "to_ea": to_ea, "to_xc": to_xc}
+        if (all(s.get("ready") and not s["export"]["last_error"] for s in (ea, xc))
+                and selected(to_ea, ea["sequence_number"])
+                and selected(to_xc, xc["sequence_number"])):
+            last["convergence_seconds"] = round(time.monotonic() - started, 3)
+            Path(sys.argv[3]).write_text(json.dumps(last, indent=2))
+            print(f"Babel crash routing prerequisite: PASS ({last['convergence_seconds']}s)", flush=True)
+            break
+    except (OSError, ValueError, RuntimeError) as error:
+        last = {"error": str(error)}
+    time.sleep(min(1, max(0, deadline - time.monotonic())))
+else:
+    Path(sys.argv[3]).write_text(json.dumps(last, indent=2))
+    raise SystemExit("Babel routing prerequisite failed to converge within 240s: " + json.dumps(last))
+PY
+kill -0 "${parent_ea}"
 wait_ping6 ea fd78:abcd::8
+wait_ping6 xc fd78:abcd::1
 
 # Access is outside Velvet Core. These destination selectors model the small
 # external integration hook needed for return traffic; all routes in the

@@ -434,3 +434,70 @@ type fakeProbeSocket struct{ local netip.AddrPort }
 func (s *fakeProbeSocket) Endpoint() netip.AddrPort          { return s.local }
 func (s *fakeProbeSocket) Send([]byte, netip.AddrPort) error { return nil }
 func (s *fakeProbeSocket) Close() error                      { return nil }
+
+func TestDynamicWinningProposalReleasesSupersededRoutedSession(t *testing.T) {
+	for _, reuseSession := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reuse-session-%v", reuseSession), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				backend := &runtimeBackend{}
+				d, remote, proposal := dynamicFixture(t, backend)
+				d.runner.Desired.LoopbackV6 = netip.MustParseAddr("fd00::1")
+				d.runner.Desired.LoopbackPoolV6 = netip.MustParsePrefix("fd00::/64")
+				peerConfig := engine.Config{Context: engine.RoutedSession, LocalUID: remote.RemoteUID,
+					LocalLoopbackV6: remote.RemoteLoopbackV6, LoopbackPoolV6: d.runner.Desired.LoopbackPoolV6}
+				if !d.reserveDial(remote.RemoteLoopbackV6) {
+					t.Fatal("could not reserve the original outbound slot")
+				}
+				originalDone := make(chan struct{})
+				localConn, peerConn := net.Pipe()
+				d.workers.Go(func() {
+					defer close(originalDone)
+					defer func() { <-d.outboundSessions }()
+					d.serveRouted(d.ctx, localConn, remote.RemoteLoopbackV6)
+				})
+				d.workers.Go(func() { _ = engine.New(peerConfig).Run(d.ctx, peerConn) })
+				synctest.Wait()
+				old := d.attempts[remote.RemoteUID.UUID]
+				if old == nil || old.state != dynamicProposing {
+					t.Fatal("original routed proposal did not become operational")
+				}
+				winningSession := old.session
+				if !reuseSession {
+					localConfig := engine.Config{Context: engine.RoutedSession,
+						LocalUID:        message.UID{UUID: d.runner.Desired.UUID},
+						LocalLoopbackV6: d.runner.Desired.LoopbackV6, LoopbackPoolV6: d.runner.Desired.LoopbackPoolV6,
+						Operational: func(session *engine.Session) error { winningSession = session; return nil }}
+					incoming, peerIncoming := net.Pipe()
+					d.workers.Go(func() { _ = engine.New(localConfig).Run(d.ctx, incoming) })
+					d.workers.Go(func() { _ = engine.New(peerConfig).Run(d.ctx, peerIncoming) })
+					synctest.Wait()
+					if winningSession == old.session {
+						t.Fatal("winning routed session did not become operational")
+					}
+				}
+				next := d.prepareInbound(winningSession, proposal)
+				synctest.Wait()
+				if next == nil || next == old || d.attempts[old.remote] != next || next.state != dynamicProbing ||
+					backend.prepared != 1 || len(backend.removed) != 0 || next.plan.ListenPort != old.plan.ListenPort {
+					t.Fatal("winning proposal did not retain its reservation and current attempt")
+				}
+				if winningSession.Context.Err() != nil {
+					t.Fatal("arbitration closed the winning session")
+				}
+				select {
+				case <-originalDone:
+					if reuseSession {
+						t.Fatal("still-used routed session was closed")
+					}
+					if len(d.outboundSessions) != 0 || d.targets[remote.RemoteLoopbackV6].dialing {
+						t.Fatal("superseded connection retained its dial slot")
+					}
+				default:
+					if !reuseSession {
+						t.Fatal("superseded routed TCP session remained open")
+					}
+				}
+			})
+		})
+	}
+}

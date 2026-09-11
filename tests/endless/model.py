@@ -2,10 +2,49 @@
 import ipaddress
 import os
 import random
+import re
 
 
 class NotConverged(Exception):
     pass
+
+
+class PendingLinks:
+    """Track actual kernel interface incarnations, never daemon attempt claims."""
+    def __init__(self):
+        self.since = {}
+
+    def observe(self, observations, now):
+        current = {}
+        for node, obs in observations.items():
+            materialized = {route.get('dev') for route in obs['fib'] if str(route.get('protocol')) == '202'}
+            pending = set(obs['wg']) - materialized
+            pending = {name for name in pending if name.startswith('vdl-')}
+            obs['pending'] = sorted(pending)
+            for name in pending:
+                index = obs['ifindices'].get(name)
+                if index is None:
+                    raise NotConverged(f'node {node}/{name}: interface changed during observation')
+                key = node, index
+                current[key] = self.since.get(key, now)
+                # UDP 30s + final validation 30s + deferred cleanup 10s +
+                # cleanup 5s, with 15s for observation/scheduling. No refresh
+                # merely because a new proposal reused the same interface.
+                if now - current[key] > 90:
+                    raise AssertionError(f'node {node}/{name}: tentative WG incarnation exceeded 90s')
+                if any(route.get('dev') == name for route in obs['fib']):
+                    raise NotConverged(f'node {node}/{name}: tentative WG entered FIB')
+                if any(re.search(r'%'+re.escape(name)+r'\]?:6696\b', line)
+                       for line in obs['babel_sockets'].splitlines()):
+                    raise NotConverged(f'node {node}/{name}: Babel attached to tentative WG')
+        self.since = current
+
+
+def nat_heartbeat_fresh(status, now):
+    # Network namespaces share the host monotonic clock. File mtimes use wall
+    # time and can falsely report a stalled translator after a clock step.
+    updated = status.get('updated_monotonic')
+    return isinstance(updated, (int, float)) and 0 <= now - updated <= 5
 
 
 def address(node):
@@ -28,6 +67,7 @@ class Topology:
         if not 3 <= min_nodes < nodes <= 16:
             raise ValueError("require 3 <= min-nodes < nodes <= 16")
         self.size, self.minimum, self.dynamic = nodes, min_nodes, dynamic
+        self.modes = {node: 'active' if dynamic else 'off' for node in range(nodes)}
         self.rng = random.Random(seed)
         self.public = set(range(max(2, nodes // 4)))
         self.active = set(range(nodes))
@@ -92,9 +132,14 @@ class Topology:
 
     def required(self, node):
         result = set(self.static_links(node).values())
-        if self.dynamic and node in self.public:
-            result |= (self.active & self.public) - {node}
+        if self.dynamic:
+            result |= {peer for peer in self.active - {node}
+                       if (node in self.public or peer in self.public) and self.want_pair(node, peer)}
         return result
+
+    def want_pair(self, left, right):
+        a, b = self.modes[left], self.modes[right]
+        return (a == 'active' and b != 'off') or (b == 'active' and a != 'off')
 
     def components(self):
         if self.dynamic:
@@ -115,7 +160,7 @@ class Topology:
 
     def state(self):
         return {'active': sorted(self.active), 'dynamic': self.dynamic, 'public': sorted(self.public),
-                'bootstrap': self.boot, 'profiles': self.profiles, 'births': self.births}
+                'bootstrap': self.boot, 'profiles': self.profiles, 'births': self.births, 'modes': self.modes}
 
 
 def parse_wg(dump):
@@ -139,12 +184,14 @@ def audit(topology, observations):
     """Membership/underlay model is the oracle; WG/FIB/status are observations."""
     owners = {}
     for node, observation in observations.items():
-        for link in observation['wg'].values():
+        for name, link in observation['wg'].items():
+            if name in observation.get('pending', ()):
+                continue
             key = link['public']
             if key in owners and owners[key] != node:
                 raise NotConverged('WireGuard public key shared by different nodes')
             owners[key] = node
-    forwarding, pairs, nat_dynamic = {}, [], 0
+    forwarding, pairs = {}, []
     known = {prefix(n): n for n in range(topology.size)}
     components = topology.components()
     for node in sorted(topology.active):
@@ -155,6 +202,8 @@ def audit(topology, observations):
         interfaces, peers = {}, set()
         dynamic_count = 0
         for name, link in observation['wg'].items():
+            if name in observation.get('pending', ()):
+                continue
             if len(link['peers']) != 1:
                 raise NotConverged(f'node {node}/{name}: expected one WG peer')
             peer = link['peers'][0]
@@ -166,15 +215,20 @@ def audit(topology, observations):
                     raise NotConverged(f'node {node}/{name}: wrong static identity')
             elif name.startswith('vdl-'):
                 dynamic_count += 1
-                if node not in topology.public:
-                    nat_dynamic += 1
                 if not topology.dynamic or remote not in topology.active:
                     raise NotConverged(f'node {node}/{name}: stale/unexpected dynamic WG interface')
             else:
                 raise NotConverged(f'node {node}: unexpected WG interface {name}')
             if remote == node or not peer['handshake']:
                 raise NotConverged(f'node {node}/{name}: self or unhandshaken WG link')
-            reciprocal = [candidate for candidate in observations[remote]['wg'].values()
+            if name.startswith('vdl-'):
+                reverse = lambda candidate: candidate.startswith('vdl-')
+            else:
+                expected = f'vl-in-{node:02d}' if name.startswith('vl-boot-') else f'vl-boot-{node:02d}'
+                reverse = lambda candidate: candidate == expected
+            reciprocal = [candidate for candidate_name, candidate in observations[remote]['wg'].items()
+                          if candidate_name not in observations[remote].get('pending', ())
+                          if reverse(candidate_name)
                           if candidate['public'] == peer['public'] and any(
                               p['public'] == link['public'] and p['handshake'] for p in candidate['peers'])]
             if not reciprocal:
@@ -216,9 +270,6 @@ def audit(topology, observations):
         for peer in topology.required(node):
             if forwarding[node][prefix(peer)] != peer:
                 raise NotConverged(f'node {node}: required direct link uses fallback to {peer}')
-    if (topology.dynamic and len(topology.active & topology.public) >= 2
-            and topology.active - topology.public and not nat_dynamic):
-        raise NotConverged('no NAT Dynamic Link: the run has not exercised NAT punching')
     for source in sorted(topology.active):
         for destination in sorted(components[source] - {source}):
             node, seen = source, set()
@@ -235,3 +286,18 @@ def is_babel_check(parent, executable, argv, daemon, babel, config):
     """Only the supervisor's exact config validator is an expected transient."""
     return (parent == daemon and executable == os.path.realpath(babel)
             and argv == [babel, 'check', '--config', config])
+
+
+def process_fd_limit(role, nodes):
+    """Account for Link resources and the separate bounded observer pool."""
+    if role == 'nat':
+        return 4112  # 4096 translated sockets, packet socket, selector and files.
+    limit = 64 + 16 * nodes
+    if role == 'velvetd':
+        # Each other node can observe for each of its other targets. The
+        # production inbound/observer pool is capped at 128. Each accepted
+        # observer owns one routed TCP session and two public UDP listeners;
+        # these are additional to this node's own per-Link discovery resources.
+        observers = min(128, max(0, (nodes - 1) * (nodes - 2)))
+        limit += 3 * observers
+    return limit

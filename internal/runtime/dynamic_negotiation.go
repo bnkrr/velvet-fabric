@@ -158,6 +158,12 @@ func (d *dynamicLinkEngine) prepareInbound(session *engine.Session, value messag
 		}
 		plan = current.plan
 		d.discardAttemptLocked(remoteID, current)
+		// The losing outbound session no longer owns an Attempt. Closing it
+		// releases its dial slot; a late close callback cannot affect the
+		// replacement. A proposal reusing this same session keeps it alive.
+		if current.session != nil && current.session != session {
+			_ = current.session.Close()
+		}
 	}
 	if cleanup := d.pendingCleanups[remoteID]; cleanup != nil && plan.InterfaceName == "" {
 		plan = cleanup.plan

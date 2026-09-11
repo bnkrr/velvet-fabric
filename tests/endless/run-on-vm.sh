@@ -38,7 +38,8 @@ ssh "${ssh_args[@]}" "${ssh_alias}" "${mkdir_command}"
 # Quote the remote path for scp's remote-shell mode too.
 scp_root=$(python3 -c 'import shlex,sys; print(shlex.quote(sys.argv[1] + "/"))' "${asset_root}")
 scp "${ssh_args[@]}" "${build_dir}/velvetd" "${babel_target}/release/babel-rs" \
-  "${repo_root}/tests/endless/netns.py" "${repo_root}/tests/endless/model.py" "${repo_root}/tests/endless/nat.py" "${ssh_alias}:${scp_root}"
+  "${repo_root}/tests/endless/netns.py" "${repo_root}/tests/endless/model.py" "${repo_root}/tests/endless/nat.py" "${repo_root}/tests/endless/coverage_model.py" \
+  "${repo_root}/tests/endless/mutations.py" "${ssh_alias}:${scp_root}"
 remote_command=$(python3 - "${asset_root}" "$@" <<'PY'
 import shlex
 import sys

@@ -4,19 +4,29 @@ Real velvetd and managed Babel processes run in isolated Linux namespaces.
 Every node is either public or behind a controlled UDP NAT. Each newly added
 node selects **one currently present public node** as its outbound bootstrap.
 Public nodes also participate in deletion/re-add; at least one remains present.
-The harness does not restart or reload surviving nodes to reset discovery state.
+Membership churn does not restart or reload surviving nodes to reset discovery
+state. Explicit online exercises below change only the selected fault/policy.
 
 ```sh
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0 --underlay ipv6
 # Bounded execution of the same loop:
 tests/endless/run-on-vm.sh --nodes 4 --rounds 6 --stable-seconds 3
+# Online changes, followed by one membership mutation (still finite):
+tests/endless/run-on-vm.sh --nodes 4 --rounds 1 --capture \
+  --exercise policy --exercise blackout --exercise control-loss \
+  --exercise nat-reset --exercise nat-rebind
+# Public nodes must initiate toward passive NAT members, including NAT66:
+tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 4 \
+  --underlay ipv6 --nat-policy passive
 ```
 
 `--rounds 0` continues until verifier failure or interruption. The endless
 runner is **not** included in normal E2E `all` or automatically launched by CI;
 only its unprivileged verifier tests run in CI. Root, Linux netns/WireGuard,
 Python 3.11+, iproute2, nftables, ping and sysctl are required on the test host.
+Run finite regressions serially on a small VM: namespace isolation does not
+isolate CPU or kernel work, and parallel suites can exhaust the 5s tool budget.
 
 The wrapper builds locally, including pinned **babel-rs v0.4.1** at
 `b5e15d857d776c60179dcb6078a524b56b3ced94`, using a Git archive rather than sibling
@@ -93,20 +103,30 @@ handshake timestamps, AllowedIPs, runtime committed counts and process state.
 The independent model requires:
 
 - Correct, reciprocal provisioned Links for the selected bootstrap graph.
-- With Dynamic Links enabled, direct connectivity among live public nodes.
-- Additional NAT/public and NAT/NAT Links may succeed or retain a routed fallback.
-  At least one committed NAT Dynamic Link is required while multiple publics
-  and NAT nodes are present, so an all-static run cannot pass as NAT punching.
-  This permits bounded inference failure without incorrectly demanding a full
-  mesh from arbitrary NAT combinations. Any tentative/stale WG interface, missing
-  handshake or incomplete AllowedIPs prevents successful convergence.
+- With Dynamic Links enabled, every public/public and public/NAT pair with
+  `A.want(B) && B.accept(A)` or the reverse must have a direct Link. All fixture
+  profiles can send to a public listener; other successful NAT pairs cannot
+  hide one missing pair. Static bootstrap Links remain required in every mode.
+- NAT/NAT pairs may use direct Links or routed fallback. Every committed WG
+  interface must have a reciprocal peer of the correct interface kind, an actual
+  handshake and complete AllowedIPs. A provisioned peer using the same node key
+  cannot stand in for the reciprocal end of a Dynamic Link.
+- Continual attempts may coexist with valid fallback. A dynamic interface lacking
+  its protocol-202 materialized adjacency must carry no FIB route and have no
+  Babel UDP socket. Its kernel ifindex is tracked independently of daemon state;
+  a tentative incarnation lasting over 90 seconds fails (30s UDP + 30s final
+  validation + 10s deferred cleanup + 5s cleanup, with 15s sampling allowance).
+  Such interfaces never satisfy required neighbors or committed counts.
 - All modeled reachable destinations have active routes using live WG peers.
   Following each best FIB path must reach its owner without cycles. Public/public
-  pairs use their required direct Links; NAT paths may traverse public nodes.
+  and public/NAT pairs use required direct Links; optional NAT/NAT paths may
+  traverse public nodes.
   Removed destinations must leave no unicast learned/materialized route behind.
 - Remote overlay routes never leak into `main`; the local connected loopback and
   ordinary NAT-client underlay default route are allowed.
-- Real IPv6 loopback pings rotate over ordered reachable pairs; a removed node
+- Real IPv6 loopback pings rotate over ordered reachable pairs; every pair must
+  actually pass during each verification phase in addition to the continuous
+  stable audit window. A removed node
   must not answer. With dynamic disabled, reachability follows the provisioned
   graph and deletion may partition it.
 - Exactly one velvetd and one managed Babel process per member, with no unexpected
@@ -130,31 +150,80 @@ Link liveness. Production timers are retained, not shortened by tests.
 | `--nodes` | 6 | Total reusable slots, at most 16 |
 | `--min-nodes` | 3 | Require `3 <= min-nodes < nodes`; includes public slots |
 | `--seed` | 1 | Repeatable topology, bootstrap, profile and add/delete sequence |
-| `--rounds` | 0 | Mutation rounds; zero is unlimited, startup is round 0 |
+| `--rounds` | 0 | Membership rounds after exercises; zero is unlimited, startup is round 0 |
 | `--underlay` | ipv4 | IPv4 NAT/public or IPv6 NAT/public |
 | `--dynamic` | active | `active` or provisioned-graph-only `off` |
+| `--nat-policy` | active | Initial NAT policy, `active` or `passive`; publics stay active |
+| `--exercise` | none | Repeat option for distinct online exercises; each runs once before churn |
+| `--capture` | disabled | Rotating UDP capture on this run's bridge; requires tcpdump |
 | `--settle-timeout` | 180 | Budget for startup/mutation and each convergence phase |
 | `--stable-seconds` | 10 | Required continuous successful audit interval |
 | `--probe-pairs` | 16 | Rotating positive ping pairs per audit |
 | `--rss-growth-mib` | 64 | Allowed per-process rolling median RSS growth |
 | `--artifacts` | unique run directory | Must not already exist |
 
+## Bounded online exercises
+
+These exercises select the first NAT member and a public other than its bootstrap.
+They run after initial convergence and before the requested membership rounds.
+They are explicit, deterministic fault cases, not yet randomized churn events.
+
+| Exercise | Injection and independent acceptance |
+| --- | --- |
+| `policy` | SIGHUP off → passive → original policy. First require old dynamic interfaces to retire within 75s, then require no proposals to/from that node for 18s. Passive must not initiate. Required public links recover. Current SIGHUP replaces the target's runtime/Babel; only that child replacement is allowed, and the old PID must disappear. |
+| `blackout` | Drop one direction of underlay UDP for one established non-bootstrap public/NAT pair for at least 40s. Require withdrawn direct routes and real bidirectional fallback before removing the fault, then recover direct connectivity. |
+| `control-loss` | Block the pair's routed TCP/UDP VFP port, remove only that pair's dynamic WG interfaces and hold at least 20s. Verify actual dropped packets and fallback; restore control and require fresh direct Links. |
+| `nat-reset` | Replace only the translator, clearing all mappings while member/Babel stay alive. The replacement must forward real traffic and all required direct paths recover. |
+| `nat-rebind` | Clear mappings, change the router WAN address and switch preserve/offset allocation. Public WG observations must use the new WAN endpoint; all required paths recover without restarting velvetd/Babel. |
+
+Fault windows and recovery phases are separate. The recovery budget and production
+retry timers are unchanged. Packet counters prove the injected drop matched real
+traffic. Except for the explicitly reloaded policy target's managed Babel, all
+existing velvetd/Babel PIDs must remain unchanged. These cases do not claim broad
+partition, dual-stack switching, multi-layer NAT or all observer-failure coverage.
+
 ## Records, resources and stopping
 
 The finite slot pool bounds state. Per current process, RSS samples use a
 60-entry deque. After five minutes and 60 samples, a rolling median becomes its
-baseline; subsequent growth beyond the configured allowance fails. FD budgets
-are `64 + 16 * nodes` for member processes and 4112 for a NAT process. A short
-run does not establish an RSS plateau or prove leak freedom.
+baseline; subsequent growth beyond the configured allowance fails. The base FD
+budget is `64 + 16 * nodes`, where `nodes` is the configured slot count. Velvetd
+also allows `3 * min(128, max(0, (nodes - 1) * (nodes - 2)))` FDs for the bounded
+observer pool: each lease can add one routed TCP connection and two UDP listeners.
+Babel uses only the base budget; a NAT process has a separate limit of 4112.
+A short run does not establish an RSS plateau or prove leak freedom.
+
+The old per-Link-only estimate under-counted shared public observers during
+simultaneous discovery. The real observer-concurrency regression in
+`tests/directed/` also drains leases and requires all temporary public UDP/routed
+TCP sockets to close and FDs to return below the original per-Link ceiling,
+in addition to the normal shutdown ownership audit.
+
+Each NAT translator publishes a heartbeat on the shared host monotonic clock.
+A heartbeat older than five seconds fails verification; wall-clock corrections
+do not change this budget or depend on status-file modification times.
 
 Artifacts use umask 077:
 
 - Manifest: arguments, initial topology/profiles, binary hashes, Python/kernel
   versions, runner PID, unique `vfe-...` namespace prefix, bridge and UUIDs.
-- Exact copied `netns.py`, `model.py`, `nat.py` runtime sources.
+- Exact copied `netns.py`, `model.py`, `nat.py`, `coverage_model.py`, `mutations.py`
+  runtime sources.
 - Rotating `events.jsonl` (about 16 MiB with backups), `samples.jsonl` (about
   2 MiB), per-slot daemon logs (about 2 MiB per slot).
 - Atomically replaced `latest.json` with current topology and complete audit.
+- `coverage.json`: cumulative verified samples by family/profile/policy/requirement/
+  outcome, latest ordered node pairs, actual ping and local/remote proposal counts.
+  Pair counts reset on birth or NAT replacement; sampled outcome does not invent
+  an initiator when no proposal was observed. A finite run reports only the
+  profiles actually verified, not all 36 merely because they exist in the catalog.
+- Rotating `observations.jsonl` (about 12 MiB): intermediate kernel WG counters,
+  routes, Babel sockets and actual ifindices, including partial reads before a
+  later node fails. Each sample and daemon log carries host-monotonic elapsed
+  time and round; events also identify the current exercise phase.
+- Optional `underlay.pcap*` (3 × about 10 MB, 256-byte snapshot length). Capture
+  startup and continued process liveness are checked; `capture.log` retains
+  tcpdump's final packet/drop statistics. This captures underlay UDP only.
 - On failure/interruption: `failure.json`, bounded-time WG/kernel/socket/control
   diagnostics, NAT state/error records, configs and Babel state. Configs contain
   test credentials; raw WG private/preshared keys are discarded from observations.

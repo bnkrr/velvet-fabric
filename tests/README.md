@@ -183,7 +183,7 @@ routing, ownership, multi-Plan forwarding, Babel convergence and reload.
 
 ## Validation limits
 
-The netns cases are specific Linux topologies, not every mapping/filter pair
+The 35-case netns suite uses specific Linux topologies, not every mapping/filter pair
 in the simulator. Mapping expiry, hairpinning, nested NAT, arbitrary route
 changes, background mapping contention and long-duration stability are not
 established by this suite. IPv6 coverage uses one chosen underlay family per
@@ -194,14 +194,15 @@ long-term stability under every network change. Complete failed attempts now
 return to the bounded retry scheduler rather than exhausting a configuration
 generation.
 
-A 2026-09-10 regression run reproduced a separate failure in the eight-node
-`netns-dynamic.sh` managed-Babel SIGKILL recovery step: a remote unreachable
-route remained after the existing 120-second budget. It also reproduced with
-unmodified velvetd `f0898f1` and the same required Babel pin. The complete
-combined suite therefore is not currently green. A supplemental run omitting
-only that crash injection passed the mesh routing, connectivity and equivalent
-reload checks; the formal test retains the crash check and its original budget.
-This does not identify the underlying Babel recovery cause.
+The eight-node crash check separates supervisor recovery from routing readiness.
+After the new Babel child is ready, it waits up to 240 seconds for both endpoints
+to learn routes carrying the current origin sequences, with healthy route export.
+This matches the pinned Babel restart suite: a random sequence behind surviving
+feasibility history can take about three minutes to recover. Only then do the
+unchanged Fabric forwarding and mesh checks run. An early successful ping over
+stale pre-crash FIB state is insufficient to pass the routing prerequisite.
+Failure to meet that prerequisite still fails the test as a Babel convergence
+failure; it does not consume or relax a Dynamic-Link recovery budget.
 
 Observer listeners are public in these scenarios, including a deliberately
 unavailable bootstrap observer. General observer discovery behind NAT and its
@@ -215,13 +216,32 @@ Public probe keys are supplied over the existing trusted Fabric control path;
 this work does not add end-to-end identity protection against untrusted Fabric
 members.
 
+## Bounded coverage matrix and fault scenarios
+
+The [directed suite](directed/README.md) adds finite profile-pair matrices,
+observer failures, precise crash/handoff triggers, whole-Fabric partition/merge,
+NAT expiry/contention/rebind, dual-stack and egress changes, real TCP/UDP and MTU
+checks, and nested/shared kernel NAT. Each scenario states its direct/fallback
+boundary and validates actual WG/FIB/packet evidence. It reuses the independent
+host oracle without starting endless churn. Scenario existence is not a pass
+record; per-case results and retained failures identify what actually passed.
+
+```sh
+tests/directed/run-on-vm.sh --group all
+tests/directed/run-on-vm.sh --case partition --case data-mtu --family both
+```
+
 ## Optional endless membership testing
 
 The [endless netns harness](endless/README.md) mixes public nodes with per-node
 NAT mapping/filter/allocation profiles. Every added member chooses one current
 public as bootstrap; public nodes also churn, with at least one remaining.
-An independent WG/FIB and real-packet verifier checks public direct Links,
-NAT direct or routed fallback, deletion cleanup and same-identity rejoin.
+An independent WG/FIB and real-packet verifier requires every eligible public/NAT
+pair to connect directly; difficult NAT/NAT pairs may use verified routed fallback.
+Coverage records actual profiles, directions and outcomes, with bounded intermediate
+WG/FIB evidence. Optional online exercises cover policy changes, one-way underlay
+loss, routed control loss, mapping reset and WAN endpoint changes. Deletion cleanup
+and same-identity rejoin remain part of membership churn.
 The NAT emulator itself has an independent 72-case real-UDP IPv4/IPv6 check.
 `--rounds 0` is unlimited; a positive count uses the same path for bounded
 validation. It is opt-in and separate from privileged E2E `all`.

@@ -19,7 +19,9 @@ import threading
 import time
 import uuid
 
-from model import Topology, NotConverged, address, audit, parse_wg, is_babel_check
+from model import process_fd_limit
+from model import Topology, PendingLinks, NotConverged, address, audit, parse_wg, is_babel_check, nat_heartbeat_fresh
+from coverage_model import Coverage
 
 
 class StopRequested(BaseException):
@@ -36,6 +38,11 @@ def arguments():
     parser.add_argument("--rounds", type=int, default=0, help="0: until failure or interruption")
     parser.add_argument("--underlay", choices=("ipv4", "ipv6"), default="ipv4")
     parser.add_argument("--dynamic", choices=("active", "off"), default="active")
+    parser.add_argument("--nat-policy", choices=("active", "passive"), default="active")
+    parser.add_argument("--capture", action="store_true", help="bounded bridge UDP capture; requires tcpdump")
+    parser.add_argument("--exercise", action="append", default=[],
+                        choices=("policy", "blackout", "control-loss", "nat-reset", "nat-rebind"),
+                        help="run each selected online mutation once before membership churn")
     parser.add_argument("--settle-timeout", type=float, default=180)
     parser.add_argument("--stable-seconds", type=float, default=10)
     parser.add_argument("--probe-pairs", type=int, default=16)
@@ -52,6 +59,13 @@ def arguments():
         topology = Topology(args.nodes, args.min_nodes, args.seed, args.dynamic == "active")
     except ValueError as error:
         parser.error(str(error))
+    if args.dynamic == 'off' and (args.exercise or args.nat_policy != 'active'):
+        parser.error('--exercise and --nat-policy require active dynamic discovery')
+    if len(args.exercise) != len(set(args.exercise)):
+        parser.error('duplicate --exercise')
+    if args.dynamic == 'active':
+        for node in set(range(args.nodes)) - topology.public:
+            topology.modes[node] = args.nat_policy
     if args.plan:
         if not args.rounds:
             parser.error("--plan requires positive --rounds")
@@ -88,6 +102,14 @@ class Runner:
         self.started, self.deadline = time.monotonic(), None
         self.stop_signal = None
         self.latest = {}
+        self.coverage = Coverage(args.underlay)
+        self.pending_links = PendingLinks()
+        self.capture = None
+        self.wan_epochs = {node: 0 for node in range(topology.size)}
+        self.nat_epochs = {node: 0 for node in range(topology.size)}
+        self.phase = 'membership'
+        self.last_mismatch = None
+        self.snapshots = rotating_logger(artifacts / 'observations.jsonl', 4 * 1024 * 1024, 2)
         self.events = rotating_logger(artifacts / "events.jsonl", 4 * 1024 * 1024, 3)
         self.samples = rotating_logger(artifacts / "samples.jsonl", 1024 * 1024, 1)
         self.logs = {}
@@ -98,7 +120,7 @@ class Runner:
         temporary.replace(self.artifacts / name)
 
     def record(self, kind, **fields):
-        entry = {"kind": kind, "round": self.round, "elapsed": round(time.monotonic() - self.started, 3), **fields}
+        entry = {"kind": kind, "round": self.round, "elapsed": round(time.monotonic() - self.started, 3), "phase": self.phase, **fields}
         value = json.dumps(entry)
         self.events.info(value)
         print(value, flush=True)
@@ -130,7 +152,8 @@ class Runner:
         return self.run("ip", "-n", self.namespace(node), *args, **kwargs)
 
     def wan(self, node):
-        return f"192.0.2.{node + 1}" if self.args.underlay == "ipv4" else f"2001:db8:ee::{node + 1:x}"
+        host = node + 1 + 128 * (self.wan_epochs[node] % 2)
+        return f"192.0.2.{host}" if self.args.underlay == "ipv4" else f"2001:db8:ee::{host:x}"
 
     def endpoint(self, node, port):
         value = self.wan(node)
@@ -167,6 +190,14 @@ class Runner:
                 path.mkdir(parents=True, exist_ok=False)
                 self.owned_dirs.add(path)
         self.psk = self.run("wg", "genpsk")
+        if self.args.capture:
+            with (self.artifacts / 'capture.log').open('w') as log:
+                self.capture = sp.Popen(['tcpdump', '-Z', 'root', '-i', self.bridge, '-n', '-U',
+                    '-s', '256', '-C', '10', '-W', '3', '-w', str(self.artifacts / 'underlay.pcap'), 'udp'],
+                    stdout=sp.DEVNULL, stderr=log)
+            time.sleep(0.1)
+            if self.capture.poll() is not None:
+                raise RuntimeError('packet capture failed to start; see capture.log')
 
     def write_config(self, node):
         peers = []
@@ -191,7 +222,7 @@ class Runner:
             'node': {'uid': {'name': f'n{node}', 'uuid': self.uids[node]},
                      'private_key': self.keys[node], 'loopback_address_v6': address(node)},
             'peers': peers, 'babel': {'enabled': True, 'executable': str(self.args.babel.resolve())},
-            'dynamic_links': {'mode': self.args.dynamic, 'allow_candidate_prefixes': [
+            'dynamic_links': {'mode': self.topology.modes[node], 'allow_candidate_prefixes': [
                 '192.0.2.0/24' if self.args.underlay == 'ipv4' else '2001:db8:ee::/64']}}
         (self.runtime / f'{node}.json').write_text(json.dumps(spec))
 
@@ -242,16 +273,15 @@ class Runner:
  oifname "wan" icmpv6 type destination-unreachable drop
  }
 }""")
-            mapping, filtering, allocation = self.topology.profiles[node]
-            (self.runtime / f'nat-{node}.json').unlink(missing_ok=True)
-            log = (self.runtime / f'nat-{node}.log').open('w')
-            process = sp.Popen(['ip', 'netns', 'exec', self.namespace(outer), 'python3',
-                str(Path(__file__).with_name('nat.py')), '--wan', self.wan(node), '--mapping', mapping,
-                '--filter', filtering, '--allocation', allocation, '--seed', str(self.args.seed + node),
-                '--status', str(self.runtime / f'nat-{node}.json')], stdout=log, stderr=sp.STDOUT)
-            log.close()
-            self.nat_processes[node] = process
+            self.start_nat(node)
+        self.coverage.reset(node)
         self.write_config(node)
+        self.start_daemon(node)
+
+    def on_event(self, node, event):
+        """Optional bounded-test instrumentation; never an acceptance oracle."""
+
+    def start_daemon(self, node):
         logger = self.logs.get(node)
         if logger is None:
             logger = rotating_logger(self.artifacts / f"node-{node}.log", 1024 * 1024, 1)
@@ -265,12 +295,41 @@ class Runner:
         def drain():
             with proc.stdout:
                 while chunk := proc.stdout.readline(65536):
-                    logger.info(chunk.decode(errors="replace").rstrip("\n"))
+                    line = chunk.decode(errors="replace").rstrip("\n")
+                    try:
+                        event = json.loads(line)
+                        event['observed_elapsed'] = round(time.monotonic() - self.started, 6)
+                        event['observed_round'] = self.round
+                        self.on_event(node, event)
+                        if event.get('event') == 'velvet-dynamic-attempt' and event.get('status') == 'proposed':
+                            remote = next((n for n, uid in self.uids.items() if uid == event.get('remote_uid')), None)
+                            if remote is not None:
+                                self.coverage.proposed(node, remote)
+                        line = json.dumps(event)
+                    except (ValueError, TypeError):
+                        pass
+                    logger.info(line)
 
         thread = threading.Thread(target=drain, daemon=True)
         info["thread"] = thread
         thread.start()
         self.record("node-start", node=node, pid=proc.pid, bootstrap=self.topology.boot[node], profile=self.topology.profiles[node])
+
+    def start_nat(self, node):
+        mapping, filtering, allocation = self.topology.profiles[node]
+        (self.runtime / f'nat-{node}.json').unlink(missing_ok=True)
+        with (self.runtime / f'nat-{node}.log').open('w') as log:
+            self.nat_processes[node] = sp.Popen(['ip', 'netns', 'exec', self.namespace(f'r{node}'), 'python3',
+                str(Path(__file__).with_name('nat.py')), '--wan', self.wan(node), '--mapping', mapping,
+                '--filter', filtering, '--allocation', allocation,
+                '--seed', str(self.args.seed + node + self.nat_epochs[node]),
+                '--status', str(self.runtime / f'nat-{node}.json'), *self.nat_options(node)], stdout=log, stderr=sp.STDOUT)
+
+    def nat_options(self, node):
+        return []
+
+    def expected_helpers(self, node):
+        return set()
 
     def stop_node(self, node, abrupt=False):
         info = self.nodes[node]
@@ -314,7 +373,8 @@ class Runner:
 
     def resources(self, node, role, pid):
         info = self.nodes[node]
-        sample = info["resources"].setdefault(role, {"pid": pid, "rss": deque(maxlen=60), "baseline": None})
+        sample = info["resources"].setdefault(role, {"pid": pid, "started": time.monotonic(),
+                                                    "rss": deque(maxlen=60), "baseline": None})
         if sample["pid"] != pid:
             raise RuntimeError(f"node {node}: unexpected {role} process replacement")
         try:
@@ -325,17 +385,30 @@ class Runner:
             raise RuntimeError(f"node {node}: {role} process disappeared") from None
         sample["rss"].append(rss)
         median = statistics.median(sample["rss"])
-        if time.monotonic() - info["started"] >= 300 and len(sample["rss"]) == 60:
+        if time.monotonic() - sample['started'] >= 300 and len(sample["rss"]) == 60:
             if sample["baseline"] is None:
                 sample["baseline"] = median
             elif median > sample["baseline"] + self.args.rss_growth_mib * 1024:
                 raise RuntimeError(f"node {node}: {role} median RSS grew beyond budget")
-        if fds > (4112 if role == 'nat' else 64 + 16 * self.topology.size):
-            raise RuntimeError(f"node {node}: {role} FD count exceeds pool-sized budget")
+        limit = process_fd_limit(role, self.topology.size)
         self.samples.info(json.dumps({"round": self.round, "node": node, "role": role, "pid": pid,
-            "rss_kib": rss, "fds": fds, "baseline_kib": sample["baseline"]}))
+            "rss_kib": rss, "fds": fds, "fd_limit": limit, "baseline_kib": sample["baseline"]}))
+        if fds > limit:
+            raise RuntimeError(f"node {node}: {role} FD count {fds} exceeds pool-sized budget {limit}")
 
     def observe(self):
+        try:
+            if self.capture is not None and self.capture.poll() is not None:
+                raise RuntimeError('packet capture exited unexpectedly; see capture.log')
+            observations = self._observe()
+            self.pending_links.observe(observations, time.monotonic())
+            return observations
+        finally:
+            self.snapshots.info(json.dumps({'round': self.round, 'phase': self.phase,
+                'elapsed': round(time.monotonic() - self.started, 6),
+                'observations': self.latest}))
+
+    def _observe(self):
         self.latest = {}
         for node, info in sorted(self.nodes.items()):
             if info["proc"].poll() is not None:
@@ -353,7 +426,7 @@ class Runner:
                 raise NotConverged(f"node {node}: waiting for managed Babel")
             self.resources(node, "babel", child)
             pids = {int(pid) for pid in self.run("ip", "netns", "pids", self.namespace(node)).split()}
-            expected = {info["proc"].pid, child}
+            expected = {info["proc"].pid, child} | self.expected_helpers(node)
             if not expected <= pids:
                 raise RuntimeError(f"node {node}: missing expected namespace process: {pids}")
             extra = pids - expected
@@ -387,11 +460,13 @@ class Runner:
                 profile = tuple(nat_status[key] for key in ('mapping', 'filter', 'allocation'))
                 if profile != tuple(self.topology.profiles[node]):
                     raise RuntimeError(f'node {node}: NAT fixture is running the wrong profile')
-                if time.time() - path.stat().st_mtime > 5:
+                if not nat_heartbeat_fresh(nat_status, time.monotonic()):
                     raise RuntimeError(f'node {node}: NAT fixture stalled')
-            self.latest[node] = {"status": status, 'nat': nat_status, "wg": parse_wg(self.ns(node, "wg", "show", "all", "dump")),
+            self.latest[node] = {"observed_elapsed": round(time.monotonic() - self.started, 6), "status": status, 'nat': nat_status, "wg": parse_wg(self.ns(node, "wg", "show", "all", "dump")),
                 "fib": json.loads(self.ip(node, "-6", "-j", "route", "show", "table", "20000")),
-                "main": json.loads(self.ip(node, "-6", "-j", "route", "show", "table", "main"))}
+                "main": json.loads(self.ip(node, "-6", "-j", "route", "show", "table", "main")),
+                "ifindices": {link['ifname']: link['ifindex'] for link in json.loads(self.ip(node, '-j', 'link', 'show', 'type', 'wireguard'))},
+                "babel_sockets": self.ns(node, 'ss', '-H', '-uan', 'sport', '=', ':6696')}
         return self.latest
 
     def ping(self, source, target):
@@ -406,31 +481,43 @@ class Runner:
 
     def probes(self, pairs):
         count = min(self.args.probe_pairs, len(pairs))
+        passed = set()
         for index in range(count):
             pair = pairs[(self.probe_cursor + index) % len(pairs)]
             if not self.ping(*pair):
                 raise NotConverged(f"data-plane probe failed {pair}")
+            self.coverage.ping(*pair)
+            passed.add(pair)
         self.probe_cursor += count
         absent = sorted(set(range(self.topology.size)) - self.topology.active)
         if absent:
             source = sorted(self.topology.active)[self.round % len(self.topology.active)]
             if self.ping(source, absent[self.round % len(absent)]):
                 raise NotConverged("deleted node still answers")
+        return passed
 
     def verify(self, survivors=()):
         start, good_since, last_report = time.monotonic(), None, 0
         self.deadline = start + self.args.settle_timeout
         reason = "waiting for first audit"
+        self.last_mismatch = None
+        probed = set()
         while time.monotonic() < self.deadline:
             # NAT fallback may use the node being removed. Sample forwarding
             # inside the same bounded convergence window, not as an assumed
             # unaffected direct path inherited from the old full-mesh fixture.
             try:
                 pairs = audit(self.topology, self.observe())
-                self.probes(pairs)
+                probed.update(self.probes(pairs))
                 if good_since is None:
                     good_since = time.monotonic()
-                if time.monotonic() - good_since >= self.args.stable_seconds:
+                if time.monotonic() - good_since >= self.args.stable_seconds and set(pairs) <= probed:
+                    if self.args.nat_policy == 'passive':
+                        for node in self.topology.active - self.topology.public:
+                            if any(self.coverage.proposals[node, peer] for peer in self.topology.active - {node}):
+                                raise AssertionError(f'passive NAT node {node} initiated a proposal')
+                    self.coverage.verified(self.topology, self.latest)
+                    self.save("coverage.json", self.coverage.state())
                     self.save("latest.json", {"round": self.round, "topology": self.topology.state(), "observations": self.latest})
                     self.record("verified", seconds=round(time.monotonic() - start, 3), active=sorted(self.nodes),
                                 pairs=len(pairs), operations=self.counts, public=sorted(self.topology.active & self.topology.public))
@@ -439,6 +526,7 @@ class Runner:
                 reason = "checking stable window"
             except NotConverged as error:
                 good_since, reason = None, str(error)
+                self.last_mismatch = reason
             if time.monotonic() - last_report >= 30:
                 self.record("waiting", reason=reason)
                 last_report = time.monotonic()
@@ -451,7 +539,18 @@ class Runner:
         for node in sorted(self.topology.active):
             self.add_node(node)
         self.verify()
-        while self.args.rounds == 0 or self.round < self.args.rounds:
+        if self.args.exercise:
+            from mutations import exercise
+            for name in self.args.exercise:
+                self.round += 1
+                self.phase = name
+                exercise(self, name)
+                self.coverage.operations[name] += 1
+                self.save('coverage.json', self.coverage.state())
+            self.phase = 'membership'
+        membership_round = 0
+        while self.args.rounds == 0 or membership_round < self.args.rounds:
+            membership_round += 1
             self.round += 1
             self.deadline = time.monotonic() + self.args.settle_timeout
             previous = self.topology.active.copy()
@@ -463,13 +562,16 @@ class Runner:
                 self.stop_node(event["node"], event["abrupt"])
                 self.counts["abrupt" if event["abrupt"] else "graceful"] += 1
             self.counts[event["operation"]] += 1
+            self.coverage.operations[event["operation"]] += 1
             self.verify(sorted(previous & self.topology.active))
         self.record("complete", result="PASS", operations=self.counts)
 
     def snapshot_failure(self, error):
         self.deadline = None
         self.record("stopped", reason=str(error))
-        self.save("failure.json", {"round": self.round, "error": str(error), "topology": self.topology.state(),
+        self.save("coverage.json", self.coverage.state())
+        self.save("failure.json", {"round": self.round, "phase": self.phase, "error": str(error),
+                                  "last_verifier_mismatch": self.last_mismatch, "topology": self.topology.state(),
                                   "observations": self.latest, "operations": self.counts})
         self.deadline = time.monotonic() + 30
         for node in sorted(self.created):
@@ -498,6 +600,14 @@ class Runner:
         self.deadline = None
         self.stop_signal = None
         errors = []
+        if self.capture is not None:
+            if self.capture.poll() is None:
+                self.capture.send_signal(signal.SIGINT)
+            try:
+                self.capture.wait(timeout=5)
+            except sp.TimeoutExpired:
+                self.capture.kill(); self.capture.wait(timeout=3)
+                errors.append('packet capture required forced cleanup')
         for info in self.nodes.values():
             if info["proc"].poll() is None:
                 info["proc"].terminate()
@@ -562,7 +672,7 @@ class Runner:
             except OSError as error:
                 errors.append(str(error))
         self.record("cleanup", result="FAIL" if errors else "PASS", errors=errors)
-        for logger in (self.events, self.samples, *self.logs.values()):
+        for logger in (self.events, self.samples, self.snapshots, *self.logs.values()):
             for handler in logger.handlers:
                 handler.close()
         return errors
@@ -571,15 +681,20 @@ class Runner:
 def main():
     args, topology = arguments()
     if args.plan:
-        print(json.dumps({"seed": args.seed, "nodes": args.nodes, "initial": topology.state()}))
+        print(json.dumps({"seed": args.seed, "nodes": args.nodes, "initial": topology.state(),
+                          "exercise_prelude": args.exercise}))
+        if 'nat-rebind' in args.exercise:
+            node = min(topology.active - topology.public)
+            mapping, filtering, allocation = topology.profiles[node]
+            topology.profiles[node] = (mapping, filtering, 'offset' if allocation == 'preserve' else 'preserve')
         for round_number in range(1, args.rounds + 1):
-            print(json.dumps({"round": round_number, "event": topology.next_event(), "state": topology.state()}))
+            print(json.dumps({"round": len(args.exercise) + round_number, "event": topology.next_event(), "state": topology.state()}))
         return 0
     if args.validate:
         return 0
     if os.geteuid() != 0:
         raise SystemExit("requires root on a disposable Linux test host")
-    for tool in ("ip", "wg", "nft", "ping", "sysctl", "ss"):
+    for tool in ("ip", "wg", "nft", "ping", "sysctl", "ss", *(("tcpdump",) if args.capture else ())):
         if not shutil.which(tool):
             raise SystemExit(f"missing {tool}")
     os.umask(0o077)
@@ -594,7 +709,7 @@ def main():
         runner.save("manifest.json", {"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "sha256": hashes, "kernel": os.uname().release, "python": os.sys.version, "pid": os.getpid(),
             "namespace_prefix": f"vfe-{runner.token}-", "bridge": runner.bridge, "uids": runner.uids, "topology": topology.state()})
-        for name in ("netns.py", "model.py", "nat.py"):
+        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py"):
             shutil.copyfile(Path(__file__).with_name(name), artifacts / name)
 
         def stop(signum, _frame):

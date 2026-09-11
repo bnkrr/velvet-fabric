@@ -83,7 +83,8 @@ def admits(remote, destinations, filtering):
 
 
 class Translator:
-    def __init__(self, wan, mapping, filtering, allocation, seed, interface='lan'):
+    def __init__(self, wan, mapping, filtering, allocation, seed, interface='lan', idle_timeout=180,
+                 other_wan=None, primary_destination=None):
         self.wan, self.mapping, self.filtering, self.allocation = wan, mapping, filtering, allocation
         self.rng = random.Random(seed)
         self.sequence = 40000
@@ -94,8 +95,12 @@ class Translator:
         self.lan.setblocking(False)
         self.selector.register(self.lan, selectors.EVENT_READ, None)
         self.stats = {'out': 0, 'in': 0, 'filtered': 0, 'created': 0, 'expired': 0}
+        self.idle_timeout = idle_timeout
+        self.other_wan, self.primary_destination = other_wan, primary_destination
+        self.wan_created = {}
 
-    def allocate(self, local):
+    def allocate(self, local, wan=None):
+        wan = wan or self.wan
         if self.allocation == 'preserve':
             desired = local[1]
         elif self.allocation == 'offset':
@@ -105,14 +110,14 @@ class Translator:
             self.sequence = 40000 + (self.sequence - 40000 + 1) % 20000
         else:
             desired = self.rng.randrange(40000, 60000)
-        sock = socket.socket(socket.AF_INET6 if ':' in self.wan else socket.AF_INET, socket.SOCK_DGRAM)
+        sock = socket.socket(socket.AF_INET6 if ':' in wan else socket.AF_INET, socket.SOCK_DGRAM)
         try:
             # Collision fallback is explicit; the reported mapping remains the
             # real socket endpoint. No fabricated evidence is injected into VFP.
             try:
-                sock.bind((self.wan, desired))
+                sock.bind((wan, desired))
             except OSError:
-                sock.bind((self.wan, 0))
+                sock.bind((wan, 0))
             sock.setblocking(False)
             return sock
         except BaseException:
@@ -127,15 +132,19 @@ class Translator:
         if ipaddress.ip_address(remote[0]).is_multicast or ipaddress.ip_address(remote[0]).is_link_local:
             return
         key = mapping_key(local, remote, self.mapping)
+        wan = self.other_wan if self.other_wan and remote[0] != self.primary_destination else self.wan
+        if self.other_wan:
+            key = (wan, key)  # Mapping state is independent per egress.
         entry = self.entries.get(key)
         if entry is None:
             if len(self.entries) >= 4096:
                 raise RuntimeError('NAT fixture mapping capacity exceeded')
-            entry = {'socket': self.allocate(local), 'local': local, 'destinations': set(),
+            entry = {'socket': self.allocate(local, wan), 'local': local, 'destinations': set(),
                      'client_mac': client_mac, 'router_mac': router_mac}
             self.entries[key] = entry
             self.selector.register(entry['socket'], selectors.EVENT_READ, entry)
             self.stats['created'] += 1
+            self.wan_created[wan] = self.wan_created.get(wan, 0) + 1
         if len(entry['destinations']) >= 4096 and remote not in entry['destinations']:
             raise RuntimeError('NAT fixture destination capacity exceeded')
         entry['destinations'].add(remote)
@@ -166,7 +175,7 @@ class Translator:
                 self.receive(key.data)
         now = time.monotonic()
         for key, entry in list(self.entries.items()):
-            if now - entry['last'] > 180:
+            if now - entry['last'] > self.idle_timeout:
                 self.selector.unregister(entry['socket'])
                 entry['socket'].close()
                 del self.entries[key]
@@ -187,8 +196,20 @@ def main():
     parser.add_argument('--allocation', choices=ALLOCATIONS, required=True)
     parser.add_argument('--seed', type=int, required=True)
     parser.add_argument('--status', type=Path, required=True)
+    parser.add_argument('--idle-timeout', type=float, default=180)
+    parser.add_argument('--other-wan')
+    parser.add_argument('--primary-destination')
     args = parser.parse_args()
-    translator = Translator(args.wan, args.mapping, args.filter, args.allocation, args.seed)
+    if not 0 < args.idle_timeout <= 3600:
+        parser.error('idle timeout must be in (0, 3600] seconds')
+    if bool(args.other_wan) != bool(args.primary_destination):
+        parser.error('other WAN and primary destination must be supplied together')
+    if args.other_wan and any(ipaddress.ip_address(a).version != ipaddress.ip_address(args.wan).version
+                              for a in (args.other_wan, args.primary_destination)):
+        parser.error('NAT egress addresses must share the address family')
+    translator = Translator(args.wan, args.mapping, args.filter, args.allocation, args.seed,
+                            idle_timeout=args.idle_timeout, other_wan=args.other_wan,
+                            primary_destination=args.primary_destination)
     stopped = False
     def stop(_signum, _frame):
         nonlocal stopped
@@ -202,7 +223,9 @@ def main():
             if time.monotonic() - last >= 1:
                 temporary = args.status.with_suffix('.tmp')
                 temporary.write_text(json.dumps({'mapping': args.mapping, 'filter': args.filter,
-                    'allocation': args.allocation, 'entries': len(translator.entries), **translator.stats}))
+                    'allocation': args.allocation, 'entries': len(translator.entries),
+                    'wan_created': translator.wan_created,
+                    'updated_monotonic': time.monotonic(), **translator.stats}))
                 temporary.replace(args.status)
                 last = time.monotonic()
     finally:

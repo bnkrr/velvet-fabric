@@ -1,10 +1,15 @@
 """Negative controls for the independent verifier and NAT packet fixture."""
 import copy
+import json
 import socket
 import unittest
+from unittest.mock import Mock, patch
 
-from model import Topology, NotConverged, audit, parse_wg, prefix, is_babel_check
+from model import Topology, PendingLinks, NotConverged, audit, parse_wg, prefix, is_babel_check, nat_heartbeat_fresh
 from nat import admits, decode, encode, mapping_key, checksum
+from coverage_model import Coverage
+from netns import Runner
+from check_commit import CommitRunner
 
 
 def observation_fixture(dynamic=True):
@@ -44,6 +49,64 @@ def observation_fixture(dynamic=True):
 
 
 class OracleTests(unittest.TestCase):
+    def test_each_public_nat_pair_is_required(self):
+        topology, observations = observation_fixture()
+        for node in topology.active - topology.public:
+            self.assertTrue(topology.public <= topology.required(node))
+            for public in topology.public:
+                self.assertIn(node, topology.required(public))
+        # Other NATs continue to punch successfully. One lost required pair
+        # still fails even if runtime counts honestly omit that pair.
+        for node in topology.active - topology.public:
+            public = next(p for p in topology.public if p != topology.boot[node])
+            broken = copy.deepcopy(observations)
+            for a, b in ((node, public), (public, node)):
+                del broken[a]['wg'][f'vdl-{b}']
+                broken[a]['status']['runtime']['dynamic_links'] -= 1
+            with self.assertRaisesRegex(NotConverged, 'missing required neighbors'):
+                audit(topology, broken)
+
+    def test_policy_controls_new_link_requirement(self):
+        topology = Topology(6, 3, 1)
+        node = 2
+        public = next(p for p in topology.public if p != topology.boot[node])
+        for left in ('active', 'passive', 'off'):
+            for right in ('active', 'passive', 'off'):
+                topology.modes[node], topology.modes[public] = left, right
+                expected = 'off' not in (left, right) and 'active' in (left, right)
+                self.assertEqual(topology.want_pair(node, public), expected)
+                self.assertEqual(public in topology.required(node), expected)
+                self.assertEqual(node in topology.required(public), expected)
+                self.assertIn(topology.boot[node], topology.required(node))
+
+    def test_static_peer_cannot_fake_dynamic_reciprocity(self):
+        topology, observations = observation_fixture()
+        owners = {link['public']: n for n, obs in observations.items() for link in obs['wg'].values()}
+        for node, obs in observations.items():
+            for link in obs['wg'].values():
+                link['public'] = f'node-{node}'
+                for peer in link['peers']:
+                    peer['public'] = f"node-{owners[peer['public']]}"
+        node = 2
+        public = topology.boot[node]
+        observations[public]['wg'][f'vdl-{node}'] = {
+            'public': f'node-{public}', 'port': 33333,
+            'peers': [{'public': f'node-{node}', 'handshake': 100, 'allowed': ['0.0.0.0/0', '::/0']}]}
+        observations[public]['status']['runtime']['dynamic_links'] += 1
+        with self.assertRaisesRegex(NotConverged, 'nonreciprocal WG peer'):
+            audit(topology, observations)
+
+    def test_nat_heartbeat_survives_clock_step_but_still_detects_stall(self):
+        heartbeat = {'updated_monotonic': 100.0}
+        # Replay the observed 8301-second wall-clock step with only 2.6 seconds
+        # of elapsed runtime. Backwards steps must not conceal a real stall.
+        for wall in (1789036749.0, 1789036749.0 + 8301, 1789036749.0 - 8301):
+            with patch('time.time', return_value=wall):
+                self.assertTrue(nat_heartbeat_fresh(heartbeat, 102.6))
+                self.assertFalse(nat_heartbeat_fresh(heartbeat, 105.1))
+        for invalid in ({}, {'updated_monotonic': float('nan')}, {'updated_monotonic': 110}):
+            self.assertFalse(nat_heartbeat_fresh(invalid, 102.6))
+
     def test_public_nat_reachability_and_nat_nat_fallback(self):
         for dynamic in (True, False):
             topology, observations = observation_fixture(dynamic)
@@ -134,10 +197,6 @@ class NATTests(unittest.TestCase):
             self.assertIsNone(decode(frame[:-1]))
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class ProcessIdentityTests(unittest.TestCase):
     def test_only_exact_supervised_babel_check_is_transient(self):
         argv = ['/opt/babel-rs', 'check', '--config', '/run/velvet/node/babel-rs.toml']
@@ -150,3 +209,97 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertFalse(accepts(command=[argv[0], 'run', '--config', argv[3]]))
         self.assertFalse(accepts(command=[*argv[:3], '/tmp/other.toml']))
         self.assertFalse(accepts(command=[*argv, '--extra']))
+
+
+class EvidenceTests(unittest.TestCase):
+    def test_commit_negative_control_survives_transient_base_audit(self):
+        runner = CommitRunner.__new__(CommitRunner)
+        runner.latest = {2: {'wg': {'vdl-n3-test': {}}}}
+        runner.tentative_seen, runner.failed_seen = set(), set()
+        runner.ns = Mock(return_value='UNCONN 0 0 [fe80::1%vdl-n3-test]:6696 [::]:*')
+        with patch.object(Runner, 'observe', side_effect=NotConverged('tentative WG entered FIB')):
+            with self.assertRaisesRegex(AssertionError, 'Babel attached to uncommitted'):
+                runner.observe()
+
+    def test_pending_incarnation_must_retire_without_entering_routing(self):
+        obs = {0: {'wg': {'vdl-a': {'public': '(none)', 'peers': []}},
+                   'fib': [], 'ifindices': {'vdl-a': 10}, 'babel_sockets': ''}}
+        tracker = PendingLinks()
+        tracker.observe(obs, 1)
+        tracker.observe(obs, 90)
+        with self.assertRaisesRegex(AssertionError, 'exceeded 90s'):
+            tracker.observe(obs, 92)
+        # A real deletion/recreation has another kernel ifindex.
+        obs[0]['ifindices']['vdl-a'] = 11
+        tracker.observe(obs, 92)
+        self.assertEqual(len(tracker.since), 1)
+        for fib, sockets in (([{'dev': 'vdl-a', 'protocol': 203}], ''),
+                             ([], 'UNCONN 0 0 [fe80::1%vdl-a]:6696 [::]:*')):
+            obs[0].update(fib=fib, babel_sockets=sockets)
+            with self.assertRaises(NotConverged):
+                tracker.observe(obs, 93)
+        obs[0].update(fib=[{'dev': 'vdl-a', 'protocol': 202}], babel_sockets='')
+        tracker.observe(obs, 94)
+        self.assertEqual(obs[0]['pending'], [])
+        self.assertEqual(tracker.since, {})
+
+    def test_pending_does_not_satisfy_a_required_peer(self):
+        topology, observations = observation_fixture()
+        node = 2
+        public = next(p for p in topology.public if p != topology.boot[node])
+        for a, b in ((node, public), (public, node)):
+            observations[a]['pending'] = [f'vdl-{b}']
+            observations[a]['status']['runtime']['dynamic_links'] -= 1
+        with self.assertRaisesRegex(NotConverged, 'missing required neighbors'):
+            audit(topology, observations)
+
+    def test_coverage_distinguishes_real_probe_direction_and_fallback(self):
+        topology, observations = observation_fixture()
+        audit(topology, observations)
+        coverage = Coverage('ipv6')
+        self.assertEqual(coverage.state()['matrix'], [])
+        coverage.ping(2, 3)
+        coverage.proposed(1, 2)
+        coverage.verified(topology, observations)
+        self.assertEqual(len(coverage.pairs), 30)
+        self.assertEqual(coverage.pairs[2, 3]['outcome'], 'fallback')
+        self.assertEqual(coverage.pairs[2, 3]['successful_pings'], 1)
+        self.assertEqual(coverage.pairs[3, 2]['successful_pings'], 0)
+        self.assertEqual(coverage.pairs[2, 1]['remote_proposals'], 1)
+        self.assertEqual(coverage.pairs[2, 1]['local_proposals'], 0)
+        self.assertTrue(all(row['family'] == 'ipv6' for row in coverage.state()['matrix']))
+        coverage.reset(2)
+        self.assertFalse(any(2 in pair for pair in coverage.pairs))
+        self.assertEqual(coverage.probes[2, 3], 0)
+        self.assertEqual(coverage.proposals[1, 2], 0)
+
+    def test_partial_observations_survive_a_later_read_failure(self):
+        runner = Runner.__new__(Runner)
+        runner.capture, runner.round, runner.phase, runner.started = None, 12, 'control-loss', 0
+        runner.latest, runner.snapshots = {}, Mock()
+        def partial():
+            runner.latest[0] = {'wg': parse_wg('vdl-a\tPRIVATE\tPUBLIC\t123\toff\n')}
+            raise NotConverged('node 1 not ready')
+        runner._observe = partial
+        with self.assertRaises(NotConverged):
+            runner.observe()
+        raw = runner.snapshots.info.call_args.args[0]
+        entry = json.loads(raw)
+        self.assertEqual(entry['round'], 12)
+        self.assertEqual(entry['phase'], 'control-loss')
+        self.assertIn('0', entry['observations'])
+        self.assertNotIn('PRIVATE', raw)
+
+    def test_dead_capture_cannot_pass_as_evidence(self):
+        runner = Runner.__new__(Runner)
+        runner.capture = Mock()
+        runner.capture.poll.return_value = 1
+        runner.round, runner.phase, runner.started = 0, 'membership', 0
+        runner.latest, runner.snapshots, runner._observe = {}, Mock(), Mock()
+        with self.assertRaisesRegex(RuntimeError, 'capture exited'):
+            runner.observe()
+        runner._observe.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

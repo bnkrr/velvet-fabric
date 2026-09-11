@@ -3,6 +3,7 @@
 import json
 
 import netns
+from model import NotConverged
 
 
 class CommitRunner(netns.Runner):
@@ -13,6 +14,7 @@ class CommitRunner(netns.Runner):
             topology.profiles[node] = ('eim', 'eif', 'preserve')
         super().__init__(args, topology, runtime, artifacts)
         self.tentative_seen = set()
+        self.failed_seen = set()
 
     def add_node(self, node):
         super().add_node(node)
@@ -30,8 +32,17 @@ class CommitRunner(netns.Runner):
             self.ns(node, 'nft', '-f', '-', input=rules)
 
     def observe(self):
-        observations = super().observe()
+        observation_error = None
+        try:
+            observations = super().observe()
+        except NotConverged as error:
+            # The base oracle may see a tentative interface before this
+            # stricter negative control. Still inspect every completed read:
+            # no transient grace is allowed for Babel on this blocked pair.
+            observation_error, observations = error, self.latest
         for node in (2, 3):
+            if node not in observations:
+                continue
             prefix = f'vdl-n{5 - node}-'
             names = [name for name in observations[node]['wg'] if name.startswith(prefix)]
             if names:
@@ -40,6 +51,15 @@ class CommitRunner(netns.Runner):
             for line in sockets.splitlines():
                 if prefix in line and ':6696' in line:
                     raise AssertionError(f'Babel attached to uncommitted node {node} Link: {line}')
+            events = [json.loads(line) for line in (self.artifacts / f'node-{node}.log').read_text().splitlines()
+                      if line.startswith('{')]
+            if any(e.get('event') == 'velvet-dynamic-attempt' and e.get('status') == 'failed'
+                   and e.get('remote_uid') == self.uids[5 - node] for e in events):
+                self.failed_seen.add(node)
+        if observation_error is not None:
+            raise observation_error
+        if self.failed_seen != {2, 3}:
+            raise NotConverged('waiting for both blocked final Link validations to fail')
         return observations
 
     def execute(self):
