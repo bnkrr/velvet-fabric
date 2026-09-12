@@ -4,6 +4,8 @@ This suite exercises real velvetd, pinned Babel v0.6.0, kernel WireGuard and
 VFP on isolated network namespaces. It is finite, separate from endless churn,
 and makes no claims about load resistance or Internet success rates.
 
+Configure the test host and local build environment using [VM setup](../VM.md).
+
 ```sh
 tests/directed/run-on-vm.sh --group all
 tests/directed/run-on-vm.sh --group matrix --family ipv6
@@ -86,13 +88,3 @@ attempt; the latter is an observed capability boundary, not assumed support.
 
 Scenario availability is not a pass record. Consult the run's `results.json`,
 per-case failure/exception records and final cleanup events for actual results.
-
-## VM test configuration
-
-Set `VELVET_VM_HOST` to your SSH destination and `VELVET_VM_REMOTE_ROOT`
-to an absolute test asset directory. For Babel suites, set `VELVET_BABEL_REPO`
-to a local Git checkout containing the pinned revision. Go and Cargo are
-resolved through PATH; `VELVET_GO_BIN` and `VELVET_CARGO_BIN` can override
-them. `VELVET_SSH_CONFIG` optionally selects an SSH configuration file.
-Use a Linux build host with a matching VM architecture. Keep personal
-defaults outside tracked files; configure caches/toolchains in the caller environment.

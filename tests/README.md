@@ -23,6 +23,9 @@ A UDP probe or an algorithm simulation alone does not establish this result.
 
 ## Ordinary Go tests
 
+For privileged VM suites, first configure the host, asset directory and local
+Babel checkout as described in [VM setup](VM.md).
+
 ```sh
 go test ./internal/inference ./internal/linkdiscovery
 go test ./internal/linkdiscovery -run '^TestPeer.*Matrix$' -v
@@ -264,13 +267,3 @@ restart, missing publisher cache, source/UUID conflicts, stale/duplicate snapsho
 late operations, independent budgets, reply coalescing, fairness and bounded caches.
 The ordinary routed failure regressions retain the actual VFP session callbacks,
 response timer and cleanup checks while requiring future retry eligibility.
-
-## VM test configuration
-
-Set `VELVET_VM_HOST` to your SSH destination and `VELVET_VM_REMOTE_ROOT`
-to an absolute test asset directory. For Babel suites, set `VELVET_BABEL_REPO`
-to a local Git checkout containing the pinned revision. Go and Cargo are
-resolved through PATH; `VELVET_GO_BIN` and `VELVET_CARGO_BIN` can override
-them. `VELVET_SSH_CONFIG` optionally selects an SSH configuration file.
-Use a Linux build host with a matching VM architecture. Keep personal
-defaults outside tracked files; configure caches/toolchains in the caller environment.

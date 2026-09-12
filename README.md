@@ -90,6 +90,9 @@ go build -o bin/velvetd ./cmd/velvetd
 go build -o bin/velvetctl ./cmd/velvetctl
 ```
 
+See [validation](tests/README.md) for test coverage and [VM setup](tests/VM.md)
+for the optional privileged test runners.
+
 A minimal NodeSpec for node `a` is:
 
 ```json

@@ -7,6 +7,8 @@ Public nodes also participate in deletion/re-add; at least one remains present.
 Membership churn does not restart or reload surviving nodes to reset discovery
 state. Explicit online exercises below change only the selected fault/policy.
 
+Configure the test host and local build environment using [VM setup](../VM.md).
+
 ```sh
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0 --underlay ipv6
@@ -22,8 +24,9 @@ tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 4 \
 ```
 
 `--rounds 0` continues until verifier failure or interruption. The endless
-runner is **not** included in normal E2E `all` or automatically launched by CI;
-only its unprivileged verifier tests run in CI. Root, Linux netns/WireGuard,
+runner is **not** included in normal E2E `all` or automatically launched by CI.
+CI runs its unprivileged verifier tests and the finite kernel materialization
+check. Root, Linux netns/WireGuard,
 Python 3.11+, iproute2, nftables, ping and sysctl are required on the test host.
 Run finite regressions serially on a small VM: namespace isolation does not
 isolate CPU or kernel work, and parallel suites can exhaust the 5s tool budget.
@@ -31,8 +34,8 @@ isolate CPU or kernel work, and parallel suites can exhaust the 5s tool budget.
 The wrapper builds locally, including pinned **babel-rs v0.6.0** at
 `dbeede34abd8dff2422c39ab18a15949b0f38f11`, using a Git archive rather than sibling
 worktree edits. Only binaries/runtime files are copied into a unique asset
-directory on the configured VM. Overrides: `VELVET_GO_BIN`, `VELVET_SSH_CONFIG`,
-`VELVET_VM_HOST`, `VELVET_VM_REMOTE_ROOT`.
+directory on the configured VM. Build and SSH settings are shared with the
+other suites; see [VM setup](../VM.md).
 
 ## Per-node underlay model
 
@@ -272,13 +275,3 @@ The real UDP check independently varies destination IP, destination port and
 local port, observes actual translated endpoints, tests unsolicited replies from
 different external endpoints, and relies on kernel UDP delivery to validate
 reply framing/checksums. It supplies no Velvet protocol messages.
-
-## VM test configuration
-
-Set `VELVET_VM_HOST` to your SSH destination and `VELVET_VM_REMOTE_ROOT`
-to an absolute test asset directory. For Babel suites, set `VELVET_BABEL_REPO`
-to a local Git checkout containing the pinned revision. Go and Cargo are
-resolved through PATH; `VELVET_GO_BIN` and `VELVET_CARGO_BIN` can override
-them. `VELVET_SSH_CONFIG` optionally selects an SSH configuration file.
-Use a Linux build host with a matching VM architecture. Keep personal
-defaults outside tracked files; configure caches/toolchains in the caller environment.
