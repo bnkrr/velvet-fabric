@@ -28,8 +28,8 @@ Python 3.11+, iproute2, nftables, ping and sysctl are required on the test host.
 Run finite regressions serially on a small VM: namespace isolation does not
 isolate CPU or kernel work, and parallel suites can exhaust the 5s tool budget.
 
-The wrapper builds locally, including pinned **babel-rs v0.4.1** at
-`b5e15d857d776c60179dcb6078a524b56b3ced94`, using a Git archive rather than sibling
+The wrapper builds locally, including pinned **babel-rs v0.6.0** at
+`dbeede34abd8dff2422c39ab18a15949b0f38f11`, using a Git archive rather than sibling
 worktree edits. Only binaries/runtime files are copied into a unique asset
 directory on the configured VM. Overrides: `VELVET_GO_BIN`, `VELVET_SSH_CONFIG`,
 `VELVET_VM_HOST`, `VELVET_VM_REMOTE_ROOT`.
@@ -111,9 +111,13 @@ The independent model requires:
   interface must have a reciprocal peer of the correct interface kind, an actual
   handshake and complete AllowedIPs. A provisioned peer using the same node key
   cannot stand in for the reciprocal end of a Dynamic Link.
-- Continual attempts may coexist with valid fallback. A dynamic interface lacking
-  its protocol-202 materialized adjacency must carry no FIB route and have no
-  Babel UDP socket. Its kernel ifindex is tracked independently of daemon state;
+- Continual attempts may coexist with valid fallback. Before starting each node,
+  the verifier subscribes to kernel route and interface events. Installation of
+  a protocol-202 adjacency in table 20000 records materialization for that kernel
+  ifindex. Replacing the same peer route onto a parallel static or dynamic Link
+  does not erase this record; interface deletion does. Lost/truncated events fail
+  verification. A dynamic incarnation never materialized must carry no FIB route
+  and have no Babel UDP socket. This evidence is independent of daemon up claims;
   a tentative incarnation lasting over 90 seconds fails (30s UDP + 30s final
   validation + 10s deferred cleanup + 5s cleanup, with 15s sampling allowance).
   Such interfaces never satisfy required neighbors or committed counts.
@@ -248,6 +252,9 @@ recorded nodes, NAT routers, veths, bridge, processes and UUID directories.
 tests/endless/run-on-vm.sh --plan --nodes 16 --min-nodes 8 --rounds 10
 # Negative controls and model/NAT framing unit tests:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
+# Root-only, real route replacement between parallel Links, interface recreation,
+# and rejection of premature Babel routes (also part of hosted E2E CI):
+sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_materialization.py
 # Root-only, independent real UDP tests for all 36 profiles in each family:
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_nat.py
 # Retained namespace references and SIGTERM during partial setup:

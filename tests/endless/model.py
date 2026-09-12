@@ -14,12 +14,16 @@ class PendingLinks:
     def __init__(self):
         self.since = {}
 
+    def forget(self, node):
+        # A reborn namespace can reuse ifindices from the previous birth.
+        self.since = {key: value for key, value in self.since.items() if key[0] != node}
+
     def observe(self, observations, now):
         current = {}
         for node, obs in observations.items():
-            materialized = {route.get('dev') for route in obs['fib'] if str(route.get('protocol')) == '202'}
-            pending = set(obs['wg']) - materialized
-            pending = {name for name in pending if name.startswith('vdl-')}
+            materialized = set(obs['materialized_ifindices'])
+            pending = {name for name in obs['wg'] if name.startswith('vdl-')
+                       and obs['ifindices'].get(name) not in materialized}
             obs['pending'] = sorted(pending)
             for name in pending:
                 index = obs['ifindices'].get(name)
@@ -27,6 +31,12 @@ class PendingLinks:
                     raise NotConverged(f'node {node}/{name}: interface changed during observation')
                 key = node, index
                 current[key] = self.since.get(key, now)
+        # Remember first observation even if an admission check below fails.
+        # Otherwise a continuous violation could keep restarting its lifetime.
+        self.since = current
+        for node, obs in observations.items():
+            for name in obs['pending']:
+                key = node, obs['ifindices'][name]
                 # UDP 30s + final validation 30s + deferred cleanup 10s +
                 # cleanup 5s, with 15s for observation/scheduling. No refresh
                 # merely because a new proposal reused the same interface.
@@ -37,7 +47,6 @@ class PendingLinks:
                 if any(re.search(r'%'+re.escape(name)+r'\]?:6696\b', line)
                        for line in obs['babel_sockets'].splitlines()):
                     raise NotConverged(f'node {node}/{name}: Babel attached to tentative WG')
-        self.since = current
 
 
 def nat_heartbeat_fresh(status, now):

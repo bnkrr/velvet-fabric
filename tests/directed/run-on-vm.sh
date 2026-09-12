@@ -18,9 +18,9 @@ trap 'rm -rf -- "${build_dir}"' EXIT
 GOCACHE="${repo_root}/.local/cache/go-build" GOMODCACHE="${repo_root}/.local/cache/go-mod" \
 CGO_ENABLED=0 GOOS=linux \
   "${VELVET_GO_BIN:-go}" build -trimpath -o "${build_dir}/velvetd" ./cmd/velvetd
-babel_revision=b5e15d857d776c60179dcb6078a524b56b3ced94 # v0.4.1
+babel_revision=dbeede34abd8dff2422c39ab18a15949b0f38f11 # v0.6.0
 babel_repo=${VELVET_BABEL_REPO:?set VELVET_BABEL_REPO to a local babel-rs checkout}
-babel_target="${repo_root}/.local/cache/babel-rs-v0.4.1"
+babel_target="${repo_root}/.local/cache/babel-rs-v0.6.0"
 mkdir "${build_dir}/babel-source"
 git -C "${babel_repo}" archive "${babel_revision}" | tar -x -C "${build_dir}/babel-source"
 CARGO_TARGET_DIR="${babel_target}" \

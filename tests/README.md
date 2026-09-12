@@ -86,9 +86,10 @@ multi-hop Fabric path.
 
 ## Babel compatibility
 
-The managed integration and privileged tests pin `babel-rs` v0.4.1 at
-`b5e15d857d776c60179dcb6078a524b56b3ced94`. `manager_test.go` covers the
-structured `[[interfaces]]`/`match` configuration, static names and dynamic
+The managed integration and privileged tests pin `babel-rs` v0.6.0 at
+`dbeede34abd8dff2422c39ab18a15949b0f38f11`. Local wrappers build a Git archive of
+that commit, and hosted CI checks out the same published revision.
+`manager_test.go` covers the structured `[[interfaces]]`/`match` configuration, static names and dynamic
 interface patterns, explicit wired policy, top-level shutdown budget, origins
 and export views. The real netns suites exercise Babel's own config validator,
 control readiness/reload, interface attachment, route export and restart.

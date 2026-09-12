@@ -276,9 +276,9 @@ automatically originates the node loopback. It reloads the child online as
 Link membership or origins change and restarts an unexpected exit with bounded exponential
 backoff. Parent death terminates the child.
 
-The current Velvet release targets `babel-rs` v0.4.1. Generated configuration
-uses structured `[[interfaces]]` rules with patterns for static Links and exact
-names for committed Dynamic Links. Tentative WG interfaces are excluded until
+The managed integration targets `babel-rs` v0.6.0 (`dbeede3`).
+Generated configuration uses structured `[[interfaces]]` rules with patterns
+for static Links and exact names for committed Dynamic Links. Tentative WG interfaces are excluded until
 VFP commit, including during final connectivity validation. Withdrawal removes
 the exact name through an online reload; a link-local-only Link needs no ordinary
 origin to participate. It explicitly selects the `wired` metric preset used by the

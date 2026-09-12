@@ -12,8 +12,8 @@ remote_root=${VELVET_VM_REMOTE_ROOT:?set VELVET_VM_REMOTE_ROOT to an absolute te
 local_binary="${repo_root}/.local/bin/velvetd"
 local_ctl="${repo_root}/.local/bin/velvetctl"
 babel_repo=${VELVET_BABEL_REPO:?set VELVET_BABEL_REPO to a local babel-rs checkout}
-babel_revision=b5e15d857d776c60179dcb6078a524b56b3ced94 # v0.4.1
-babel_target="${repo_root}/.local/cache/babel-rs-v0.4.1"
+babel_revision=dbeede34abd8dff2422c39ab18a15949b0f38f11 # v0.6.0
+babel_target="${repo_root}/.local/cache/babel-rs-v0.6.0"
 babel_binary="${babel_target}/release/babel-rs"
 
 mkdir -p "$(dirname "${local_binary}")"

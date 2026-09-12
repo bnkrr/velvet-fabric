@@ -1,6 +1,6 @@
 # Bounded dynamic-link E2E
 
-This suite exercises real velvetd, pinned Babel v0.4.1, kernel WireGuard and
+This suite exercises real velvetd, pinned Babel v0.6.0, kernel WireGuard and
 VFP on isolated network namespaces. It is finite, separate from endless churn,
 and makes no claims about load resistance or Internet success rates.
 

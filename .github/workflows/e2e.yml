@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  BABEL_RS_REVISION: b5e15d857d776c60179dcb6078a524b56b3ced94 # v0.4.1
+  BABEL_RS_REVISION: dbeede34abd8dff2422c39ab18a15949b0f38f11 # v0.6.0
 
 jobs:
   linux-netns:
@@ -49,6 +49,9 @@ jobs:
           mkdir -p .local/bin
           CGO_ENABLED=0 go build -trimpath -o .local/bin/velvetd ./cmd/velvetd
           CGO_ENABLED=0 go build -trimpath -o .local/bin/velvetctl ./cmd/velvetctl
+      - name: Test independent materialization observer
+        working-directory: velvet-fabric
+        run: sudo python3 tests/endless/check_materialization.py
       - name: Test static Link establishment
         working-directory: velvet-fabric
         run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"

@@ -24,9 +24,9 @@ GOCACHE="${repo_root}/.local/cache/go-build" GOMODCACHE="${repo_root}/.local/cac
 CGO_ENABLED=0 GOOS=linux \
   "${VELVET_GO_BIN:-go}" build -trimpath -o "${build_dir}/velvetd" ./cmd/velvetd
 # Build the integration pin, never the sibling's possibly modified worktree.
-babel_revision=b5e15d857d776c60179dcb6078a524b56b3ced94 # v0.4.1
+babel_revision=dbeede34abd8dff2422c39ab18a15949b0f38f11 # v0.6.0
 babel_repo=${VELVET_BABEL_REPO:?set VELVET_BABEL_REPO to a local babel-rs checkout}
-babel_target="${repo_root}/.local/cache/babel-rs-v0.4.1"
+babel_target="${repo_root}/.local/cache/babel-rs-v0.6.0"
 mkdir "${build_dir}/babel-source"
 git -C "${babel_repo}" archive "${babel_revision}" | tar -x -C "${build_dir}/babel-source"
 CARGO_TARGET_DIR="${babel_target}" \
@@ -39,7 +39,7 @@ ssh "${ssh_args[@]}" "${ssh_alias}" "${mkdir_command}"
 scp_root=$(python3 -c 'import shlex,sys; print(shlex.quote(sys.argv[1] + "/"))' "${asset_root}")
 scp "${ssh_args[@]}" "${build_dir}/velvetd" "${babel_target}/release/babel-rs" \
   "${repo_root}/tests/endless/netns.py" "${repo_root}/tests/endless/model.py" "${repo_root}/tests/endless/nat.py" "${repo_root}/tests/endless/coverage_model.py" \
-  "${repo_root}/tests/endless/mutations.py" "${ssh_alias}:${scp_root}"
+  "${repo_root}/tests/endless/mutations.py" "${repo_root}/tests/endless/materialization.py" "${ssh_alias}:${scp_root}"
 remote_command=$(python3 - "${asset_root}" "$@" <<'PY'
 import shlex
 import sys

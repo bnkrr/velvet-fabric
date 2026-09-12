@@ -22,6 +22,7 @@ import uuid
 from model import process_fd_limit
 from model import Topology, PendingLinks, NotConverged, address, audit, parse_wg, is_babel_check, nat_heartbeat_fresh
 from coverage_model import Coverage
+from materialization import MaterializedLinks
 
 
 class StopRequested(BaseException):
@@ -104,6 +105,7 @@ class Runner:
         self.latest = {}
         self.coverage = Coverage(args.underlay)
         self.pending_links = PendingLinks()
+        self.materialized_links = {}
         self.capture = None
         self.wan_epochs = {node: 0 for node in range(topology.size)}
         self.nat_epochs = {node: 0 for node in range(topology.size)}
@@ -276,6 +278,7 @@ class Runner:
             self.start_nat(node)
         self.coverage.reset(node)
         self.write_config(node)
+        self.materialized_links[node] = MaterializedLinks(self.namespace(node))
         self.start_daemon(node)
 
     def on_event(self, node, event):
@@ -362,6 +365,8 @@ class Runner:
                 raise RuntimeError(f'node {node}: NAT fixture shutdown failed')
             del self.nat_processes[node]
         del self.nodes[node]
+        self.materialized_links.pop(node).close()
+        self.pending_links.forget(node)
         root = f'ver{self.token}{node:x}'
         self.run('ip', 'link', 'del', root)
         self.root_links.discard(root)
@@ -466,7 +471,8 @@ class Runner:
                 "fib": json.loads(self.ip(node, "-6", "-j", "route", "show", "table", "20000")),
                 "main": json.loads(self.ip(node, "-6", "-j", "route", "show", "table", "main")),
                 "ifindices": {link['ifname']: link['ifindex'] for link in json.loads(self.ip(node, '-j', 'link', 'show', 'type', 'wireguard'))},
-                "babel_sockets": self.ns(node, 'ss', '-H', '-uan', 'sport', '=', ':6696')}
+                "babel_sockets": self.ns(node, 'ss', '-H', '-uan', 'sport', '=', ':6696'),
+                "materialized_ifindices": self.materialized_links[node].read()}
         return self.latest
 
     def ping(self, source, target):
@@ -600,6 +606,9 @@ class Runner:
         self.deadline = None
         self.stop_signal = None
         errors = []
+        for observer in self.materialized_links.values():
+            observer.close()
+        self.materialized_links.clear()
         if self.capture is not None:
             if self.capture.poll() is None:
                 self.capture.send_signal(signal.SIGINT)
@@ -709,7 +718,7 @@ def main():
         runner.save("manifest.json", {"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "sha256": hashes, "kernel": os.uname().release, "python": os.sys.version, "pid": os.getpid(),
             "namespace_prefix": f"vfe-{runner.token}-", "bridge": runner.bridge, "uids": runner.uids, "topology": topology.state()})
-        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py"):
+        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py", "materialization.py"):
             shutil.copyfile(Path(__file__).with_name(name), artifacts / name)
 
         def stop(signum, _frame):

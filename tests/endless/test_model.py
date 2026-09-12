@@ -223,7 +223,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_pending_incarnation_must_retire_without_entering_routing(self):
         obs = {0: {'wg': {'vdl-a': {'public': '(none)', 'peers': []}},
-                   'fib': [], 'ifindices': {'vdl-a': 10}, 'babel_sockets': ''}}
+                   'fib': [], 'ifindices': {'vdl-a': 10}, 'babel_sockets': '',
+                   'materialized_ifindices': []}}
         tracker = PendingLinks()
         tracker.observe(obs, 1)
         tracker.observe(obs, 90)
@@ -238,10 +239,25 @@ class EvidenceTests(unittest.TestCase):
             obs[0].update(fib=fib, babel_sockets=sockets)
             with self.assertRaises(NotConverged):
                 tracker.observe(obs, 93)
-        obs[0].update(fib=[{'dev': 'vdl-a', 'protocol': 202}], babel_sockets='')
+        obs[0].update(fib=[{'dev': 'vdl-a', 'protocol': 202}], babel_sockets='', materialized_ifindices=[11])
         tracker.observe(obs, 94)
         self.assertEqual(obs[0]['pending'], [])
         self.assertEqual(tracker.since, {})
+
+    def test_failed_admission_does_not_reset_any_pending_lifetime(self):
+        obs = {node: {'wg': {'vdl-a': {}}, 'fib': [], 'ifindices': {'vdl-a': 10},
+                      'babel_sockets': '', 'materialized_ifindices': []} for node in (0, 1)}
+        obs[0]['fib'] = [{'dev': 'vdl-a', 'protocol': 203}]
+        tracker = PendingLinks()
+        for now in (1, 60):
+            with self.assertRaisesRegex(NotConverged, 'entered FIB'):
+                tracker.observe(obs, now)
+        self.assertEqual(tracker.since, {(0, 10): 1, (1, 10): 1})
+        tracker.forget(0)
+        self.assertEqual(tracker.since, {(1, 10): 1})
+        del obs[0]
+        with self.assertRaisesRegex(AssertionError, 'exceeded 90s'):
+            tracker.observe(obs, 92)
 
     def test_pending_does_not_satisfy_a_required_peer(self):
         topology, observations = observation_fixture()
