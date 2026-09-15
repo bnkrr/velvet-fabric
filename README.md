@@ -100,7 +100,9 @@ go build -o bin/velvetctl ./cmd/velvetctl
 ```
 
 See [validation](tests/README.md) for test coverage and [VM setup](tests/VM.md)
-for the optional privileged test runners.
+for the optional privileged test runners. Maintainers follow the
+[release procedure](docs/RELEASING.md), including CI and E2E acceptance of the
+release tag before publication.
 
 A minimal NodeSpec for node `a` is:
 

@@ -14,7 +14,7 @@ case ${selection} in
       case ${nat_case} in
         preserve|remap|delayed-remap|blocked|control-loss|random|observer-fallback|lifecycle|v6-lifecycle) ;;
         *)
-          if [[ ! ${nat_case} =~ ^v[46]-(retry-blackout|policy-wakeup|policy-restart-query)$ &&
+          if [[ ! ${nat_case} =~ ^v[46]-(delayed-handshake|retry-blackout|policy-wakeup|policy-restart-query)$ &&
                 ! ${nat_case} =~ ^v[46]-single-(preserve|remap|random)-(public|nat)-init$ &&
                 ! ${nat_case} =~ ^v6-(native|filtered)-(a|b)-init$ &&
                 ! ${nat_case} =~ ^v6-dual-(preserve|remap|blocked|random)$ ]]; then

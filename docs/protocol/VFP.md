@@ -215,8 +215,15 @@ invalid source addresses, and datagrams received on another interface are
 silently ignored. The message carries no Node UID, WireGuard key, port, or
 resource. Node identity remains an `OPEN` property after TCP is established.
 
-The initial runtime sends one Hello immediately and repeats at one-second
-intervals while it needs negotiation and no negotiation is already running.
+The runtime repeats Hello with independently sampled 750–1250 ms delays while
+it needs negotiation and no negotiation is already running. Static Links send
+the first Hello immediately. After a Dynamic Link's UDP-to-WG handoff, the
+routed proposer sends first; the acceptor listens immediately and waits two
+seconds before its first independent announcement. Both can answer a received
+Hello immediately. This avoids starting both WG handshakes at once: repeated
+simultaneous initiations can invalidate each other, and kernel timer scheduling
+can keep retries synchronized. Hello timers are independent of the one-second
+health ticker so that tick rounding does not discard their jitter.
 Receiving a multicast `HELLO` triggers one unicast `HELLO_ACK` to its actual
 source address on the effective discovery port. A receiver MUST NOT reply to
 `HELLO_ACK`; consequently replies cannot form a loop or Fabric-wide flood.

@@ -53,6 +53,9 @@ for allocation in ("preserve", "remap", "blocked", "random"):
 
 
 for family in (4, 6):
+    CASES[f"v{family}-delayed-handshake"] = {
+        "family": family, "mode": "preserve", "public": ("a", "b"),
+        "initiator": "a" if family == 4 else "b", "handshake_delay_ms": 150}
     for fault in ("retry-blackout", "policy-wakeup", "policy-restart-query"):
         CASES[f"v{family}-{fault}"] = {
             "family": family, "mode": "preserve", "public": ("a", "b"),
@@ -204,6 +207,18 @@ def scenario(case):
  {address_match} saddr {observed_address(peer)} meta l4proto udp @th,64,32 0x56465000 counter name probes_in
  }}
 }}""")
+        if config.get("handshake_delay_ms"):
+            # Delay only the dynamic UDP port range. Static bootstrap must
+            # already provide a working Fabric for this handoff regression.
+            for node in ("a", "b"):
+                ns(node, "tc", "qdisc", "add", "dev", "wan", "root", "handle", "1:",
+                   "prio", "bands", "3", "priomap", *("0" for _ in range(16)))
+                ns(node, "tc", "qdisc", "add", "dev", "wan", "parent", "1:3",
+                   "handle", "30:", "netem",
+                   "delay", f'{config["handshake_delay_ms"]}ms')
+                ns(node, "tc", "filter", "add", "dev", "wan", "parent", "1:",
+                   "protocol", "ipv6" if family == 6 else "ip", "prio", "1", "flower",
+                   "ip_proto", "udp", "dst_port", "31000-32000", "classid", "1:3")
         keys = {node: run("wg", "genkey") for node in nodes}
         pubs = {node: run("wg", "pubkey", input=key + "\n") for node, key in keys.items()}
         psk = run("wg", "genpsk")
@@ -464,6 +479,19 @@ def scenario(case):
             processes[0].send_signal(signal.SIGHUP)
             wait_for(lambda: all(sum(e.get("event") == "velvet-dynamic-link" and e.get("status") == "up" for e in events(n)) > counts[n] for n in ("a", "b")), "new configuration did not relearn the Link")
             ns("a", "ping", "-n", "-6", "-I", "fd78:7777::1", "-c", "2", "-W", "2", "fd78:7777::2")
+        if config.get("handshake_delay_ms"):
+            # A later engine retry must not hide a failed WG handoff on this
+            # lossless path. Both endpoints have the same delay, deliberately
+            # exercising simultaneous handshake initiation and kernel retries.
+            for node in ("a", "b"):
+                queues = json.loads(ns(node, "tc", "-s", "-j", "qdisc", "show", "dev", "wan"))
+                assert any(q.get("kind") == "netem" and q.get("packets", 0) > 0
+                           for q in queues), (node, "dynamic UDP delay was not exercised")
+                # Routed TCP may retry before Babel has converged. The
+                # invariant starts at the successful public UDP handoff.
+                assert sum(e.get("event") == "velvet-udp-probe" and
+                           e.get("status") == "handoff" for e in events(node)) == 1, \
+                    (node, "delayed WG handshake needed a fresh handoff")
         print(f"velvet real UDP / IPv{family} / WG handoff ({case}): PASS", flush=True)
         succeeded = True
     except BaseException:

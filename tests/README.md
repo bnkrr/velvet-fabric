@@ -173,7 +173,15 @@ The blackout case additionally requires multiple handoffs. Failed test logs and
 configuration remain in the reported private runtime directory after network
 resources are cleaned up.
 
-The privileged CI suite and VM helper include all 35 cases:
+Two `v{4,6}-delayed-handshake` cases add 150 ms to each sender's dynamic UDP
+traffic while keeping the static bootstrap path unchanged, and require the
+first WG handoff to establish the Link. Retries before Fabric convergence are
+allowed; a later handoff cannot hide a WG handshake timeout. These cover
+simultaneous handshake collisions with both Proposal directions. Failed cases also print a bounded recent
+timeline of WG state, interface addresses, UDP sockets and daemon events;
+private and preshared keys are hashed before retention.
+
+The privileged CI suite and VM helper include all 37 cases:
 
 ```sh
 tests/e2e/run-on-vm.sh all
@@ -187,7 +195,7 @@ routing, ownership, multi-Plan forwarding, Babel convergence and reload.
 
 ## Validation limits
 
-The 35-case netns suite uses specific Linux topologies, not every mapping/filter pair
+The 37-case netns suite uses specific Linux topologies, not every mapping/filter pair
 in the simulator. Mapping expiry, hairpinning, nested NAT, arbitrary route
 changes, background mapping contention and long-duration stability are not
 established by this suite. IPv6 coverage uses one chosen underlay family per

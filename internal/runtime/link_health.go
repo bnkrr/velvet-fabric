@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
@@ -19,6 +20,10 @@ import (
 
 const linkPingInterval = 10 * time.Second
 const linkFailureTimeout = 30 * time.Second
+
+func linkHelloDelay() time.Duration {
+	return 750*time.Millisecond + time.Duration(mathrand.Int64N(int64(500*time.Millisecond)))
+}
 
 // One outstanding challenge bounds memory and rejects replay/late observations.
 // Its random value is fresh across supervisor restarts, without a wire Link ID.
@@ -119,7 +124,7 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 	var health linkHealth
 	healthy, busy := false, false
 	ready, changed := false, false
-	nextPing, nextHello, nextNegotiation := time.Time{}, time.Time{}, time.Time{}
+	nextPing, nextNegotiation := time.Time{}, time.Time{}
 	start := func(conn net.Conn, target netip.Addr) {
 		busy = true
 		changed = false
@@ -200,8 +205,19 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	_ = socket.SendHello()
-	nextHello = time.Now().Add(time.Second)
+	helloDelay := linkHelloDelay()
+	if attempt != nil && !attempt.localProposal {
+		// The routed proposer starts WG traffic. Give its handshake and
+		// Hello a head start before independently announcing from this end;
+		// simultaneous WG initiations can repeatedly invalidate each other.
+		helloDelay = 2 * time.Second
+	} else {
+		_ = socket.SendHello()
+	}
+	// Keep Hello schedules independent across endpoints and separate from the
+	// health ticker so its resolution does not erase the sampled jitter.
+	hello := time.NewTimer(helloDelay)
+	defer hello.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -315,15 +331,16 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 					}
 				}
 			}
+		case <-hello.C:
+			if !healthy && !busy {
+				_ = socket.SendHello()
+			}
+			hello.Reset(linkHelloDelay())
 		case now := <-ticker.C:
 			if healthy && health.expired(now) {
 				if err = withdraw(); err != nil {
 					return err
 				}
-			}
-			if !healthy && !busy && !now.Before(nextHello) {
-				_ = socket.SendHello()
-				nextHello = now.Add(time.Second)
 			}
 			if result != nil && !now.Before(nextPing) {
 				if err = ping(now); err != nil {
