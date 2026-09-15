@@ -47,6 +47,9 @@ type reloadRequest struct {
 
 var errRunnerDidNotStop = errors.New("runtime did not stop after cancellation")
 
+// releaseVersion is set by release builds with -ldflags '-X main.releaseVersion=...'.
+var releaseVersion string
+
 func main() {
 	configPath := flag.String("config", "", "path to a NodeSpec JSON file")
 	controlPath := flag.String("control-socket", "", "Unix control socket (default: per-node runtime directory)")
@@ -328,6 +331,9 @@ func acquireSingleton() (*os.File, error) {
 }
 
 func version() string {
+	if releaseVersion != "" {
+		return releaseVersion
+	}
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
 		return info.Main.Version
 	}

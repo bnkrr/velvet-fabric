@@ -49,8 +49,10 @@ NodeSpec
    v
 velvetd
    |-- WireGuard Links and stable node loopback
-   |-- VFP over link-local TCP: adjacent-Link control and address negotiation
+   |-- VFP over link-local TCP: Link negotiation, closed after establishment
+   |-- VFP over link-local UDP: discovery, liveness and endpoint observations
    |-- VFP over routed loopbacks: node discovery and Dynamic-Link signalling
+   |-- authenticated public UDP probes: path measurements before WG handoff
    |-- static Core routes and policy rules
    `-- optional managed babel-rs
           `-- standard Babel over link-local UDP: dynamic route propagation
@@ -77,10 +79,17 @@ kept under `docs/protocol/refs/`.
 VFP's wire format is still in internal development. TCP sessions and UDP
 link-local discovery now share an eight-byte `VFP\0` header and TLV encoding,
 with wire Version remaining `1`. This revision does not accept the older TCP
-header or `VFPD` discovery packets; upgrade all Fabric nodes together. UDP is
-still used only inside existing WireGuard Links, not for underlay hole punching.
+header or `VFPD` discovery packets; upgrade all Fabric nodes together. Link-local
+discovery and liveness, and routed admission updates, remain inside the Fabric.
+Public underlay probes use separate leased sockets and an authenticated,
+encrypted envelope; unauthorized datagrams receive no response.
 
 ## Quick start
+
+Linux release archives contain `velvetd` and `velvetctl` for `amd64` and `arm64`,
+with SHA256 checksums on the [Releases page](https://github.com/bnkrr/velvet-fabric/releases).
+For optional managed dynamic routing, install `babel-rs v0.6.0` separately and
+set `babel.executable` to its executable path in NodeSpec.
 
 Build the daemon and local control client:
 
