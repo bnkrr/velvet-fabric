@@ -12,6 +12,8 @@ import tempfile
 import time
 import uuid
 
+from netns_trace import NetnsTrace
+
 os.umask(0o077)
 
 DAEMON, BABEL = map(os.path.abspath, sys.argv[1:3])
@@ -94,6 +96,7 @@ def scenario(case):
     runtime.chmod(0o700)
     processes, logs, uuids, root_links = [], [], [], []
     succeeded = False
+    trace = NetnsTrace({node: names[node] for node in nodes}, runtime)
 
     def ns(node, *args, **kw):
         return run("ip", "netns", "exec", names[node], *args, **kw)
@@ -236,6 +239,8 @@ def scenario(case):
             log = (runtime / f"{node}.log").open("w")
             logs.append(log)
             processes.append(sp.Popen(["ip", "netns", "exec", names[node], DAEMON, "--config", str(runtime / f"{node}.json"), "--reconcile-interval", "1s"], stdout=log, stderr=sp.STDOUT))
+        trace.start()
+
         def tentative_clean():
             return all(not any(i.startswith("vdl-") for i in ns(n, "wg", "show", "interfaces").split()) for n in ("a", "b"))
 
@@ -462,6 +467,8 @@ def scenario(case):
         print(f"velvet real UDP / IPv{family} / WG handoff ({case}): PASS", flush=True)
         succeeded = True
     except BaseException:
+        if trace.thread.ident is not None:
+            trace.dump(sys.stderr)
         for node in nodes:
             path = runtime / f"{node}.log"
             if path.exists():
@@ -470,6 +477,8 @@ def scenario(case):
             print(ns(node, "ip", "-6", "route", "show", "table", "20000", check=False), file=sys.stderr)
         raise
     finally:
+        if trace.thread.ident is not None:
+            trace.stop()
         for p in processes:
             p.terminate()
         for p in processes:
