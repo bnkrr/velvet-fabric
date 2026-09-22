@@ -154,6 +154,9 @@ sudo bin/velvetctl status --config node.json
 This minimal configuration establishes one adjacent Link. It does not provide
 multi-hop routing until static routes are configured or Babel is enabled.
 
+For complete A–B–C configurations with an Access prefix on A and a default
+exit on C, see the tested [static and dynamic examples](examples/README.md).
+
 ## Link configuration
 
 Keys are embedded directly in NodeSpec. `fabric.psk` must be a base64-encoded
@@ -260,7 +263,10 @@ by their locally named next-hop Peer:
 ```
 
 A Domain is a source-selected routing view. Every Domain has its own table and
-every configured source prefix installs a `from` rule selecting that table.
+every configured source prefix installs a `from` rule selecting that table and
+a `to` rule selecting the Fabric table for return traffic. Fabric destination
+rules run before Domain source rules. Configure the complete source set on
+every participating forwarding node, with the same canonical prefix per family.
 This allows different source populations to use different exits while sharing
 the same Fabric topology:
 
@@ -287,6 +293,26 @@ source-specific origins.
 For each address family, the first source prefix in a Domain is its canonical
 RFC 9079 source. Additional source prefixes are aliases selecting the same
 Linux route view.
+
+Access prefixes are ordinary return destinations: declare them in
+`fabric.announcements` on the node providing local Access delivery. Keep business
+exits in `domains.<name>.announcements`. Without Babel, configure remote Access
+paths in `fabric.routes.<peer>` and business paths in `domains.<name>.routes.<peer>`;
+announcements still provide local delivery through `throw` routes. With Babel,
+the same announcements supply the next hops dynamically. Access interfaces and
+their local delivery routes remain externally managed.
+
+Routing admission comes from local configuration, not learned prefixes. There
+is no catch-all Fabric lookup: packets outside the configured source and
+destination selectors continue through the host's existing policy rules.
+An arbitrary learned ordinary prefix outside those selectors does not create
+a new destination rule. Explicit broad selectors, including `/0`, broaden this
+scope. Fabric destination matches take precedence over Domain routes, rather
+than comparing prefix lengths across the two tables.
+
+Configurations that previously announced Access pools under a Domain should
+move those announcements to `fabric.announcements`, and move static return
+routes to `fabric.routes`. External return-selection rules are no longer needed.
 
 ## Dynamic routing
 

@@ -70,11 +70,27 @@ fi
 
 create_core_underlay vd
 
-add_attached ea access0 10.100.30.1/24
-add_attached eb access0 10.100.31.1/24 10.100.32.1/24
-add_attached xa service0 10.60.1.1/24 10.61.1.1/24 10.100.201.1/24
+add_attached ea access0 10.100.30.1/24 fd30:100:30::1/64
+add_attached eb access0 10.100.31.1/24 10.100.32.1/24 fd30:100:32::1/64
+add_attached xa service0 10.60.1.1/24 10.61.1.1/24 10.100.201.1/24 fd30:60:1::1/64
 add_attached xb service0 10.60.2.1/24 10.100.202.1/24
 add_attached xc service0 10.60.3.1/24
+
+# Model existing host default traffic outside all Velvet selectors. The leaf
+# xc advertises ordinary split defaults; learning them must not capture this traffic.
+ip -n "$(namespace ea)" address add 2001:db8:ffff::1/64 dev underlay0 nodad
+ip -n "$(namespace r1)" address add 2001:db8:ffff::2/64 dev underlay0 nodad
+ip -n "$(namespace r1)" address add 198.51.100.9/32 dev lo
+ip -n "$(namespace r1)" address add 2001:db8:ffff:1::9/128 dev lo nodad
+ip -n "$(namespace ea)" route add default via 192.0.2.21 dev underlay0
+ip -n "$(namespace ea)" -6 route add default via 2001:db8:ffff::2 dev underlay0
+check_host_routing() {
+  ip -n "$(namespace ea)" route get 198.51.100.9 from 192.0.2.11 | grep -q 'via 192.0.2.21 dev underlay0'
+  ip -n "$(namespace ea)" -6 route get 2001:db8:ffff:1::9 from 2001:db8:ffff::1 | grep -q 'via 2001:db8:ffff::2 dev underlay0'
+  ip netns exec "$(namespace ea)" ping -c 1 -W 3 -I 192.0.2.11 198.51.100.9 >/dev/null
+  ip netns exec "$(namespace ea)" ping -6 -c 1 -W 3 -I 2001:db8:ffff::1 2001:db8:ffff:1::9 >/dev/null
+}
+check_host_routing
 
 for node in ${nodes}; do
   ns=$(namespace "${node}")
@@ -226,16 +242,6 @@ kill -0 "${parent_ea}"
 wait_ping6 ea fd78:abcd::8
 wait_ping6 xc fd78:abcd::1
 
-# Access is outside Velvet Core. These destination selectors model the small
-# external integration hook needed for return traffic; all routes in the
-# selected tables are still learned through Babel.
-for node in ${nodes}; do
-  ns=$(namespace "${node}")
-  ip -n "${ns}" rule add priority 19930 to 10.100.30.0/24 lookup 20030
-  ip -n "${ns}" rule add priority 19930 to 10.100.32.0/24 lookup 20030
-  ip -n "${ns}" rule add priority 19931 to 10.100.31.0/24 lookup 20031
-done
-
 wait_ping4() {
   node=$1; source=$2; target=$3; ns=$(namespace "${node}"); attempt=0
   while ! ip netns exec "${ns}" ping -c 1 -W 1 -I "${source}" "${target}" >/dev/null 2>&1; do
@@ -249,18 +255,32 @@ wait_ping4 ea 10.100.30.1 10.60.2.1
 wait_ping4 eb 10.100.32.1 10.100.201.1
 wait_ping4 eb 10.100.31.1 10.60.3.1
 wait_ping4 eb 10.100.31.1 10.61.1.1
+for item in 'ea:30' 'eb:32'; do
+  node=${item%:*}; pool=${item#*:}; attempt=0
+  until ip netns exec "$(namespace "${node}")" ping -6 -c 1 -W 1 -I "fd30:100:${pool}::1" fd30:60:1::1 >/dev/null 2>&1; do
+    attempt=$((attempt + 1)); test "${attempt}" -lt 45 || exit 1
+    sleep 1
+  done
+done
 
 # Representative routes must be Babel-owned and genuinely multi-hop.
 ip -n "$(namespace ea)" -6 route show table 20000 exact fd78:abcd::8/128 proto 203 | grep -q fd78:abcd::8
 ip -n "$(namespace ea)" route show table 20030 exact 10.60.2.0/24 proto 203 | grep -q 10.60.2.0/24
 ip -n "$(namespace eb)" route show table 20031 exact 10.61.1.0/24 proto 203 | grep -q 10.61.1.0/24
 ip -n "$(namespace eb)" -details rule show | grep -q 'from 10.100.32.0/24 lookup 20030 proto 201'
+ip -n "$(namespace xa)" -details rule show | grep -q 'to 10.100.32.0/24 lookup 20000 proto 201'
+ip -n "$(namespace xa)" -6 -details rule show | grep -q 'to fd30:100:32::/64 lookup 20000 proto 201'
+ip -n "$(namespace xa)" route show table 20000 exact 10.100.32.0/24 proto 203 | grep -q 10.100.32.0/24
+ip -n "$(namespace xa)" -6 route show table 20000 exact fd30:100:32::/64 proto 203 | grep -q fd30:100:32::/64
 
 wait_route8() {
   presence=$1; attempt=0
   while :; do
     route=$(ip -n "$(namespace ea)" -6 route show table 20000 exact fd78:abcd::8/128 proto 203 2>/dev/null || true)
-    if { test "${presence}" = present && test -n "${route}"; } || { test "${presence}" = absent && test -z "${route}"; }; then return; fi
+    default4=$(ip -n "$(namespace ea)" route show table 20000 exact 128.0.0.0/1 proto 203 2>/dev/null || true)
+    default6=$(ip -n "$(namespace ea)" -6 route show table 20000 exact ::/1 proto 203 2>/dev/null || true)
+    if { test "${presence}" = present && test -n "${route}" && test -n "${default4}" && test -n "${default6}"; } ||
+       { test "${presence}" = absent && test -z "${route}${default4}${default6}"; }; then return; fi
     attempt=$((attempt + 1))
     # A graceful retraction normally converges immediately.  The upper bound
     # also covers expiry after a lost UDP retraction (3.5 x the 16s Update
@@ -272,16 +292,20 @@ wait_route8() {
 
 # Stopping the managed leaf withdraws its origins; restarting the same
 # velvetd/babel-rs pair must restore Router-ID state and reconverge.
+wait_route8 present
+check_host_routing
 pid_xc=$(cat "${runtime}/xc.pid")
 kill -TERM "${pid_xc}"
 wait "${pid_xc}" || true
 wait_route8 absent
+check_host_routing
 ip netns exec "$(namespace xc)" "${velvetd}" --config "${runtime}/xc.json" --reconcile-interval 5s >>"${runtime}/xc.log" 2>&1 &
 pid_xc=$!
 printf '%s\n' "${pid_xc}" >"${runtime}/xc.pid"
 pids="${pids} ${pid_xc}"
 wait_route8 present
 wait_ping6 ea fd78:abcd::8
+check_host_routing
 
 # Restart the same sparse Core with Dynamic Link enabled. No static multi-hop
 # route is added: routed VFP discovers each remote Node UID, observations from

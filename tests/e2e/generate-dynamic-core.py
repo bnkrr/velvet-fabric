@@ -37,12 +37,13 @@ EDGES = [
 DOMAINS = {
     "plan-a": {
         "table_id": 20030,
-        # Ordering is semantic: the first IPv4 prefix is Babel's canonical S.
-        "source_prefixes": ["10.100.30.0/24", "10.100.32.0/24"],
+        # Ordering is semantic: the first prefix per family is Babel's canonical S.
+        "source_prefixes": ["10.100.30.0/24", "10.100.32.0/24",
+                            "fd30:100:30::/64", "fd30:100:32::/64"],
         "origins": {
-            "ea": ["10.100.30.0/24"],
-            "eb": ["10.100.32.0/24"],
-            "xa": ["10.60.1.0/24", "10.100.201.0/24"],
+            "ea": ["10.100.30.0/24", "fd30:100:30::/64"],
+            "eb": ["10.100.32.0/24", "fd30:100:32::/64"],
+            "xa": ["10.60.1.0/24", "10.100.201.0/24", "fd30:60:1::/64"],
             "xb": ["10.60.2.0/24", "10.100.202.0/24"],
         },
     },
@@ -108,7 +109,8 @@ for node, metadata in NODES.items():
             "table_id": domain["table_id"],
             "source_prefixes": domain["source_prefixes"],
             **(
-                {"announcements": domain["origins"][node]}
+                {"announcements": [prefix for prefix in domain["origins"][node]
+                                   if prefix not in domain["source_prefixes"]]}
                 if node in domain["origins"]
                 else {}
             ),
@@ -122,6 +124,13 @@ for node, metadata in NODES.items():
             "psk": fabric_psk,
             "loopback_prefix_v6": "fd78:abcd::/48",
             "routing_table_id": 20000,
+            # Deliberately broad ordinary origins exercise host routing isolation.
+            "announcements": [
+                prefix
+                for domain in DOMAINS.values()
+                for prefix in domain["origins"].get(node, [])
+                if prefix in domain["source_prefixes"]
+            ] + (["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"] if node == "xc" else []),
         },
         "node": {
             "uid": {

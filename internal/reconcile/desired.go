@@ -239,6 +239,9 @@ func compileRouting(desired *DesiredState, nodeSpec *spec.NodeSpec, links map[st
 				return fmt.Errorf("domain %q source prefix: %w", name, err)
 			}
 			addRule(RulePlan{TableID: domain.TableID, Priority: domain.TableID, Source: prefix})
+			// Return traffic selects the ordinary Fabric view regardless of its
+			// source. Admission stays tied to local configuration, not learned routes.
+			addDestinationRule(desired.FabricTableID, prefix)
 		}
 		if err := compilePeerRoutes(domain.Routes, domain.TableID, links, addRoute, nil); err != nil {
 			return fmt.Errorf("domain %q: %w", name, err)

@@ -17,6 +17,8 @@ class WrapperTests(unittest.TestCase):
         self.repo = self.base / "repo space's"
         source = Path(__file__).resolve().parents[1]
         shutil.copytree(source, self.repo / 'tests', ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(source.parent / 'examples', self.repo / 'examples',
+                        ignore=shutil.ignore_patterns('__pycache__'))
         self.bin = self.base / 'tools'
         self.bin.mkdir()
         self.log = self.base / 'calls.jsonl'

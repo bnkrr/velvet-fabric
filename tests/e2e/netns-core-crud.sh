@@ -156,7 +156,8 @@ cat >"${runtime}/a.json" <<EOF
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
     "routing_table_id": 20000,
-    "routes": {"b": ["fd78:1234:5678::3/128"]}
+    "routes": {"b": ["fd78:1234:5678::3/128"]},
+    "announcements": ["10.100.1.0/24"]
   },
   "node": {
     "uid": {"name": "a", "uuid": "10000000-0000-4000-8000-000000000001"},
@@ -174,8 +175,7 @@ cat >"${runtime}/a.json" <<EOF
     "production": {
       "table_id": 20001,
       "source_prefixes": ["10.100.1.0/24"],
-      "routes": {"b": ["192.168.20.0/24"]},
-      "announcements": ["10.100.1.0/24"]
+      "routes": {"b": ["192.168.20.0/24"]}
     }
   }
 }
@@ -190,7 +190,8 @@ cat >"${runtime}/b.json" <<EOF
     "link_prefix_v4": "10.240.0.0/16",
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
-    "routing_table_id": 20000
+    "routing_table_id": 20000,
+    "routes": {"a": ["10.100.1.0/24"]}
   },
   "node": {
     "uid": {"name": "b", "uuid": "10000000-0000-4000-8000-000000000002"},
@@ -218,7 +219,6 @@ cat >"${runtime}/b.json" <<EOF
       "table_id": 20001,
       "source_prefixes": ["10.100.1.0/24"],
       "routes": {
-        "a": ["10.100.1.0/24"],
         "c": ["192.168.20.0/24"]
       }
     }
@@ -236,7 +236,7 @@ cat >"${runtime}/c.json" <<EOF
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
     "routing_table_id": 20000,
-    "routes": {"b": ["fd78:1234:5678::1/128"]}
+    "routes": {"b": ["fd78:1234:5678::1/128", "10.100.1.0/24"]}
   },
   "node": {
     "uid": {"name": "c", "uuid": "10000000-0000-4000-8000-000000000003"},
@@ -254,7 +254,6 @@ cat >"${runtime}/c.json" <<EOF
     "production": {
       "table_id": 20001,
       "source_prefixes": ["10.100.1.0/24"],
-      "routes": {"b": ["10.100.1.0/24"]},
       "announcements": ["192.168.20.0/24"]
     }
   }
@@ -275,7 +274,7 @@ if ! ip -n "${ns_b}" route show table 20001 exact 192.168.20.0/24 dev vl-b-c pro
   ip -n "${ns_b}" -details route show table 20000 >&2 || true
   exit 1
 fi
-ip -n "${ns_b}" route show table 20001 exact 10.100.1.0/24 dev vl-b-a proto 201 | grep -q 10.100.1.0/24
+ip -n "${ns_b}" route show table 20000 exact 10.100.1.0/24 dev vl-b-a proto 201 | grep -q 10.100.1.0/24
 ip -n "${ns_c}" route show table 20001 type throw exact 192.168.20.0/24 proto 201 | grep -q 192.168.20.0/24
 ip -n "${ns_b}" -details rule show | grep -q 'from 10.100.1.0/24 lookup 20001 proto 201'
 test "$(ip netns exec "${ns_b}" sh -c 'cat /proc/sys/net/ipv4/ip_forward')" = 1
@@ -294,7 +293,7 @@ fi
 ip netns exec "${ns_a}" ping -c 1 -W 3 "${b_link4}" >/dev/null
 ip netns exec "${ns_a}" ping -6 -c 1 -W 3 "${b_link6}" >/dev/null
 ip netns exec "${ns_a}" ping -6 -c 1 -W 3 fd78:1234:5678::3 >/dev/null
-for ns in "${ns_a}" "${ns_b}" "${ns_c}"; do ip -n "${ns}" rule add priority 19999 to 10.100.1.0/24 lookup 20001; done
+ip -n "${ns_b}" -details rule show | grep -q 'to 10.100.1.0/24 lookup 20000 proto 201'
 ip netns exec "${ns_a}" ping -c 1 -W 3 -I 10.100.1.1 192.168.20.1 >/dev/null
 
 ip -n "${ns_a}" route add blackhole 203.0.113.0/24 table 20000 proto 204

@@ -136,6 +136,14 @@ for node, metadata in NODES.items():
             f"fd78:abcd::{target_metadata['index']}/128",
         )
 
+    fabric_announcements = []
+    for plan in PLANS.values():
+        for prefix, owner in plan["sources"].items():
+            if owner == node:
+                fabric_announcements.append(prefix)
+            else:
+                group_route(fabric_routes, next_hop(node, owner), prefix)
+
     domains = {}
     for plan_name, plan in PLANS.items():
         members = plan["members"]
@@ -143,8 +151,7 @@ for node, metadata in NODES.items():
             continue
         routes: dict[str, list[str]] = {}
         announcements: list[str] = []
-        resources = {**plan["sources"], **plan["targets"]}
-        for prefix, owner in resources.items():
+        for prefix, owner in plan["targets"].items():
             if owner == node:
                 announcements.append(prefix)
             else:
@@ -164,6 +171,7 @@ for node, metadata in NODES.items():
             "loopback_prefix_v6": "fd78:abcd::/48",
             "routing_table_id": 20000,
             "routes": fabric_routes,
+            "announcements": fabric_announcements,
         },
         "node": {
             "uid": {

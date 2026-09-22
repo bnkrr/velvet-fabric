@@ -1,0 +1,48 @@
+{
+  "api_version": "velvet.io/v1alpha1",
+  "kind": "NodeSpec",
+  "fabric": {
+    "psk": "<FABRIC_PSK>",
+    "loopback_prefix_v6": "fd78:abcd::/48",
+    "routing_table_id": 20000,
+    "announcements": [
+      "10.100.20.0/24"
+    ],
+    "routes": {
+      "b": [
+        "fd78:abcd::3/128"
+      ]
+    }
+  },
+  "node": {
+    "uid": {
+      "name": "a"
+    },
+    "private_key": "<A_PRIVATE_KEY>",
+    "loopback_address_v6": "fd78:abcd::1"
+  },
+  "peers": [
+    {
+      "name": "b",
+      "public_key": "<B_PUBLIC_KEY>",
+      "endpoints": [
+        "192.0.2.2:51002"
+      ],
+      "listen_port": 51001,
+      "interface_name": "vl-a-b"
+    }
+  ],
+  "domains": {
+    "internet": {
+      "table_id": 20001,
+      "source_prefixes": [
+        "10.100.20.0/24"
+      ],
+      "routes": {
+        "b": [
+          "0.0.0.0/0"
+        ]
+      }
+    }
+  }
+}

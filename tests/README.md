@@ -107,6 +107,19 @@ killing a correctly shutting-down daemon before it finishes cleanup.
 
 ## Real netns integration
 
+`netns-examples.py` runs the shipped `examples/static_minimal` and
+`examples/dynamic_minimal` configurations unchanged apart from fresh secrets,
+UUIDs and the Babel executable path. A real client behind A reaches an upstream
+host through B and C's NAT. It checks both forwarding directions, local Access
+delivery, node loopbacks and route/rule ownership. Run it with
+`tests/e2e/run-on-vm.sh examples`.
+
+The static Core and dynamic suites configure Access return prefixes in the
+Fabric view and business exits in Domain views. No external return-selection
+rules are installed: Velvet owns both source selection and destination return
+selection. The dynamic suite also checks dual-stack Access traffic and host
+routing isolation when ordinary split-default routes are learned and withdrawn.
+
 `e2e/netns-udp-nat.py` runs real velvetd, pinned Babel, VFP, UDP and kernel WG
 with a public static bootstrap observer and either directly addressed WAN
 nodes, one Linux conntrack NAT, or two NATs. Public addresses here belong to an

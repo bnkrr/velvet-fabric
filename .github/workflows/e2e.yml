@@ -68,6 +68,13 @@ jobs:
           "$PWD/.local/bin/velvetd"
           "$PWD/../babel-rs/target/release/babel-rs"
           "$PWD/.local/bin/velvetctl"
+      - name: Test shipped three-node examples
+        working-directory: velvet-fabric
+        run: >-
+          sudo python3 tests/e2e/netns-examples.py
+          "$PWD/.local/bin/velvetd"
+          "$PWD/../babel-rs/target/release/babel-rs"
+          "$PWD/.local/bin/velvetctl"
       - name: Test public UDP discovery over IPv4, IPv6, NAT44 and NAT66
         working-directory: velvet-fabric
         run: >-

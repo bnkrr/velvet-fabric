@@ -5,10 +5,10 @@ cd "${repo_root}"
 selection=${1:-all}
 case ${selection} in
   --help|-h)
-    echo "usage: $0 [all|static|ports|crud|static-core|dynamic|nat [CASE...]]"
+    echo "usage: $0 [all|static|ports|crud|static-core|dynamic|examples|nat [CASE...]]"
     echo 'VM/build configuration: tests/VM.md'
     exit 0 ;;
-  all|static|ports|crud|static-core|dynamic) ;;
+  all|static|ports|crud|static-core|dynamic|examples) ;;
   nat)
     for nat_case in "${@:2}"; do
       case ${nat_case} in
@@ -29,7 +29,7 @@ trap '[[ -z ${build_dir:-} ]] || rm -rf -- "${build_dir}"' EXIT
 vm_configure
 babel_revision=dbeede34abd8dff2422c39ab18a15949b0f38f11 # v0.6.0
 vm_build with-ctl
-tar -cf "${build_dir}/tests.tar" tests/e2e/*.sh tests/e2e/*.py
+tar -cf "${build_dir}/tests.tar" tests/e2e/*.sh tests/e2e/*.py examples
 vm_upload velvetd velvetctl babel-rs tests.tar
 command=$(python3 - "${asset_root}" "${selection}" "${@:2}" <<'PY'
 import shlex, sys
@@ -41,6 +41,7 @@ commands = {
     'crud': ['sh', root + '/tests/e2e/netns-core-crud.sh', velvet],
     'static-core': ['sh', root + '/tests/e2e/netns-wg-admin-core.sh', velvet],
     'dynamic': ['sh', root + '/tests/e2e/netns-dynamic.sh', velvet, babel, ctl],
+    'examples': ['python3', root + '/tests/e2e/netns-examples.py', velvet, babel, ctl],
     'nat': ['python3', root + '/tests/e2e/netns-udp-nat.py', velvet, babel, *cases],
 }
 selected = list(commands) if selection == 'all' else [selection]

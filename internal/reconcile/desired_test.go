@@ -55,6 +55,7 @@ func TestBuildDesiredStateContainsLinkAndRoutingState(t *testing.T) {
 	assertRules(t, desired.Rules, []RulePlan{
 		{TableID: 20000, Priority: 20000, Destination: netip.MustParsePrefix("fd41::20/128")},
 		{TableID: 20000, Priority: 20000, Destination: netip.MustParsePrefix("fd41::/48")},
+		{TableID: 20000, Priority: 20000, Destination: netip.MustParsePrefix("10.100.1.0/24")},
 		{TableID: 20001, Priority: 20001, Source: netip.MustParsePrefix("10.100.1.0/24")},
 	})
 }
@@ -98,6 +99,9 @@ func TestBuildDesiredStateCompilesManagedBabel(t *testing.T) {
 			assertRules(t, desired.Rules, []RulePlan{
 				{TableID: 20000, Priority: 20000, Destination: netip.MustParsePrefix("fd41::/48")},
 				{TableID: 20000, Priority: 20000, Destination: netip.MustParsePrefix("198.51.100.0/24")},
+				{TableID: 20000, Priority: 20000, Destination: src4},
+				{TableID: 20000, Priority: 20000, Destination: netip.MustParsePrefix("10.100.2.0/24")},
+				{TableID: 20000, Priority: 20000, Destination: src6},
 				{TableID: 20001, Priority: 20001, Source: src4},
 				{TableID: 20001, Priority: 20001, Source: netip.MustParsePrefix("10.100.2.0/24")},
 				{TableID: 20001, Priority: 20001, Source: src6},
