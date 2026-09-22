@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/velvet-fabric/velvet-fabric/internal/link"
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/discovery"
@@ -62,7 +63,10 @@ type linkInstall struct {
 
 // manageLink owns the link-local listener for the lifetime of a WG interface.
 // TCP negotiations are short workers; UDP handling continues while they run.
-func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, attempt *dynamicAttempt, onCommit func(engine.Result)) error {
+func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, control *linkControl, onCommit func(engine.Result)) error {
+	if control == nil {
+		control = r.staticControl(plan, onCommit)
+	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	local := plan.BootstrapAddress.Addr()
@@ -78,6 +82,10 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 	if err != nil {
 		socket.Close()
 		return err
+	}
+	if control.ready != nil {
+		control.ready(true)
+		defer control.ready(false)
 	}
 	var workers sync.WaitGroup
 	defer func() { cancel(); listener.Close(); socket.Close(); workers.Wait() }()
@@ -126,6 +134,7 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 	ready, changed := false, false
 	nextPing, nextNegotiation := time.Time{}, time.Time{}
 	start := func(conn net.Conn, target netip.Addr) {
+		initiator := conn == nil
 		busy = true
 		changed = false
 		nextNegotiation = time.Now().Add(time.Second)
@@ -135,7 +144,7 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 				conn, e = dialVFP(ctx, plan.InterfaceName, local, target, r.Desired.VFPPort)
 			}
 			if e == nil {
-				e = r.negotiateLink(ctx, conn, plan, func(value engine.Result) error {
+				e = r.negotiateLink(ctx, conn, plan, initiator, func(value engine.Result) error {
 					request := linkInstall{value, target, make(chan error, 1)}
 					select {
 					case installs <- request:
@@ -174,31 +183,21 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 			return e
 		}
 		healthy = false
-		if attempt != nil {
-			d := r.dynamic
-			d.mu.Lock()
-			if d.isCurrentAttemptLocked(attempt) && attempt.state == dynamicUp {
-				attempt.state = dynamicRecovering
-				d.armConnectivityDeadlineLocked(attempt, ctx)
-				r.log(Event{Event: "velvet-dynamic-link", Status: "recovering", Interface: plan.InterfaceName, RemoteUID: attempt.remote.String(), Error: "Link PONG deadline"})
-			}
-			d.mu.Unlock()
+		if control.failed != nil {
+			control.failed(ctx)
 		}
 		return nil
 	}
 	confirm := func(now time.Time) error {
 		if !healthy {
-			if attempt != nil {
-				err = r.dynamic.commitLink(ctx, attempt, *result)
-			} else {
-				r.dynamic.resourceMu.Lock()
-				err = r.commitLink(ctx, plan, false, *result, onCommit)
-				r.dynamic.resourceMu.Unlock()
-			}
+			err = control.commit(ctx, *result)
 			if err != nil {
 				return fmt.Errorf("confirm Link adjacency: %w", err)
 			}
 			healthy = true
+			if !control.automatic {
+				r.staticTakesOver(result.RemoteUID.UUID)
+			}
 		}
 		health.lastPong = now
 		return nil
@@ -206,7 +205,7 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	helloDelay := linkHelloDelay()
-	if attempt != nil && !attempt.localProposal {
+	if control.passive {
 		// The routed proposer starts WG traffic. Give its handshake and
 		// Hello a head start before independently announcing from this end;
 		// simultaneous WG initiations can repeatedly invalidate each other.
@@ -229,7 +228,7 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 				return incoming.err
 			}
 			target, ok := tcpRemoteAddress(incoming.conn)
-			if !ok || !shouldAcceptDiscovered(local, target) || busy || time.Now().Before(nextNegotiation) {
+			if !ok || (!shouldAcceptDiscovered(local, target) && !(healthy && target == remote)) || busy || time.Now().Before(nextNegotiation) {
 				incoming.conn.Close()
 				continue
 			}
@@ -252,14 +251,14 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 				result = nil
 				health = linkHealth{}
 			}
-			if e != nil && ctx.Err() == nil {
+			if e != nil && !errors.Is(e, errDurableComplete) && ctx.Err() == nil {
 				r.log(Event{Event: "velvet-link-negotiation", Status: "failed", Interface: plan.InterfaceName, Error: e.Error()})
 			}
 			// EOF/errors do not invalidate existing liveness. Only a completed
 			// negotiation or a matching PONG can confirm installed Link state.
 		case request := <-installs:
 			value := request.result
-			if attempt != nil && value.RemoteUID.UUID != attempt.remote {
+			if control.peer != uuid.Nil && value.RemoteUID.UUID != control.peer {
 				request.done <- errors.New("negotiated UID differs from routed target")
 				continue
 			}
@@ -272,14 +271,14 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 					return err
 				}
 				addresses, _ := link.EndpointAddresses(value.Proposal, r.Desired.UUID, value.RemoteUID.UUID)
-				r.dynamic.resourceMu.Lock()
+				r.links.resourceMu.Lock()
 				err = r.Reconciler.Materialize(ctx, r.Desired, plan, addresses, nil)
 				if err == nil {
 					r.mu.Lock()
-					r.states[plan.InterfaceName] = materializedState{desired: plan, local: addresses, remote: value.RemoteUID.UUID, dynamic: attempt != nil}
+					r.states[plan.InterfaceName] = materializedState{desired: plan, local: addresses, remote: value.RemoteUID.UUID, dynamic: control.automatic}
 					r.mu.Unlock()
 				}
-				r.dynamic.resourceMu.Unlock()
+				r.links.resourceMu.Unlock()
 				if err != nil {
 					request.done <- err
 					continue
@@ -326,6 +325,7 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, att
 					return err
 				}
 				if v.Message.Endpoint.IsValid() {
+					r.durable.observeLater(plan, v.Message.Endpoint, remote, now)
 					if e := r.recordEndpointEvidence(ctx, plan.InterfaceName, v.Message.Endpoint); e != nil {
 						r.log(Event{Event: "velvet-endpoint-observation", Status: "failed", Interface: plan.InterfaceName, Error: e.Error()})
 					}

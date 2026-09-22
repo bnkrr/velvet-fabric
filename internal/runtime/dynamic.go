@@ -41,9 +41,9 @@ const (
 	dynamicStopped
 )
 
-// dynamicLinkEngine owns Dynamic Link creation and recovery, including execution,
-// timers and resource lifetime. It uses the existing Reconciler/backend and VFP
-// sessions directly; there is no separate state-aware runtime executor.
+// dynamicLinkEngine schedules automatic discovery and recovery operations.
+// The shared Link manager owns WG resources and port leases across operations.
+// Execution uses the existing Reconciler/backend and VFP sessions.
 //
 // prepare -> propose/accept -> UDP infer/observe/probe -> handoff -> WG/VFP -> up
 // Every failed Attempt stops and retains the existing routed path. Recovery uses
@@ -59,7 +59,7 @@ type dynamicLinkEngine struct {
 
 	// Resource operations take resourceMu before mu. Keep it across removal
 	// and reuse of an interface, while releasing mu during kernel cleanup.
-	resourceMu sync.Mutex
+	resourceMu *sync.Mutex
 	stopped    bool
 
 	mu               sync.Mutex
@@ -95,6 +95,8 @@ type dynamicTarget struct {
 }
 
 type dynamicAttempt struct {
+	controlReady  bool
+	port          *portLease
 	udp           *udpAttempt
 	remote        uuid.UUID
 	operationID   [16]byte
@@ -117,6 +119,7 @@ type dynamicCleanup struct {
 func newDynamicLinkEngine(runner *Runner) *dynamicLinkEngine {
 	return &dynamicLinkEngine{
 		runner:      runner,
+		resourceMu:  &runner.links.resourceMu,
 		probeSource: probe.Source,
 		listenProbe: func(ctx context.Context, local netip.AddrPort, r *probe.Receiver, f func(probe.Received)) (probeSocket, error) {
 			return probe.Listen(ctx, local, r, f)

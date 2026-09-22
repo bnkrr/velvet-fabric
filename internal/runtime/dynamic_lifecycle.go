@@ -20,7 +20,19 @@ func (d *dynamicLinkEngine) startConnectivityLocked(attempt *dynamicAttempt) {
 }
 
 func (d *dynamicLinkEngine) establishDynamic(ctx context.Context, attempt *dynamicAttempt) {
-	err := d.runner.manageLink(ctx, attempt.plan, attempt, nil)
+	var err error
+	for {
+		err = d.runner.manageLink(ctx, attempt.plan, d.linkControl(attempt), nil)
+		if !d.runner.durable.has(attempt.remote) || ctx.Err() != nil {
+			break
+		}
+		_ = d.runner.withdrawLinkAdjacency(ctx, attempt.plan)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
 	if d.ctx.Err() == nil {
 		d.failAttempt(attempt, "Link supervision: "+errorText(err), dynamicAttempting, dynamicRecovering, dynamicUp)
 	}
@@ -136,6 +148,13 @@ func (d *dynamicLinkEngine) removeEvidenceLocked(interfaceName string) {
 // removeInterface requires resourceMu. No new Attempt can reuse the interface
 // between dropping its runtime state and completing kernel deletion.
 func (d *dynamicLinkEngine) removeInterface(plan reconcile.LinkPlan, reason string) {
+	d.runner.mu.RLock()
+	state, exists := d.runner.states[plan.InterfaceName]
+	d.runner.mu.RUnlock()
+	if exists && state.desired.OwnerAlias != plan.OwnerAlias {
+		return
+	}
+
 	d.mu.Lock()
 	d.removeEvidenceLocked(plan.InterfaceName)
 	d.mu.Unlock()
@@ -143,7 +162,9 @@ func (d *dynamicLinkEngine) removeInterface(plan reconcile.LinkPlan, reason stri
 	d.runner.log(Event{Event: "velvet-dynamic-link", Status: "cleanup", Interface: plan.InterfaceName, Error: reason})
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), 5*time.Second)
 	defer cancel()
-	if err := d.runner.Reconciler.RemoveDynamic(cleanupCtx, plan); err != nil {
+	err := d.runner.Reconciler.RemoveDynamic(cleanupCtx, plan)
+	d.runner.links.removed(plan, err)
+	if err != nil {
 		d.runner.log(Event{Event: "velvet-dynamic-link", Status: "cleanup-failed", Interface: plan.InterfaceName, Error: err.Error()})
 	}
 }
@@ -162,7 +183,7 @@ func (d *dynamicLinkEngine) armConnectivityDeadlineLocked(attempt *dynamicAttemp
 func (d *dynamicLinkEngine) expireConnectivity(attempt *dynamicAttempt, ctx context.Context, epoch uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.attempts[attempt.remote] == attempt && attempt.deadlineEpoch == epoch && attempt.state != dynamicUp && ctx.Err() == nil && attempt.cancel != nil {
+	if d.attempts[attempt.remote] == attempt && attempt.deadlineEpoch == epoch && attempt.state != dynamicUp && !d.runner.durable.has(attempt.remote) && ctx.Err() == nil && attempt.cancel != nil {
 		attempt.cancel()
 	}
 }

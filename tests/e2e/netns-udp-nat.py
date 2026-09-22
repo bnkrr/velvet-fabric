@@ -62,6 +62,12 @@ for family in (4, 6):
             "initiator": "a", "retry_fault": fault}
 
 
+for family, ports in ((4, "range"), (6, "system"), (4, "fixed")):
+    CASES[f"v{family}-durable-{ports}"] = {"family": family, "mode": "preserve", "public": ("a", "b"), "durable_test": True, "ports": ports}
+CASES["v4-durable-one-fixed"] = {"family": 4, "mode": "remap", "public": ("a",), "durable_test": True, "ports": "range", "fixed_count": 1}
+CASES["v4-durable-failure"] = {"family": 4, "mode": "preserve", "public": ("a", "b"), "durable_test": True, "ports": "range", "long_failure": True}
+
+
 def endpoint(address, port):
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
 
@@ -242,6 +248,12 @@ def scenario(case):
                     "peers": peers, "babel": {"enabled": True, "executable": BABEL}}
             if node in ("a", "b"):
                 spec["dynamic_links"] = {"mode": "active" if config.get("initiator", node) == node else "passive", "allow_candidate_prefixes": [wan_prefix]}
+            if node in ("a", "b") and config.get("durable_test"):
+                spec["dynamic_links"]["durable"] = {"stable_seconds": 2}
+                if config["ports"] == "range":
+                    spec["node"]["port_range"] = {"first": 40000, "last": 40031}
+                elif config["ports"] == "fixed":
+                    spec["node"]["listen_port"] = 42000 + index
             if node == "b" and config.get("retry_fault", "").startswith("policy-"):
                 spec["dynamic_links"]["mode"] = "off"
             if node == "a" and config.get("retry_fault") == "retry-blackout":
@@ -492,6 +504,9 @@ def scenario(case):
                 assert sum(e.get("event") == "velvet-udp-probe" and
                            e.get("status") == "handoff" for e in events(node)) == 1, \
                     (node, "delayed WG handshake needed a fresh handoff")
+        if config.get("durable_test"):
+            from durable_scenarios import exercise_durable
+            exercise_durable(config, ns, ip, runtime, processes, logs, uuids, DAEMON, wan_addresses, address_match)
         print(f"velvet real UDP / IPv{family} / WG handoff ({case}): PASS", flush=True)
         succeeded = True
     except BaseException:
@@ -536,7 +551,7 @@ def scenario(case):
             print(f"failure evidence retained in {runtime}", file=sys.stderr)
 
 
-selected = sys.argv[3:] or CASES
+selected = sys.argv[3:] or [case for case in CASES if not CASES[case].get("long_failure")]
 unknown = set(selected) - CASES.keys()
 if unknown:
     raise SystemExit(f"unknown cases: {sorted(unknown)}; choose from {list(CASES)}")

@@ -30,6 +30,23 @@ type Backend struct {
 
 func New() *Backend { return &Backend{attempts: make(map[string]endpointAttempt)} }
 
+func (b *Backend) PrepareRuntime(ctx context.Context, desired *reconcile.DesiredState) error {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if desired.Babel == nil {
+		if err := cleanupDisabledBabelState(); err != nil {
+			return err
+		}
+	}
+	if err := rejectForeignTableState(desired); err != nil {
+		return err
+	}
+	return cleanupStaleLinks(desiredLinkNames(desired))
+}
+
 func (b *Backend) Reconcile(ctx context.Context, desired *reconcile.DesiredState, preserveRuntimeLinks bool) error {
 	b.kernelMu.Lock()
 	defer b.kernelMu.Unlock()

@@ -237,9 +237,11 @@ negotiated state is absent, or the adjacency has failed its UDP liveness check.
 After learning the actual remote source address, both endpoints compare the
 two IPv6 addresses as unsigned 128-bit integers. The endpoint with the lower
 address initiates TCP and the endpoint with the higher address accepts. Both
-endpoints listen before sending Hello. A node accepts TCP only when its source
-is an IPv6 link-local address scoped to the expected Link and address ordering
-assigns the remote endpoint the dialling role. Receipt of the peer's Hello need
+endpoints listen before sending Hello. During discovery, a node accepts TCP only when its source is an IPv6 link-local
+address scoped to the expected Link and address ordering assigns the remote
+endpoint the dialling role. On a healthy Link, either peer may initiate a
+separate Durable negotiation (Section 8.18); source scope and peer identity
+checks still apply. Receipt of the peer's Hello need
 not win a scheduling race with TCP accept: the scoped link-local source is
 sufficient return-address evidence on this point-to-point Link. Equal
 addresses are a collision and no VFP session is established. Address ordering
@@ -518,6 +520,11 @@ points.
 | `0x0e` | `LINK_PONG` | Echo a Link challenge and optionally report the observed endpoint |
 | `0x0f` | `POLICY_QUERY` | Ask for the sender's Dynamic-Link admission at the destination node |
 | `0x10` | `POLICY_UPDATE` | Publish the sender's Dynamic-Link admission decision for the recipient |
+| `0x11` | `DURABLE_PROPOSE` | Propose a fixed endpoint agreement on a healthy Link |
+| `0x12` | `DURABLE_SAVED` | Confirm durable local storage of the current agreement |
+| `0x13` | `DURABLE_DECLINE` | Decline the current agreement |
+| `0x14` | `DURABLE_CHECK` | Check an existing saved agreement over routed TCP |
+| `0x15` | `DURABLE_STATUS` | Return readiness for that exact check |
 
 Types `0x01` and `0x02` are TCP messages in both link-bound and routed sessions.
 Types `0x03` and `0x04` are TCP messages in link-bound sessions only; Types
@@ -528,6 +535,8 @@ Section 4.2. Type `0x0b` is operational routed TCP only; `0x0c` is public
 UDP only, under Section 8.16. Types `0x0d` and `0x0e` are UDP-only
 inside a specific WireGuard Link, under Section 8.10. Types `0x0f` and `0x10`
 are routed UDP only, under Section 8.17; they are not Link PING/PONG extensions.
+Types `0x11`..`0x13` are link-bound TCP only; `0x14`..`0x15` are routed TCP only.
+None is valid over UDP. See Section 8.18.
 
 There is no `OPEN_ACK`, `LINK_REJECT`, or generic error Message Type.
 Dynamic discovery results and termination are DISCOVERY_CONTROL records. A valid peer `OPEN` completes the
@@ -552,6 +561,8 @@ proposal held by session state.
 | `0x000b` | `SEALED_PROBE` | 50 or 62 | Context, nonce counter and authenticated ciphertext (Section 8.16) |
 | `0x000c` | `DECLINE_REASON` | 1 | Ordinary or policy rejection of a Dynamic-Link Proposal |
 | `0x000d` | `DYNAMIC_LINK_POLICY` | 9 | Publisher revision and directed Dynamic-Link admission decision |
+| `0x000e` | `FLAGS` | 4 | Network-order unsigned flags; bit 0 is NO_DURABLE |
+| `0x000f` | `STATUS` | 1 | READY=0, NOT_READY=1, ABSENT=2 |
 
 The following subsections define the complete value syntax. Addresses are
 encoded as network-order octets without text, address-family, or prefix-length
@@ -753,7 +764,7 @@ addresses are optional resources and are not required for Velvet control-plane
 or routed data-plane connectivity.
 
 Exactly one proposal may be outstanding in a session. The endpoint with the
-smaller Node UUID sends the initial proposal. Thereafter, proposal ownership
+TCP initiator sends the initial proposal. Thereafter, proposal ownership
 alternates:
 
 1. the sender stores the complete proposal and waits;
@@ -821,7 +832,7 @@ OPEN exchange complete
       v
 NODE_STATE exchange complete
       |
-      | smaller UUID sends LINK_PROPOSE
+      | TCP initiator sends LINK_PROPOSE
       v
 proposal outstanding
       |\
@@ -850,15 +861,16 @@ The static-phase sequence is therefore:
 5. Both endpoints exchange `OPEN`, learning each other's Node UID.
 6. Both endpoints exchange `NODE_STATE`, learning each other's IPv6 node
    loopback.
-7. The lower-UUID endpoint sends the initial complete `LINK_PROPOSE`.
+7. The TCP initiator sends the initial complete `LINK_PROPOSE`.
 8. The peers exchange counterproposals until one side sends `LINK_ACCEPT`.
 9. Both sides install accepted Link addresses. Successful negotiation installs
    the direct `/128` route and admits the Link to managed routing, then closes
    TCP. An empty proposal adds no numbered Link address.
 
-No VFP field carries the Fabric PSK, WireGuard keys, endpoint candidates,
-listen port, persistent keepalive, local Peer name, or local interface name.
-Those values are already known or are local-only configuration.
+This static address negotiation carries no Fabric PSK, WireGuard keys, endpoint
+candidates, listen port, persistent keepalive, local Peer name, or local
+interface name. Those values are already known or are local-only configuration.
+Dynamic discovery and Durable promotion have their own endpoint fields below.
 
 ### 8.8 Static routes
 
@@ -1379,6 +1391,80 @@ returns the peer to unknown and MAY cause a new budgeted initial negotiation;
 policy versions only order observations while that local comparison state is
 retained. Cache eviction MUST NOT repeatedly erase the independent send budget
 to create an unbounded stream of fresh attempts.
+
+### 8.18 Durable agreement and controlled recovery
+
+After OPEN/NODE_STATE, the TCP initiator sends the first business request:
+LINK_PROPOSE for address establishment, or DURABLE_PROPOSE for promotion of a
+healthy automatic Link. The receiver dispatches by that message. No session
+purpose TLV is used. Either peer may initiate a fresh promotion TCP connection
+on an established Link regardless of discovery address ordering. Promotion does
+not reinstall addresses or refresh Link health. Its TCP operation is bounded
+by 10 seconds; an interrupted operation may be retried with the same agreement.
+
+| Message | TLV | Cardinality | Meaning |
+|---|---|---:|---|
+| DURABLE_PROPOSE | OPERATION_ID | 1 | New agreement identifier, retained in storage; local proposals use UUIDv4 bytes |
+| DURABLE_PROPOSE | NODE_UID | 1..2 | Owners of fixed endpoints, ascending UUID order |
+| DURABLE_PROPOSE | WG_ENDPOINT | 1..2 | Endpoint paired with the corresponding UID |
+| DURABLE_PROPOSE | FLAGS | 0..1 | NO_DURABLE asserts the proposer has no confirmed Durable Link |
+| DURABLE_SAVED | OPERATION_ID | 1 | Exactly the current agreement |
+| DURABLE_DECLINE | OPERATION_ID | 1 | Declined agreement |
+| DURABLE_DECLINE | DECLINE_REASON | 1 | Ordinary=0 or policy=1 |
+| DURABLE_DECLINE | DYNAMIC_LINK_POLICY | 0..1 | Required accept=false for policy decline |
+| DURABLE_CHECK | OPERATION_ID | 2 | First: fresh query; second: saved agreement |
+| DURABLE_STATUS | OPERATION_ID | 2 | Exact query and agreement echoed in that order |
+| DURABLE_STATUS | STATUS | 1 | READY, NOT_READY or ABSENT |
+
+Canonical PROPOSE order is OPERATION_ID, alternating NODE_UID/WG_ENDPOINT pairs,
+then optional FLAGS. Other bodies follow table order. Each UID list and endpoint
+list MUST have equal length; UID owners MUST be distinct members of the current
+peer pair. OPEN still identifies the sender. A receiver MUST compare the fixed
+endpoints with its current authenticated Link observations. Fixed endpoints
+are immutable within one agreement identifier; a complete counterproposal,
+including an added local endpoint, uses a fresh UUIDv4 identifier. Receivers
+continue to treat OPERATION_ID as an opaque nonzero 16-octet value. Old
+confirmations MUST NOT confirm a replacement proposal. Excess occurrences beyond each schema
+maximum and unused/unknown TLVs follow the existing first-occurrences rule.
+Unknown flag bits are ignored; unknown STATUS values invalidate the frame.
+
+Only local qualification is needed: a stable Link and a port-preserving endpoint
+(local listening port equals the endpoint port reported by matching LINK_PONG).
+The qualifier proposes its own endpoint. A receiver may add its independently
+qualified local endpoint by counterproposal. No qualification/candidate state
+is published in advance. At least one fixed endpoint is required.
+
+A peer MUST finish atomic persistent replacement, file synchronization and
+directory synchronization before sending DURABLE_SAVED. Local confirmed success
+requires local save and receipt of matching peer SAVED. Each peer sends SAVED;
+TCP delivery alone does not prove remote storage. A saved but unconfirmed record
+is recovery data and reserves local capacity, not confirmed success. Repeated
+negotiation of identical saved parameters is safe. A fresh proposal on a healthy
+Link may replace an older locally saved agreement when the peer has lost or
+retired its record. The replacement reuses that peer's capacity slot, validates
+current fixed endpoints and exchanges new SAVED confirmations; it does not
+inherit the old agreement's confirmed status or failure timer. Saving failure
+MUST NOT send SAVED. Losing the final confirmation does not require rollback of saved recovery
+data or tearing down a healthy Link. Concurrent opposite proposals are locally
+serialized; the lower UUID wins that collision only, without becoming a
+permanent promotion authority.
+
+DURABLE_CHECK cannot create or rewrite an agreement. READY requires the exact
+saved agreement, peer UUID and actual receive resources; NOT_READY means
+the record exists but is not ready. ABSENT includes explicit loss/invalidation.
+A stale query, replaced agreement or mismatched peer MUST NOT refresh READY.
+A checker sends every 10 seconds, bounds each request to 10 seconds, and accepts
+READY for 30 seconds. Local readiness plus continuously fresh peer READY and
+30 minutes of direct WG/link-local VFP failure invalidate the agreement. An
+expired READY or local NOT_READY clears that interval. Healthy Link traffic,
+Static suppression and lack of an alternate routed path are not failure tests.
+No new endpoint, NAT punching or routed data path may demonstrate recovery of
+an old fixed endpoint agreement. Cold recovery prepares listeners and WG peers
+from saved state without waiting for routed WG_READY. A one-direction bootstrap
+is sufficient; a failed reverse direction alone is not evidence of failure.
+An authenticated session may refresh the saved peer name and last loopback
+without changing the agreement identifier. Loopback values and the Fabric
+loopback prefix are locators, not Durable agreement or owner identity fields.
 
 ## 9. Error Handling
 

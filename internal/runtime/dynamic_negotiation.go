@@ -62,10 +62,10 @@ func (d *dynamicLinkEngine) prepareOutbound(session *engine.Session) (*dynamicAt
 	if !d.active() || (target.policy != nil && !target.policy.Accept) {
 		return nil, nil
 	}
-	if d.runner.hasDirectLink(remoteID) || d.attempts[remoteID] != nil {
+	if d.runner.durable.has(remoteID) || d.runner.hasDirectLink(remoteID) || d.attempts[remoteID] != nil {
 		return nil, nil
 	}
-	if len(d.attempts)+len(d.pendingCleanups) >= maxDynamicLinks {
+	if d.resourceCountLocked() >= maxDynamicLinks {
 		d.runner.log(Event{Event: "velvet-dynamic-attempt", Status: "failed", RemoteUID: remoteID.String(), Error: "dynamic Link limit reached"})
 		return nil, nil
 	}
@@ -89,6 +89,11 @@ func (d *dynamicLinkEngine) prepareOutbound(session *engine.Session) (*dynamicAt
 
 func (d *dynamicLinkEngine) handleRoutedMessage(session *engine.Session, value message.Message) error {
 	switch value.Type {
+	case message.DurableCheck:
+		if d.runner.durable != nil {
+			return d.runner.durable.handleCheck(session, value)
+		}
+		return nil
 	case message.DiscoveryControl:
 		return d.handleDiscoveryControl(session, value)
 	case message.DynamicLinkPropose:
@@ -137,12 +142,12 @@ func (d *dynamicLinkEngine) prepareInbound(session *engine.Session, value messag
 		}
 	}()
 	remoteID := session.RemoteUID.UUID
-	if d.stopped || d.ctx.Err() != nil || !d.allowsInbound() || !d.candidateAllowed(value.Endpoint) || d.runner.hasDirectLink(remoteID) {
+	if d.stopped || d.ctx.Err() != nil || !d.allowsInbound() || d.runner.durable.has(remoteID) || !d.candidateAllowed(value.Endpoint) || d.runner.hasDirectLink(remoteID) {
 		return nil
 	}
 	current := d.attempts[remoteID]
 	_, pending := d.pendingCleanups[remoteID]
-	if current == nil && !pending && len(d.attempts)+len(d.pendingCleanups) >= maxDynamicLinks {
+	if current == nil && !pending && d.resourceCountLocked() >= maxDynamicLinks {
 		return nil
 	}
 	if len(d.evidence) == 0 {

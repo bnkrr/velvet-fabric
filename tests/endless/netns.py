@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in endless velvetd membership churn with an independent host verifier."""
 import argparse
+import base64
 from collections import deque
 import hashlib
 import json
@@ -23,6 +24,7 @@ from model import process_fd_limit
 from model import Topology, PendingLinks, NotConverged, address, audit, parse_wg, is_babel_check, nat_heartbeat_fresh
 from coverage_model import Coverage
 from materialization import MaterializedLinks
+from durable_model import DurableAudit
 
 
 class StopRequested(BaseException):
@@ -41,11 +43,15 @@ def arguments():
     parser.add_argument("--dynamic", choices=("active", "off"), default="active")
     parser.add_argument("--nat-policy", choices=("active", "passive"), default="active")
     parser.add_argument("--capture", action="store_true", help="bounded bridge UDP capture; requires tcpdump")
+    parser.add_argument("--quiet", action="store_true", help="write progress only to rotating artifact logs")
     parser.add_argument("--exercise", action="append", default=[],
-                        choices=("policy", "blackout", "control-loss", "nat-reset", "nat-rebind"),
+                        choices=("policy", "blackout", "control-loss", "nat-reset", "nat-rebind", "durable"),
                         help="run each selected online mutation once before membership churn")
     parser.add_argument("--settle-timeout", type=float, default=180)
     parser.add_argument("--stable-seconds", type=float, default=10)
+    parser.add_argument("--durable-stable-seconds", type=int, default=30,
+                        help="test promotion threshold; production failure timeout remains unchanged")
+    parser.add_argument("--automatic-ports", choices=('system', 'range', 'mixed'), default='mixed')
     parser.add_argument("--probe-pairs", type=int, default=16)
     parser.add_argument("--rss-growth-mib", type=int, default=64)
     parser.add_argument("--artifacts", type=Path, help="new directory, never reuse an existing run")
@@ -53,6 +59,7 @@ def arguments():
     parser.add_argument("--validate", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if (args.rounds < 0 or args.probe_pairs < 1 or args.rss_growth_mib < 1
+            or not 1 <= args.durable_stable_seconds <= 31536000
             or not math.isfinite(args.settle_timeout) or not math.isfinite(args.stable_seconds)
             or not 0 < args.stable_seconds < args.settle_timeout):
         parser.error("invalid duration/round/probe/resource bounds")
@@ -62,6 +69,8 @@ def arguments():
         parser.error(str(error))
     if args.dynamic == 'off' and (args.exercise or args.nat_policy != 'active'):
         parser.error('--exercise and --nat-policy require active dynamic discovery')
+    if 'durable' in args.exercise and args.nat_policy != 'active':
+        parser.error('the durable cold-success exercise requires an active NAT initiator')
     if len(args.exercise) != len(set(args.exercise)):
         parser.error('duplicate --exercise')
     if args.dynamic == 'active':
@@ -98,6 +107,8 @@ class Runner:
         self.bridge_created = False
         self.owned_dirs = set()
         self.keys, self.pubs = {}, {}
+        self.durable_audit = DurableAudit(self.uids, self.pubs)
+        self.isolated_static = set()
         self.round, self.probe_cursor = 0, 0
         self.counts = {"add": 0, "delete": 0, "abrupt": 0, "graceful": 0}
         self.started, self.deadline = time.monotonic(), None
@@ -125,7 +136,8 @@ class Runner:
         entry = {"kind": kind, "round": self.round, "elapsed": round(time.monotonic() - self.started, 3), "phase": self.phase, **fields}
         value = json.dumps(entry)
         self.events.info(value)
-        print(value, flush=True)
+        if not getattr(self.args, 'quiet', False):
+            print(value, flush=True)
 
     def timeout(self, maximum=5):
         if self.stop_signal is not None:
@@ -207,12 +219,8 @@ class Runner:
             for peer in range(self.topology.size):
                 if peer == node:
                     continue
-                # NodeSpec requires an endpoint. This deliberately unused WAN
-                # address is only a bootstrap hint; authenticated WG roaming
-                # learns the member that actually selects this public receiver.
-                placeholder = '[2001:db8:ee::ffff]:9' if self.args.underlay == 'ipv6' else '192.0.2.254:9'
                 peers.append({'name': f'in-{peer}', 'public_key': self.pubs[peer],
-                    'listen_port': 52000 + peer, 'endpoints': [placeholder],
+                    'listen_port': 52000 + peer, 'endpoints': [],
                     'interface_name': f'vl-in-{peer:02d}', 'persistent_keepalive_seconds': 1})
         bootstrap = self.topology.boot[node]
         if bootstrap is not None:
@@ -226,7 +234,25 @@ class Runner:
             'peers': peers, 'babel': {'enabled': True, 'executable': str(self.args.babel.resolve())},
             'dynamic_links': {'mode': self.topology.modes[node], 'allow_candidate_prefixes': [
                 '192.0.2.0/24' if self.args.underlay == 'ipv4' else '2001:db8:ee::/64']}}
+        spec['node'].update(self.automatic_ports(node))
+        spec['dynamic_links']['durable'] = {'stable_seconds': getattr(self.args, 'durable_stable_seconds', 1800)}
         (self.runtime / f'{node}.json').write_text(json.dumps(spec))
+
+    def automatic_ports(self, node):
+        mode = getattr(self.args, 'automatic_ports', 'system')
+        if mode == 'range' or (mode == 'mixed' and node % 2):
+            return {'port_range': {'first': 40000, 'last': 40999}}
+        return {'listen_port': 0}
+
+    def durable_records(self, node):
+        path = Path('/var/lib/velvet') / self.uids[node] / 'durable.json'
+        if not path.exists():
+            return []
+        value = json.loads(path.read_text())
+        expected = {'uuid': self.uids[node], 'public_key': self.pubs[node]}
+        if value['version'] != 1 or value['owner'] != expected:
+            raise AssertionError('durable store owner mismatch')
+        return value['records'] or []
 
     def make_namespace(self, node):
         self.run('ip', 'netns', 'add', self.namespace(node))
@@ -279,6 +305,13 @@ class Runner:
         self.coverage.reset(node)
         self.write_config(node)
         self.materialized_links[node] = MaterializedLinks(self.namespace(node))
+        if node in self.isolated_static:
+            self.ns(node, 'nft', '-f', '-', input='''table inet durable_isolation {
+ chain input { type filter hook input priority -30; policy accept;
+ iifname "vl-*" drop; ip6 saddr fd78:e2ee::/48 meta l4proto { tcp, udp } th dport 58420 drop; }
+ chain output { type filter hook output priority -30; policy accept;
+ oifname "vl-*" drop; ip6 daddr fd78:e2ee::/48 meta l4proto { tcp, udp } th dport 58420 drop; }
+}''')
         self.start_daemon(node)
 
     def on_event(self, node, event):
@@ -406,6 +439,7 @@ class Runner:
             if self.capture is not None and self.capture.poll() is not None:
                 raise RuntimeError('packet capture exited unexpectedly; see capture.log')
             observations = self._observe()
+            self.durable_audit.observe(self.topology, observations)
             self.pending_links.observe(observations, time.monotonic())
             return observations
         finally:
@@ -472,6 +506,7 @@ class Runner:
                 "main": json.loads(self.ip(node, "-6", "-j", "route", "show", "table", "main")),
                 "ifindices": {link['ifname']: link['ifindex'] for link in json.loads(self.ip(node, '-j', 'link', 'show', 'type', 'wireguard'))},
                 "babel_sockets": self.ns(node, 'ss', '-H', '-uan', 'sport', '=', ':6696'),
+                "durable_records": self.durable_records(node), "automatic_ports": self.automatic_ports(node),
                 "materialized_ifindices": self.materialized_links[node].read()}
         return self.latest
 
@@ -718,7 +753,7 @@ def main():
         runner.save("manifest.json", {"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "sha256": hashes, "kernel": os.uname().release, "python": os.sys.version, "pid": os.getpid(),
             "namespace_prefix": f"vfe-{runner.token}-", "bridge": runner.bridge, "uids": runner.uids, "topology": topology.state()})
-        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py", "materialization.py"):
+        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py", "materialization.py", "durable_model.py"):
             shutil.copyfile(Path(__file__).with_name(name), artifacts / name)
 
         def stop(signum, _frame):

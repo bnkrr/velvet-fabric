@@ -29,6 +29,9 @@ func (b *Backend) applyBootstrapLink(client *wgctrl.Client, desired reconcile.Li
 	if err := reconcileBootstrapAddress(device, desired.BootstrapAddress); err != nil {
 		return fmt.Errorf("assign bootstrap address: %w", err)
 	}
+	if desired.WaitingPort {
+		return netlink.LinkSetDown(device)
+	}
 	if err := netlink.LinkSetUp(device); err != nil {
 		return fmt.Errorf("set interface up: %w", err)
 	}
@@ -51,6 +54,9 @@ func (b *Backend) applyBootstrapLink(client *wgctrl.Client, desired reconcile.Li
 	}
 	peers = append(peers, peer)
 	privateKey, listenPort := desired.PrivateKey, desired.ListenPort
+	if listenPort == 0 && current.ListenPort != 0 {
+		listenPort = current.ListenPort
+	}
 	config := wgtypes.Config{PrivateKey: &privateKey, ListenPort: &listenPort, Peers: peers}
 	if err := client.ConfigureDevice(desired.InterfaceName, config); err != nil {
 		return fmt.Errorf("configure WireGuard device: %w", err)
@@ -69,6 +75,9 @@ func stalePeerRemovals(peers []wgtypes.Peer, wanted wgtypes.Key) []wgtypes.PeerC
 }
 
 func (b *Backend) endpointChoice(desired reconcile.LinkPlan, current *wgtypes.Device) (int, bool) {
+	if len(desired.Endpoints) == 0 {
+		return 0, false
+	}
 	now := time.Now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -126,6 +135,9 @@ func verifyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) erro
 	if device.Type() != "wireguard" || device.Attrs().Alias != desired.OwnerAlias {
 		return errors.New("interface type or ownership does not match")
 	}
+	if desired.WaitingPort {
+		return nil
+	}
 	if device.Attrs().Flags&net.FlagUp == 0 {
 		return errors.New("interface is down")
 	}
@@ -137,7 +149,7 @@ func verifyBootstrapLink(client *wgctrl.Client, desired reconcile.LinkPlan) erro
 	if err != nil {
 		return fmt.Errorf("read WireGuard device: %w", err)
 	}
-	if wgDevice.PublicKey != desired.PrivateKey.PublicKey() || wgDevice.ListenPort != desired.ListenPort {
+	if wgDevice.PublicKey != desired.PrivateKey.PublicKey() || (desired.ListenPort != 0 && wgDevice.ListenPort != desired.ListenPort) {
 		return errors.New("WireGuard local configuration does not match")
 	}
 	if len(wgDevice.Peers) != 1 || wgDevice.Peers[0].PublicKey != desired.PeerPublicKey || wgDevice.Peers[0].PresharedKey != desired.PresharedKey {

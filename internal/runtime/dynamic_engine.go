@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"github.com/google/uuid"
 	"slices"
 	"time"
 
@@ -35,11 +36,19 @@ func (d *dynamicLinkEngine) prepareAttemptLocked(session *engine.Session, operat
 	}
 	attempt.udp = u
 	if attempt.plan.InterfaceName == "" {
-		plan, err := d.runner.Reconciler.PrepareProbe(d.ctx, d.runner.Desired, nodeUID(session.RemoteUID), int(u.primary.Endpoint().Port()))
+		plan := reconcile.BuildDynamicLink(d.runner.Desired, nodeUID(session.RemoteUID))
+		plan.OwnerAlias += ":" + uuid.UUID(operationID).String()
+		plan.Probing, plan.ListenPort = true, int(u.primary.Endpoint().Port())
+		// Preparation may fail after creating the DOWN interface. Retain its
+		// generation before entering the backend so fallback can remove it.
+		attempt.plan = plan
+		d.runner.links.own(plan, nil)
+		plan, err := d.runner.Reconciler.PrepareLink(d.ctx, plan)
 		if err != nil {
 			return attempt, err
 		}
 		attempt.plan = plan
+		d.runner.links.own(plan, nil)
 	}
 	attempt.plan.ListenPort = int(u.primary.Endpoint().Port())
 	attempt.plan.Probing = true
@@ -93,7 +102,9 @@ func (d *dynamicLinkEngine) commitLink(ctx context.Context, attempt *dynamicAtte
 	if d.stopped || d.attempts[attempt.remote] != attempt || (attempt.state != dynamicAttempting && attempt.state != dynamicRecovering) {
 		return errors.New("dynamic Link Attempt is no longer awaiting connectivity")
 	}
-	if result.RemoteUID.UUID != attempt.remote {
+	if d.runner.hasHealthyStatic(attempt.remote) {
+		failure = errors.New("healthy static Link takes priority")
+	} else if result.RemoteUID.UUID != attempt.remote {
 		failure = errors.New("dynamic Link Node UID does not match routed target")
 	} else {
 		failure = d.runner.commitLink(ctx, attempt.plan, true, result, nil)

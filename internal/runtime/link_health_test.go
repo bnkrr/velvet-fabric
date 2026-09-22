@@ -73,7 +73,7 @@ func TestRuntimeShortNegotiationPreservesLinkAfterTCPCloses(t *testing.T) {
 	}{{a, ac, "vl-a"}, {b, bc, "vl-b"}} {
 		go func() {
 			plan := reconcile.LinkPlan{InterfaceName: peer.name}
-			done <- peer.r.negotiateLink(ctx, peer.c, plan, func(result engine.Result) error { return peer.r.commitLink(ctx, plan, false, result, nil) })
+			done <- peer.r.negotiateLink(ctx, peer.c, plan, peer.r == a, func(result engine.Result) error { return peer.r.commitLink(ctx, plan, false, result, nil) })
 		}()
 	}
 	for range 2 {

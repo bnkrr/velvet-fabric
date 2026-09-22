@@ -62,7 +62,7 @@ func (d *dynamicLinkEngine) prepareUDP(attempt *dynamicAttempt, hint netip.AddrP
 		return nil, err
 	}
 	port := uint16(attempt.plan.ListenPort)
-	u.primary, err = d.listenProbe(ctx, netip.AddrPortFrom(source, port), u.receiver, func(v probe.Received) {
+	u.primary, err = d.reserveProbe(ctx, netip.AddrPortFrom(source, port), u.receiver, func(v probe.Received) {
 		select {
 		case u.arrivals <- v:
 		default:
@@ -72,7 +72,7 @@ func (d *dynamicLinkEngine) prepareUDP(attempt *dynamicAttempt, hint netip.AddrP
 		if err := u.send(message.Control{Code: message.ProbeReport, Round: v.Round, Sequence: v.Sequence, Endpoints: []netip.AddrPort{v.Seen}}); err != nil {
 			cancel()
 		}
-	})
+	}, d.runner.Desired.Ports)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -144,7 +144,13 @@ func (d *dynamicLinkEngine) handoff(a *dynamicAttempt, result linkdiscovery.Peer
 		d.resourceMu.Unlock()
 		return context.Canceled
 	}
-	u.primary.Close()
+	if s, ok := u.primary.(*leasedProbe); ok {
+		s.handoff()
+		a.port = s.lease
+		d.runner.links.own(a.plan, s.lease)
+	} else {
+		u.primary.Close()
+	}
 	plan := a.plan
 	plan.Probing = false
 	plan.ReceiveOnly = true
@@ -337,7 +343,7 @@ func (u *udpAttempt) localSocket(ep netip.AddrPort) (probeSocket, error) {
 	if s := u.sockets[ep]; s != nil {
 		return s, nil
 	}
-	s, err := u.d.listenProbe(u.ctx, ep, u.receiver, func(probe.Received) {})
+	s, err := u.d.reserveProbe(u.ctx, ep, u.receiver, func(probe.Received) {}, u.d.runner.Desired.Ports)
 	if err != nil {
 		return nil, err
 	}

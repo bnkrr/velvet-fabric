@@ -37,8 +37,10 @@ class Coverage:
                       if name in static or name.startswith('vdl-') for peer in link['peers']}
             for target in sorted(topology.components()[source] - {source}):
                 name = direct.get(target)
-                outcome = 'static' if name in static else 'dynamic' if name else 'fallback'
-                requirement = 'direct' if target in topology.required(source) else 'reachable'
+                durable = observations[source].get('durable_by_interface', {}).get(name, {}).get('confirmed')
+                outcome = 'static' if name in static else 'durable' if durable else 'dynamic' if name else 'fallback'
+                recovering = target in observations[source].get('durable_recovery_peers', ())
+                requirement = 'durable-recovery' if recovering else 'direct' if target in topology.required(source) else 'reachable'
                 key = (self.family, profile(topology, source), profile(topology, target),
                        topology.modes[source], topology.modes[target], requirement, outcome)
                 self.matrix[key] += 1

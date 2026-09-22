@@ -1,4 +1,4 @@
-# Dynamic Link validation
+# Link validation
 
 Dynamic Link acceptance follows the complete path: discover a reachable Node
 UID over the existing Fabric, infer and measure locally, coordinate a bounded
@@ -31,6 +31,8 @@ go test ./internal/inference ./internal/linkdiscovery
 go test ./internal/linkdiscovery -run '^TestPeer.*Matrix$' -v
 go test -race ./...
 go vet ./...
+go test ./internal/vfp/message -run '^$' -fuzz '^FuzzDurableDecode$' -fuzztime 5s
+go test ./internal/vfp/message -run '^$' -fuzz '^FuzzMessageDecode$' -fuzztime 5s
 go test ./internal/vfp/probe -run '^$' -fuzz '^FuzzPublicProbeEnvelope$' -fuzztime 5s
 ```
 
@@ -275,3 +277,41 @@ restart, missing publisher cache, source/UUID conflicts, stale/duplicate snapsho
 late operations, independent budgets, reply coalescing, fairness and bounded caches.
 The ordinary routed failure regressions retain the actual VFP session callbacks,
 response timer and cleanup checks while requiring future retry eligibility.
+
+## Unified Link and Durable acceptance
+
+The shared health loop admits Static, Dynamic and Durable Links to Babel only
+following WG/VFP establishment and local installation. Unit tests exercise
+resource generations, cleanup failure retaining a port lease, stale callbacks,
+fixed/range exhaustion, explicit system-port overrides, bilateral persistence,
+interrupted confirmations, replacement after one-sided record loss/deletion,
+immutable versus variable endpoints, and READY
+freshness across TCP reconnections. Store loading rejects invalid or mismatched
+state without replacing the original file. Persistence fault injection covers partial
+writes, file sync, rename and directory sync, including failure after replacement.
+Fake-clock tests cover the complete
+30-minute continuous-failure boundary and reset it on offline or unready peers.
+
+The ordinary `all` VM suite includes these additional real-kernel cases:
+
+| Case | Required result |
+|---|---|
+| `ports` | Empty-endpoint Static waits on a fixed port; external port occupation recovers by retry; the peer's explicit `listen_port: 0` overrides its node range, and a later port change reconnects without filling the waiting peer's endpoint list |
+| `v4-durable-range` | Range allocation, bilateral promotion, both daemons restart with all Static paths blocked, pinned-port WG/VFP and payload recovery, unilateral deletion and fresh promotion, off/peer-ABSENT cleanup |
+| `v6-durable-system` | The same recovery using IPv6 and system-assigned ports saved before restart |
+| `v4-durable-fixed` | The same recovery with explicit fixed automatic ports |
+| `v4-durable-one-fixed` | Only the public side is port-preserving; the NAT side restarts with a new local port range while keeping the agreement and recovering payload traffic |
+
+Run the real default failure-window test separately; it takes over 30 minutes:
+
+```sh
+tests/e2e/run-on-vm.sh nat v4-durable-failure
+```
+
+It first promotes and cold-recovers a Link, then blocks direct WG traffic while
+restoring the Static routed path. Both peers must keep their records before the
+failure deadline and remove them after 30 continuous minutes of actual local
+readiness and fresh routed READY responses. Repeated CHECKs use new TCP sessions.
+Promotion stability is shortened only in these test configurations; the failure
+window is the production default. Run finite VM suites serially as described in
+[VM setup](VM.md).

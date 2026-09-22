@@ -27,6 +27,16 @@ type Reconciler struct{ backend Backend }
 
 func New(backend Backend) *Reconciler { return &Reconciler{backend: backend} }
 
+// Retire old interface generations before reserving their replacement ports.
+func (r *Reconciler) PrepareRuntime(ctx context.Context, desired *DesiredState) error {
+	if backend, ok := r.backend.(interface {
+		PrepareRuntime(context.Context, *DesiredState) error
+	}); ok {
+		return backend.PrepareRuntime(ctx, desired)
+	}
+	return nil
+}
+
 func (r *Reconciler) Reconcile(ctx context.Context, desired *DesiredState) error {
 	return r.reconcile(ctx, desired, false)
 }
@@ -56,6 +66,7 @@ func (r *Reconciler) Materialize(ctx context.Context, state *DesiredState, desir
 func BuildDynamicLink(state *DesiredState, remote spec.NodeUID) LinkPlan {
 	interfaceName := spec.DynamicInterfaceName(remote)
 	return LinkPlan{
+		Ports: state.Ports, ListenPort: state.Ports.Port,
 		PeerName: remote.UUID, InterfaceName: interfaceName,
 		OwnerAlias:       "velvet:link:" + state.UUID.String() + ":dynamic:" + remote.UUID,
 		PrivateKey:       state.PrivateKey,
@@ -85,7 +96,10 @@ func (r *Reconciler) ConfigureDynamic(ctx context.Context, state *DesiredState, 
 	}
 	plan.PeerPublicKey = peerPublicKey
 	plan.PresharedKey = psk
-	plan.Endpoints = []string{endpoint.String()}
+	plan.Endpoints = nil
+	if endpoint.IsValid() {
+		plan.Endpoints = []string{endpoint.String()}
+	}
 	return plan, r.backend.ConfigureDynamic(ctx, plan)
 }
 
@@ -103,4 +117,25 @@ func (r *Reconciler) ListenPort(ctx context.Context, interfaceName string) (int,
 
 func (r *Reconciler) ReachableLoopbacks(ctx context.Context, state *DesiredState) ([]netip.Addr, error) {
 	return r.backend.ReachableLoopbacks(ctx, state.FabricTableID, state.LoopbackPoolV6)
+}
+
+// PrepareLink reserves a compiled automatic Link, including durable cold restore.
+func (r *Reconciler) PrepareLink(ctx context.Context, plan LinkPlan) (LinkPlan, error) {
+	return r.backend.PrepareDynamic(ctx, plan)
+}
+
+func (r *Reconciler) ConfigureLink(ctx context.Context, plan LinkPlan) error {
+	return r.backend.ConfigureDynamic(ctx, plan)
+}
+
+// LinkReady includes kernel receive state; a configured port on a DOWN device
+// alone is not evidence that a controlled recovery can be received.
+func (r *Reconciler) LinkReady(ctx context.Context, plan LinkPlan) bool {
+	if backend, ok := r.backend.(interface {
+		LinkReady(context.Context, LinkPlan) bool
+	}); ok {
+		return backend.LinkReady(ctx, plan)
+	}
+	port, err := r.backend.ListenPort(ctx, plan.InterfaceName)
+	return err == nil && port == plan.ListenPort
 }

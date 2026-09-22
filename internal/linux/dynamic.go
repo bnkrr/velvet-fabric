@@ -52,7 +52,7 @@ func (b *Backend) PrepareDynamic(ctx context.Context, desired reconcile.LinkPlan
 		return reconcile.LinkPlan{}, fmt.Errorf("open WireGuard control client: %w", err)
 	}
 	defer client.Close()
-	listenPort := 0
+	listenPort := desired.ListenPort
 	privateKey := desired.PrivateKey
 	if err := client.ConfigureDevice(desired.InterfaceName, wgtypes.Config{
 		PrivateKey: &privateKey, ListenPort: &listenPort, ReplacePeers: true,
@@ -62,6 +62,9 @@ func (b *Backend) PrepareDynamic(ctx context.Context, desired reconcile.LinkPlan
 	configured, err := client.Device(desired.InterfaceName)
 	if err != nil {
 		return reconcile.LinkPlan{}, fmt.Errorf("read dynamic WireGuard endpoint: %w", err)
+	}
+	if desired.ListenPort != 0 && configured.ListenPort != desired.ListenPort {
+		return reconcile.LinkPlan{}, errors.New("WireGuard did not retain the reserved listen port")
 	}
 	if configured.ListenPort < 1 || configured.ListenPort > 65535 {
 		return reconcile.LinkPlan{}, errors.New("kernel did not allocate a dynamic WireGuard listen port")
@@ -179,4 +182,18 @@ func requireExactlyOwnedWireGuardInterface(name, owner string) (netlink.Link, er
 
 func isExactlyOwnedWireGuardInterface(device netlink.Link, owner string) bool {
 	return device != nil && device.Type() == "wireguard" && device.Attrs().Alias == owner
+}
+
+func (b *Backend) LinkReady(ctx context.Context, plan reconcile.LinkPlan) bool {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
+	if ctx.Err() != nil || plan.WaitingPort || plan.Probing {
+		return false
+	}
+	client, err := wgctrl.New()
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+	return verifyBootstrapLink(client, plan) == nil
 }

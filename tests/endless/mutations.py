@@ -6,6 +6,7 @@ import signal
 import time
 
 from model import NotConverged, address, parse_wg
+from durable_model import agreement, fixed
 
 
 def observe(r):
@@ -67,10 +68,6 @@ def reload_mode(r, node, mode):
     r.record('policy-applied', node=node, mode=mode, retired_babel_pid=old_babel)
 
 
-def proposals_to(r, node):
-    return sum(r.coverage.proposals[peer, node] for peer in r.topology.active - {node})
-
-
 def proposals_from(r, node):
     return sum(r.coverage.proposals[node, peer] for peer in r.topology.active - {node})
 
@@ -86,10 +83,16 @@ def policy(r, node):
         return all(not any(name.startswith('vdl-' if peer == node else f'vdl-n{node}-')
                            for name in r.latest[peer]['wg']) for peer in r.topology.active)
     wait_for(r, retired, 75, 'pre-policy dynamic interfaces have not retired')
-    before = proposals_to(r, node), proposals_from(r, node)
-    hold(r, 18)
-    assert before == (proposals_to(r, node), proposals_from(r, node)), 'off caused a proposal loop'
+    before = {peer: r.coverage.proposals[peer, node] for peer in r.topology.active - {node}}
+    outgoing = proposals_from(r, node)
+    # ABSENT retires a saved agreement but says nothing about admission. A peer
+    # whose policy update was lost may make one bounded proposal and learn the
+    # current refusal. Reject repeated attempts, not that first legitimate query.
+    hold(r, 36)
+    assert proposals_from(r, node) == outgoing, 'off node initiated a proposal'
+    assert all(r.coverage.proposals[peer, node] - count <= 1 for peer, count in before.items()), 'off caused repeated proposals'
     r.verify()
+    assert not r.durable_records(node), 'off retained saved Durable agreements'
     before_passive = proposals_from(r, node)
     reload_mode(r, node, 'passive')
     r.verify()
@@ -107,6 +110,7 @@ def packet_count(r, node):
 def blocked_pair(r, node, peer, control=False):
     before = {n: list(dynamic(r, n, t)) for n, t in ((node, peer), (peer, node))}
     assert all(before.values()), 'fault requires an established non-bootstrap Dynamic Link'
+    saved = paired_agreement(r, node, peer)
     family = 'ip' if r.args.underlay == 'ipv4' else 'ip6'
     if control:
         incoming = f'ip6 saddr {address(peer)} meta l4proto {{ tcp, udp }} th dport 58420'
@@ -135,6 +139,12 @@ def blocked_pair(r, node, peer, control=False):
             for n, names in before.items():
                 for name in names:
                     r.ip(n, 'link', 'del', name)
+        if control and saved:
+            wait_for(r, lambda: direct_pair(r, node, peer) and paired_agreement(r, node, peer) == saved,
+                     r.args.settle_timeout, 'Durable could not recover without routed control')
+            r.record('durable-control-independent', node=node, peer=peer, agreement=saved)
+            r.verify()
+            return
         hold(r, 20 if control else 40)
         def fallback():
             # Interface loss may still be inside the ordinary retry backoff;
@@ -157,6 +167,7 @@ def blocked_pair(r, node, peer, control=False):
 
 
 def reset_nat(r, node, rebind=False):
+    saved = {peer: r.durable_records(peer) for peer in r.topology.active}
     before = {peer: dynamic(r, peer, node) for peer in sorted(r.topology.active & r.topology.public)
               if peer != r.topology.boot[node]}
     old_wan = r.wan(node)
@@ -191,9 +202,31 @@ def reset_nat(r, node, rebind=False):
                 assert ipaddress.ip_address(host.strip('[]')) == ipaddress.ip_address(r.wan(node)), 'stale WAN endpoint'
                 assert all(value['endpoint'] != old['endpoint'] for old in old_links.values()), 'endpoint did not change'
         r.record('endpoint-change-verified', node=node, wan=r.wan(node))
+        for owner, records in saved.items():
+            for record in records:
+                if r.uids[node] not in (r.uids[owner], record['peer']['uuid']):
+                    continue
+                other = next(n for n, uid in r.uids.items() if uid == record['peer']['uuid']) if owner == node else owner
+                if other not in before:
+                    # An optional NAT/NAT Link may still be disconnected. No
+                    # new authenticated endpoint observation has invalidated it;
+                    # that agreement follows the controlled failure window.
+                    # A Static-suppressed agreement likewise has no observation
+                    # of its own endpoint merely because Static carries traffic.
+                    continue
+                current = {agreement(item): item for item in r.durable_records(owner)}
+                if any(uid == r.uids[node] for uid, _ in fixed(record, r.uids[owner])):
+                    old_id = agreement(record)
+                    wait_for(r, lambda: all(agreement(item) != old_id for item in r.durable_records(owner)),
+                             30, 'changed fixed endpoint kept old agreement after fresh health observations')
+                elif record['confirmed']:
+                    assert agreement(record) in current, 'variable endpoint change lost agreement'
 
 
 def exercise(r, name):
+    if name == 'durable':
+        durable_recovery(r)
+        return
     candidates = sorted(r.topology.active - r.topology.public)
     if not candidates:
         raise ValueError('online mutations require a NAT member')
@@ -212,3 +245,92 @@ def exercise(r, name):
         if name != 'policy' or n != node:
             assert identities[n][1] == info['resources']['babel']['pid'], 'online mutation restarted unrelated Babel'
     r.record('exercise-verified', exercise=name, node=node, peer=peer)
+
+
+def paired_agreement(r, node, peer):
+    records = []
+    for a, b in ((node, peer), (peer, node)):
+        value = next((item for item in r.durable_records(a)
+                      if item['peer']['uuid'] == r.uids[b] and item['confirmed']), None)
+        if value is None:
+            return None
+        records.append(value)
+    if (agreement(records[0]) == agreement(records[1])
+            and fixed(records[0], r.uids[node]) == fixed(records[1], r.uids[peer])):
+        return agreement(records[0])
+    return None
+
+
+def direct_pair(r, node, peer):
+    for a, b in ((node, peer), (peer, node)):
+        links = dynamic(r, a, b)
+        if not links or not all(p['handshake'] and {'0.0.0.0/0', '::/0'} <= set(p['allowed'])
+                                for p in links.values()):
+            return False
+        routes = json.loads(r.ip(a, '-6', '-j', 'route', 'show', 'table', '20000', 'exact', address(b) + '/128'))
+        if not any(str(route.get('protocol')) == '202' and route.get('dev') in links for route in routes):
+            return False
+    return r.ping(node, peer) and r.ping(peer, node)
+
+
+def durable_recovery(r):
+    selected = []
+
+    def qualified():
+        # Soft admission does not promise that any particular pair promotes.
+        # Select an actually bilateral agreement without changing product limits.
+        for node in sorted(r.topology.active - r.topology.public):
+            for peer in sorted(r.topology.active & r.topology.public):
+                if peer != r.topology.boot[node] and paired_agreement(r, node, peer):
+                    selected[:] = node, peer
+                    return True
+        return False
+
+    wait_for(r, qualified,
+             r.args.settle_timeout + getattr(r.args, 'durable_stable_seconds', 1800),
+             'both peers did not durably save the same agreement')
+    node, peer = selected
+    saved = paired_agreement(r, node, peer)
+    records = {n: next(item for item in r.durable_records(n) if agreement(item) == saved) for n in (node, peer)}
+    survivors = {n: info['proc'].pid for n, info in r.nodes.items() if n not in (node, peer)}
+    r.record('durable-cold-start', node=node, peer=peer, agreement=saved)
+    r.isolated_static.update((node, peer))
+    try:
+        # Both namespaces and NAT state disappear; only node identity/configuration
+        # and saved Durable state survive. No old WG interface can satisfy this.
+        for n in (node, peer):
+            r.stop_node(n, abrupt=True)
+        for n in (node, peer):
+            r.add_node(n)
+        wait_for(r, lambda: paired_agreement(r, node, peer) == saved and direct_pair(r, node, peer),
+                 r.args.settle_timeout, 'cold Durable could not recover with all Static paths blocked')
+        for n, record in records.items():
+            current = next(item for item in r.durable_records(n) if agreement(item) == saved)
+            assert fixed(current, r.uids[n]) == fixed(record, r.uids[n]), 'cold recovery changed recovery endpoints'
+            if any(uid == r.uids[n] for uid, _ in fixed(record, r.uids[n])):
+                assert current['local']['listen_port'] == record['local']['listen_port'], 'cold recovery lost fixed port'
+        for n, pid in survivors.items():
+            assert r.nodes[n]['proc'].pid == pid, 'cold exercise restarted an unrelated node'
+        r.record('durable-cold-verified', node=node, peer=peer, agreement=saved)
+    finally:
+        r.isolated_static.difference_update((node, peer))
+        for n in (node, peer):
+            if n in r.nodes:
+                r.ns(n, 'nft', 'delete', 'table', 'inet', 'durable_isolation')
+    r.verify()
+    # Let a configured Static take over this exact peer pair. Its different WG
+    # ports must not be mistaken for a mutation of the standby Durable agreement.
+    original_bootstrap = r.topology.boot[node]
+    try:
+        r.topology.boot[node] = peer
+        reload_mode(r, node, r.topology.modes[node])
+        r.verify()
+        assert paired_agreement(r, node, peer) == saved, 'Static takeover erased standby Durable'
+        assert not dynamic(r, node, peer) and not dynamic(r, peer, node), 'Static left duplicate automatic resources'
+        r.record('durable-static-standby', node=node, peer=peer, agreement=saved)
+    finally:
+        r.topology.boot[node] = original_bootstrap
+        reload_mode(r, node, r.topology.modes[node])
+    r.verify()
+    assert paired_agreement(r, node, peer) == saved and direct_pair(r, node, peer), 'standby Durable did not resume'
+    r.record('durable-standby-resumed', node=node, peer=peer, agreement=saved)

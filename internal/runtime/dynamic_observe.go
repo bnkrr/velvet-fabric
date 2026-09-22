@@ -100,7 +100,7 @@ func (d *dynamicLinkEngine) startObserver(s *engine.Session, id [16]byte, target
 			}
 			d.mu.Unlock()
 		}()
-		var sockets []*probe.Socket
+		var sockets []probeSocket
 		defer func() {
 			for _, socket := range sockets {
 				socket.Close()
@@ -122,20 +122,20 @@ func (d *dynamicLinkEngine) startObserver(s *engine.Session, id [16]byte, target
 		}
 		var endpoints []netip.AddrPort
 		for range 2 {
-			socket, err := probe.Listen(ctx, netip.AddrPortFrom(local, 0), receiver, func(v probe.Received) {
+			socket, err := d.reserveProbe(ctx, netip.AddrPortFrom(local, 0), receiver, func(v probe.Received) {
 				if v.Round != 0 {
 					return
 				}
 				if err := sendDiscovery(s, id, message.Control{Code: message.ProbeReport, Sequence: v.Sequence, Endpoints: []netip.AddrPort{v.Seen}}); err != nil {
 					cancel()
 				}
-			})
+			}, d.runner.Desired.Ports)
 			if err != nil {
 				fail()
 				return
 			}
 			sockets = append(sockets, socket)
-			prediction := inference.Infer(nil, inference.SurveyInput{Local: socket.Local, Target: target, PublicIPs: []netip.Addr{public}, BaseOnly: true})
+			prediction := inference.Infer(nil, inference.SurveyInput{Local: socket.Endpoint(), Target: target, PublicIPs: []netip.Addr{public}, BaseOnly: true})
 			endpoints = append(endpoints, linkdiscovery.CandidatesFor(prediction, 1)...)
 		}
 		if err = sendDiscovery(s, id, message.Control{Code: message.ObserveReady, Key: receiver.Key, Endpoints: endpoints}); err != nil {

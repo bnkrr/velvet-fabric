@@ -16,11 +16,6 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-const (
-	minimumDerivedPort = 20000
-	derivedPortSpan    = 40000
-)
-
 type Bootstrap struct {
 	InterfaceName string
 	ListenPort    int
@@ -48,10 +43,9 @@ func DeriveBootstrap(fabricPSK []byte, localPrivate, peerPublic wgtypes.Key, loc
 	if peer.InterfaceName != "" {
 		interfaceName = peer.InterfaceName
 	}
-	portDigest := digest(fabricPSK, []byte("velvet-fabric/wg-listen-port/v1"), localPublic[:], peerPublic[:])
 	result := Bootstrap{
 		InterfaceName: interfaceName,
-		ListenPort:    minimumDerivedPort + int(binary.BigEndian.Uint16(portDigest[:2]))%derivedPortSpan,
+		ListenPort:    0,
 		LocalAddress:  DeriveLinkLocal(fabricPSK, uid, interfaceName),
 	}
 	if peer.ListenPort != nil {

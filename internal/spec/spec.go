@@ -61,8 +61,9 @@ type BabelSpec struct {
 }
 
 type DynamicLinksSpec struct {
-	Mode                   string   `json:"mode"`
-	AllowCandidatePrefixes []string `json:"allow_candidate_prefixes,omitempty"`
+	Durable                *DurableSpec `json:"durable,omitempty"`
+	Mode                   string       `json:"mode"`
+	AllowCandidatePrefixes []string     `json:"allow_candidate_prefixes,omitempty"`
 }
 
 const (
@@ -72,9 +73,11 @@ const (
 )
 
 type Node struct {
-	UID               NodeUID `json:"uid"`
-	PrivateKey        string  `json:"private_key"`
-	LoopbackAddressV6 string  `json:"loopback_address_v6,omitempty"`
+	ListenPort        *int       `json:"listen_port,omitempty"`
+	PortRange         *PortRange `json:"port_range,omitempty"`
+	UID               NodeUID    `json:"uid"`
+	PrivateKey        string     `json:"private_key"`
+	LoopbackAddressV6 string     `json:"loopback_address_v6,omitempty"`
 }
 
 type NodeUID struct {
@@ -83,13 +86,14 @@ type NodeUID struct {
 }
 
 type Peer struct {
-	Name                       string   `json:"name"`
-	PublicKey                  string   `json:"public_key"`
-	Endpoints                  []string `json:"endpoints"`
-	ListenPort                 *int     `json:"listen_port,omitempty"`
-	LinkAddresses              []string `json:"link_addresses,omitempty"`
-	PersistentKeepaliveSeconds *int     `json:"persistent_keepalive_seconds,omitempty"`
-	InterfaceName              string   `json:"interface_name,omitempty"`
+	PortRange                  *PortRange `json:"port_range,omitempty"`
+	Name                       string     `json:"name"`
+	PublicKey                  string     `json:"public_key"`
+	Endpoints                  []string   `json:"endpoints"`
+	ListenPort                 *int       `json:"listen_port,omitempty"`
+	LinkAddresses              []string   `json:"link_addresses,omitempty"`
+	PersistentKeepaliveSeconds *int       `json:"persistent_keepalive_seconds,omitempty"`
+	InterfaceName              string     `json:"interface_name,omitempty"`
 }
 
 // Routes groups destination routes by the locally configured next-hop Peer.
@@ -301,6 +305,14 @@ func (s *NodeSpec) Validate() error {
 		}
 	}
 	validateLoopback("loopback_address_v6", s.Node.LoopbackAddressV6, loopV6, loopV6Err)
+	if err := ValidatePorts(s.Node.ListenPort, s.Node.PortRange); err != nil {
+		problems = append(problems, "node: "+err.Error())
+	}
+	if s.DynamicLinks != nil && s.DynamicLinks.Durable != nil {
+		if err := s.DynamicLinks.Durable.Validate(); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
 	if len(s.Peers) == 0 {
 		problems = append(problems, "peers must not be empty")
 	}
@@ -322,9 +334,6 @@ func (s *NodeSpec) Validate() error {
 		} else if privateKeyErr == nil && publicKey == privateKey.PublicKey() {
 			problems = append(problems, where+".public_key cannot equal the local WireGuard public key")
 		}
-		if len(peer.Endpoints) == 0 {
-			problems = append(problems, where+".endpoints must not be empty")
-		}
 		seenEndpoints := map[string]struct{}{}
 		for _, endpoint := range peer.Endpoints {
 			if err := validateEndpoint(endpoint); err != nil {
@@ -334,13 +343,15 @@ func (s *NodeSpec) Validate() error {
 			}
 			seenEndpoints[endpoint] = struct{}{}
 		}
-		if peer.ListenPort != nil {
-			if *peer.ListenPort < 1 || *peer.ListenPort > 65535 {
-				problems = append(problems, where+".listen_port must be between 1 and 65535")
-			} else if other, ok := ports[*peer.ListenPort]; ok {
+		if err := ValidatePorts(peer.ListenPort, peer.PortRange); err != nil {
+			problems = append(problems, where+": "+err.Error())
+		}
+		choice := s.PeerPorts(peer)
+		if choice.Port > 0 {
+			if other, ok := ports[choice.Port]; ok {
 				problems = append(problems, fmt.Sprintf("%s.listen_port is already used by peer %q", where, other))
 			}
-			ports[*peer.ListenPort] = peer.Name
+			ports[choice.Port] = peer.Name
 		}
 		if peer.PersistentKeepaliveSeconds != nil && (*peer.PersistentKeepaliveSeconds < 0 || *peer.PersistentKeepaliveSeconds > 65535) {
 			problems = append(problems, where+".persistent_keepalive_seconds must be between 0 and 65535")

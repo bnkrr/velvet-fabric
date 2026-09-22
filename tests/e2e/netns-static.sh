@@ -12,6 +12,7 @@ ns_b="vl-b-${suffix}"
 runtime=$(mktemp -d /tmp/velvet-e2e.XXXXXXXX)
 pid_a=
 pid_b=
+port_holder=
 cleanup() {
 	status=$?
 	if test "${status}" -ne 0; then
@@ -24,6 +25,7 @@ cleanup() {
 		ip -n "${ns_a}" -6 -details rule show 2>/dev/null >&2 || true
 		ip -n "${ns_b}" -6 -details rule show 2>/dev/null >&2 || true
 	fi
+  test -z "${port_holder}" || kill "${port_holder}" 2>/dev/null || true
   test -z "${pid_a}" || kill "${pid_a}" 2>/dev/null || true
   test -z "${pid_b}" || kill "${pid_b}" 2>/dev/null || true
   ip netns del "${ns_a}" 2>/dev/null || true
@@ -114,6 +116,24 @@ cat > "${runtime}/b.json" <<EOF
 }
 EOF
 
+if test "${2:-}" = ports; then
+  python3 - "${runtime}" <<'PYPORTS'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+a = json.loads((root / 'a.json').read_text())
+b = json.loads((root / 'b.json').read_text())
+a['peers'][0]['endpoints'] = []
+b['node']['port_range'] = {'first': 40000, 'last': 40031}
+b['peers'][0]['listen_port'] = 0
+(root / 'a.json').write_text(json.dumps(a, indent=2))
+(root / 'b.json').write_text(json.dumps(b, indent=2))
+PYPORTS
+  ip netns exec "${ns_a}" python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.bind(("::",51001)); open(sys.argv[1],"w").close(); time.sleep(7)' "${runtime}/port-held" &
+  port_holder=$!
+  while test ! -f "${runtime}/port-held"; do sleep 0.1; done
+fi
+
+establish() {
 ip netns exec "${ns_a}" "${velvetd}" --config "${runtime}/a.json" --once >"${runtime}/a.log" 2>&1 &
 pid_a=$!
 ip netns exec "${ns_b}" "${velvetd}" --config "${runtime}/b.json" --once >"${runtime}/b.log" 2>&1 &
@@ -122,7 +142,7 @@ pid_b=$!
 attempt=0
 while kill -0 "${pid_a}" 2>/dev/null || kill -0 "${pid_b}" 2>/dev/null; do
   attempt=$((attempt + 1))
-  if test "${attempt}" -ge 30; then
+  if test "${attempt}" -ge 45; then
     echo "velvetd did not establish the Link" >&2
     cat "${runtime}/a.log" >&2
     cat "${runtime}/b.log" >&2
@@ -138,6 +158,9 @@ wait "${pid_a}"
 wait "${pid_b}"
 pid_a=
 pid_b=
+
+}
+establish
 
 grep -q '"uuid": "[0-9a-f-][0-9a-f-]*"' "${runtime}/a.json"
 grep -q '"uuid": "[0-9a-f-][0-9a-f-]*"' "${runtime}/b.json"
@@ -175,4 +198,21 @@ ip netns exec "${ns_a}" ping -6 -c 1 -W 2 "${b_loop6}" >/dev/null
 ip netns exec "${ns_b}" ping -6 -c 1 -W 2 "${a_loop6}" >/dev/null
 test "$(ip netns exec "${ns_a}" wg show vl-a-b dump | awk 'NR == 2 {print $8}')" = "5"
 
-echo "velvet VFP unnumbered static-Link E2E: PASS"
+if test "${2:-}" = ports; then
+  grep -q '"event":"velvet-link-port","status":"waiting"' "${runtime}/a.log"
+  test "$(ip netns exec "${ns_a}" wg show vl-a-b listen-port)" -eq 51001
+  test "$(ip netns exec "${ns_b}" wg show vl-b-custom listen-port)" -gt 0
+  old_port=$(ip netns exec "${ns_b}" wg show vl-b-custom listen-port)
+  ip -n "${ns_b}" link del vl-b-custom
+  ip netns exec "${ns_b}" python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.bind(("::",int(sys.argv[1]))); open(sys.argv[2],"w").close(); time.sleep(60)' "${old_port}" "${runtime}/old-port-held" &
+  port_holder=$!
+  while test ! -f "${runtime}/old-port-held"; do sleep 0.1; done
+  establish
+  test "$(ip netns exec "${ns_b}" wg show vl-b-custom listen-port)" -ne "${old_port}"
+  ip netns exec "${ns_a}" ping -6 -c 1 -W 2 "${b_loop6}" >/dev/null
+  python3 - "${runtime}/a.json" <<'PYEMPTY'
+import json, sys
+assert json.load(open(sys.argv[1]))['peers'][0]['endpoints'] == []
+PYEMPTY
+fi
+echo "velvet VFP unnumbered static-Link E2E (${2:-fixed}): PASS"

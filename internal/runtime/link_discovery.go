@@ -16,6 +16,21 @@ import (
 
 func (r *Runner) runLink(ctx context.Context, desired reconcile.LinkPlan, established chan<- struct{}) {
 	var once sync.Once
+	if desired.WaitingPort {
+		var err error
+		for failures := uint8(0); ctx.Err() == nil; failures = min(failures+1, 7) {
+			desired, err = r.retryStaticPort(ctx, desired)
+			if err == nil {
+				break
+			}
+			r.log(Event{Event: "velvet-link-port", Status: "waiting", Interface: desired.InterfaceName, Error: err.Error()})
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryDelay(failures)):
+			}
+		}
+	}
 	for ctx.Err() == nil {
 		err := r.manageLink(ctx, desired, nil, func(engine.Result) { once.Do(func() { established <- struct{}{} }) })
 		if ctx.Err() != nil {

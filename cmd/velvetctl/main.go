@@ -15,12 +15,14 @@ import (
 )
 
 type resolvedLink struct {
-	PeerName         string   `json:"peer_name"`
-	InterfaceName    string   `json:"interface_name"`
-	ListenPort       int      `json:"listen_port"`
-	BootstrapAddress string   `json:"bootstrap_address"`
-	VFPDiscovery     string   `json:"vfp_discovery"`
-	Endpoints        []string `json:"endpoints"`
+	PortMode         string          `json:"port_mode"`
+	PortRange        *spec.PortRange `json:"port_range,omitempty"`
+	PeerName         string          `json:"peer_name"`
+	InterfaceName    string          `json:"interface_name"`
+	ListenPort       int             `json:"listen_port"`
+	BootstrapAddress string          `json:"bootstrap_address"`
+	VFPDiscovery     string          `json:"vfp_discovery"`
+	Endpoints        []string        `json:"endpoints"`
 }
 
 func main() {
@@ -30,7 +32,7 @@ func main() {
 	switch os.Args[1] {
 	case "resolve":
 		resolve(os.Args[2:])
-	case "status", "reload", "shutdown":
+	case "status", "reload", "shutdown", "durable-delete":
 		request(os.Args[1], os.Args[2:])
 	default:
 		usage()
@@ -54,7 +56,16 @@ func resolve(arguments []string) {
 	}
 	links := make([]resolvedLink, 0, len(desired.Links))
 	for _, item := range desired.Links {
-		links = append(links, resolvedLink{PeerName: item.PeerName, InterfaceName: item.InterfaceName, ListenPort: item.ListenPort, BootstrapAddress: item.BootstrapAddress.String(), VFPDiscovery: "ipv6-link-local-multicast", Endpoints: append([]string(nil), item.Endpoints...)})
+		mode := "system"
+		var span *spec.PortRange
+		if item.Ports.Port != 0 {
+			mode = "fixed"
+		} else if item.Ports.Range.First != 0 {
+			mode = "range"
+			copy := item.Ports.Range
+			span = &copy
+		}
+		links = append(links, resolvedLink{PortMode: mode, PortRange: span, PeerName: item.PeerName, InterfaceName: item.InterfaceName, ListenPort: item.ListenPort, BootstrapAddress: item.BootstrapAddress.String(), VFPDiscovery: "ipv6-link-local-multicast", Endpoints: append([]string(nil), item.Endpoints...)})
 	}
 	result := map[string]any{
 		"api_version": spec.APIVersion, "node_uid": desired.UID,
@@ -66,6 +77,7 @@ func resolve(arguments []string) {
 
 func request(command string, arguments []string) {
 	flags := flag.NewFlagSet(command, flag.ExitOnError)
+	peer := flags.String("peer", "", "peer UUID for durable-delete")
 	socket := flags.String("socket", "", "velvetd control socket")
 	configPath := flags.String("config", "", "derive the control socket from this NodeSpec")
 	_ = flags.Parse(arguments)
@@ -82,14 +94,14 @@ func request(command string, arguments []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	var result any
-	if err := control.Request(ctx, *socket, command, &result); err != nil {
+	if err := control.RequestParams(ctx, *socket, command, map[string]string{"peer": *peer}, &result); err != nil {
 		fatal("velvetctl %s: %v", command, err)
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(result)
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: velvetctl <resolve|status|reload|shutdown> [options]")
+	fmt.Fprintln(os.Stderr, "usage: velvetctl <resolve|status|reload|shutdown|durable-delete> [options]")
 	os.Exit(2)
 }
 

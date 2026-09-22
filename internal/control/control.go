@@ -18,9 +18,10 @@ const APIVersion = 1
 const maxFrame = 1 << 20
 
 type Handlers struct {
-	Status   func() any
-	Reload   func(context.Context) error
-	Shutdown func()
+	DeleteDurable func(string) error
+	Status        func() any
+	Reload        func(context.Context) error
+	Shutdown      func()
 }
 
 type request struct {
@@ -90,7 +91,7 @@ func Serve(ctx context.Context, path, version string, handlers Handlers) error {
 func handle(conn net.Conn, version string, handlers Handlers) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := writeJSON(conn, map[string]any{"type": "hello", "api_version": APIVersion, "server_version": version, "capabilities": []string{"status", "reload", "shutdown"}}); err != nil {
+	if err := writeJSON(conn, map[string]any{"type": "hello", "api_version": APIVersion, "server_version": version, "capabilities": []string{"status", "reload", "shutdown", "durable-delete"}}); err != nil {
 		return
 	}
 	reader := bufio.NewReaderSize(conn, 64*1024)
@@ -106,6 +107,22 @@ func handle(conn net.Conn, version string, handlers Handlers) {
 			switch req.Command {
 			case "status":
 				resp.OK, resp.Result = true, handlers.Status()
+			case "durable-delete":
+				var params struct {
+					Peer string `json:"peer"`
+				}
+				err := json.Unmarshal(req.Params, &params)
+				if err == nil && handlers.DeleteDurable == nil {
+					err = errors.New("durable deletion unavailable")
+				}
+				if err == nil {
+					err = handlers.DeleteDurable(params.Peer)
+				}
+				if err != nil {
+					resp.Error = &errorBody{Code: "durable_delete_rejected", Message: err.Error()}
+				} else {
+					resp.OK, resp.Result = true, map[string]bool{"deleted": true}
+				}
 			case "reload":
 				reloadContext, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 				err := handlers.Reload(reloadContext)
@@ -132,6 +149,10 @@ func handle(conn net.Conn, version string, handlers Handlers) {
 }
 
 func Request(ctx context.Context, path, command string, result any) error {
+	return RequestParams(ctx, path, command, map[string]any{}, result)
+}
+
+func RequestParams(ctx context.Context, path, command string, params any, result any) error {
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
 	if err != nil {
 		return err
@@ -148,7 +169,7 @@ func Request(ctx context.Context, path, command string, result any) error {
 	if hello.APIVersion != APIVersion {
 		return fmt.Errorf("unsupported control API %d", hello.APIVersion)
 	}
-	if err := writeJSON(conn, map[string]any{"api_version": APIVersion, "id": uint64(1), "command": command, "params": map[string]any{}}); err != nil {
+	if err := writeJSON(conn, map[string]any{"api_version": APIVersion, "id": uint64(1), "command": command, "params": params}); err != nil {
 		return err
 	}
 	var resp struct {

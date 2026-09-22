@@ -159,9 +159,9 @@ multi-hop routing until static routes are configured or Babel is enabled.
 Keys are embedded directly in NodeSpec. `fabric.psk` must be a base64-encoded
 32-byte key and is shared by every node in the Fabric. Each node has one local
 WireGuard private key, while every Peer entry contains the corresponding remote
-public key and at least one endpoint candidate.
+public key. `endpoints` may be empty or omitted to wait for inbound WireGuard.
 
-Four peer fields are optional:
+Additional peer fields are optional:
 
 ```json
 {
@@ -180,6 +180,24 @@ discovers the actual remote address using link-local UDP multicast, and runs
 VFP over TCP port 58420. The lower discovered IPv6 address initiates TCP;
 neither endpoint configures or predicts the remote control address.
 
+UDP ports have three explicit modes: `listen_port: 0` lets the system choose
+(the default), `listen_port: 42000` fixes one port, and
+`port_range: {"first": 40000, "last": 49999}` selects an inclusive range.
+There is no implicit range. These fields are mutually exclusive at the same
+level; `node` supplies the default for automatic Links and Peers, and an
+explicit Peer choice overrides it, including an explicit zero. Fixed Peer
+ports can lie outside the node range. WG, primary probes, auxiliary probes and
+observers share reservations; range exhaustion never falls back outside it.
+The main probe keeps its reservation during the handoff to WG. Existing ports
+are preferred during a runtime; Durable records retain their actual nonzero
+port across restarts. `velvetctl resolve` shows zero for ports allocated later.
+
+Migration: older versions derived an omitted static listen port from keys.
+If another node dials that port, configure its previous actual value explicitly
+before upgrading, or configure a fixed listening endpoint on the other side.
+An empty endpoint list never starts dynamic discovery for that Static Peer.
+This Link/VFP change requires coordinated upgrades of Fabric nodes.
+
 `fabric.link_prefix_v4` and `fabric.link_prefix_v6` are independent optional
 infrastructure pools. Configuring one makes Velvet propose a `/30` or `/126`
 for that family; configuring both produces a dual-stack numbered Link. With no
@@ -192,7 +210,7 @@ The lower Node UUID receives the first host and the higher UUID the second. An
 explicit `/30` or `/126` requires the corresponding Fabric Link pool, must be
 inside it, and replaces only that address family's derived prefix.
 
-Velvet also derives the local interface name, listen port, node loopback, and
+Velvet also derives the local interface name, node loopback, and
 the actual WireGuard per-Link PSK. Explicit optional values replace only their
 matching defaults. `fabric.vfp_port` and `node.loopback_address_v6` are optional
 overrides. Endpoint candidates are tried in order; a candidate without a fresh
@@ -212,7 +230,7 @@ for recovery. Static Links keep trying while configured; Dynamic Links allow a
 further 30 seconds before removal. Discovery/TCP can renegotiate peer state,
 while valid PONGs can restore the retained Link without reopening TCP. Initial
 successful negotiation establishes the Link; `--once` may then exit and provides
-no ongoing supervision. Static interfaces retain configuration-based initial
+no ongoing supervision. All interfaces require successful Link establishment before initial
 Babel admission; expired ones are excluded until recovery. No Babel dependency
 is required for Link liveness.
 
@@ -379,6 +397,50 @@ Dynamic interfaces are locally named `vdl-<remote-name>-<uuid-prefix4>` (or
 `vdl-<uuid-prefix4>` without a remote name). They are runtime state, survive an
 effectively unchanged reload, and are discarded and relearned after an
 effective configuration change.
+
+## Durable Links
+
+A healthy Dynamic Link can become Durable without changing its interface.
+At least one side must observe its own listening port unchanged externally,
+with its own advertised endpoint stable for 30 minutes. A qualifying side
+proposes the fixed endpoint set over link-local TCP. If both sides qualify,
+both endpoints are fixed. When only one is fixed, the other may change.
+There are no bootstrap evidence levels or forced disconnect tests.
+
+Optional `dynamic_links.durable` settings are `soft_limit` (default 2) and
+`stable_seconds` (default 1800). Below the soft limit a node may propose
+promotion. A recipient also accepts a proposer with no confirmed Durable Links,
+so this is a soft limit, not a hard maximum. Saved and pending agreements
+reserve capacity, including offline and Static-suppressed records.
+
+Both peers save the same agreement and exchange saved confirmations. A local
+record is confirmed only after local durable storage and the peer's confirmation.
+An interrupted exchange retains saved recovery data and can retry; it does not
+remove a healthy Link. State lives in `/var/lib/velvet/<node-uuid>/durable.json`,
+with a version and explicit owner UUID/WireGuard public key. Corrupt or
+incompatible state is reported and retained, never silently replaced with an
+empty file.
+Agreement IDs are UUID strings and public keys use standard WireGuard Base64.
+Each record has local and peer sections; either or both may contain the recovery
+endpoint fixed by the agreement. The peer's `last_loopback` is a mutable routed
+VFP address cache, not part of the agreement or the persistent owner identity.
+
+On startup Durable listeners restore independently of routed VFP. Automatic
+recovery uses the fixed endpoints and saved ports. Once another Fabric path is
+available, routed checks confirm that the peer still has the agreement and is
+ready to receive. Checks run every 10 seconds with a 10-second request budget;
+READY remains fresh for 30 seconds. Only 30 continuous minutes of direct
+failure with both sides ready invalidate the agreement. Offline or unready
+peers clear that timer. TCP reconnect alone does not reset a fresh READY period.
+A changed fixed endpoint or an explicitly lost peer agreement invalidates it
+immediately. An unchanged healthy Static takes priority over an automatic Link;
+its standby Durable record continues to reserve capacity.
+
+`off` invalidates all Dynamic/Durable resources and saved records. Static Peer
+configuration remains authoritative. `velvetctl status` reports saved Durable
+agreements; `velvetctl durable-delete --config node.json --peer <uuid>` deletes
+one locally. A healthy Link can continue as Dynamic, but must complete a fresh
+stability interval before another promotion.
 
 ## Operations
 

@@ -25,6 +25,9 @@ type Event struct {
 }
 
 type Runner struct {
+	links          linkManager
+	ports          portPool
+	durable        *durableManager
 	Desired        *reconcile.DesiredState
 	Reconciler     *reconcile.Reconciler
 	Interval       time.Duration
@@ -40,11 +43,14 @@ type Runner struct {
 }
 
 type Status struct {
-	NodeUID          string        `json:"node_uid"`
-	ConfiguredLinks  int           `json:"configured_links"`
-	EstablishedLinks int           `json:"established_links"`
-	DynamicLinks     int           `json:"dynamic_links"`
-	Babel            *babel.Status `json:"babel,omitempty"`
+	Links            []LinkStatus    `json:"links,omitempty"`
+	DurableLinks     int             `json:"durable_links"`
+	Durable          []DurableStatus `json:"durable,omitempty"`
+	NodeUID          string          `json:"node_uid"`
+	ConfiguredLinks  int             `json:"configured_links"`
+	EstablishedLinks int             `json:"established_links"`
+	DynamicLinks     int             `json:"dynamic_links"`
+	Babel            *babel.Status   `json:"babel,omitempty"`
 }
 
 type materializedState struct {
@@ -57,6 +63,18 @@ type materializedState struct {
 }
 
 func (r *Runner) Run(ctx context.Context, once bool) error {
+	// Runtime port pinning must not change the effective configuration used by reload.
+	compiled := *r.Desired
+	compiled.Links = append([]reconcile.LinkPlan(nil), r.Desired.Links...)
+	r.Desired = &compiled
+	if err := r.Reconciler.PrepareRuntime(ctx, r.Desired); err != nil {
+		r.signalReady(err)
+		return err
+	}
+	if err := r.reserveStaticPorts(ctx); err != nil {
+		r.signalReady(err)
+		return err
+	}
 	if err := r.Reconciler.Reconcile(ctx, r.Desired); err != nil {
 		r.signalReady(err)
 		return err
@@ -78,6 +96,10 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 	}
 
 	r.dynamic = newDynamicLinkEngine(r)
+	if err := r.openDurable(); err != nil {
+		r.signalReady(err)
+		return err
+	}
 	if err := r.dynamic.start(ctx); err != nil {
 		r.signalReady(err)
 		return err
@@ -88,6 +110,7 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		workers.Wait()
 		r.dynamic.stop()
 	}()
+	workers.Go(func() { r.durable.run(ctx) })
 	r.signalReady(nil)
 
 	established := make(chan struct{}, len(r.Desired.Links))
@@ -180,12 +203,14 @@ func (r *Runner) signalReady(err error) {
 func (r *Runner) Status() Status {
 	r.mu.RLock()
 	var established, dynamic int
+	automaticPeers := map[string]bool{}
 	for _, state := range r.states {
 		if !state.active {
 			continue
 		}
 		if state.dynamic {
 			dynamic++
+			automaticPeers[state.remote.String()] = true
 		} else {
 			established++
 		}
@@ -195,6 +220,18 @@ func (r *Runner) Status() Status {
 		NodeUID: r.Desired.UUID.String(), ConfiguredLinks: len(r.Desired.Links),
 		EstablishedLinks: established, DynamicLinks: dynamic,
 	}
+	if r.durable != nil {
+		status.Durable = r.durable.status()
+		for _, record := range status.Durable {
+			if record.Confirmed {
+				status.DurableLinks++
+				if automaticPeers[record.Peer.UUID] {
+					status.DynamicLinks--
+				}
+			}
+		}
+	}
+	status.Links = r.linkStatus(status.Durable)
 	if r.babel != nil {
 		value := r.babel.Status()
 		status.Babel = &value
@@ -210,7 +247,10 @@ func (r *Runner) maintain(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := r.Reconciler.Maintain(ctx, r.Desired); err != nil {
+			r.links.resourceMu.Lock()
+			err := r.Reconciler.Maintain(ctx, r.liveDesired())
+			r.links.resourceMu.Unlock()
+			if err != nil {
 				r.log(Event{Event: "velvet-reconcile", Status: "failed", NodeUID: r.Desired.UUID.String(), Error: err.Error()})
 				continue
 			}

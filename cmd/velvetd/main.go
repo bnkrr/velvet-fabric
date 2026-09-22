@@ -130,6 +130,13 @@ func main() {
 	go func() {
 		controlErrors <- control.Serve(controlCtx, *controlPath, version(), control.Handlers{
 			Status: func() any { return getStatus(activePointer.Load()) },
+			DeleteDurable: func(peer string) error {
+				current := activePointer.Load()
+				if current == nil {
+					return errors.New("runtime unavailable")
+				}
+				return current.runner.DeleteDurable(peer)
+			},
 			Reload: func(ctx context.Context) error {
 				request := reloadRequest{reply: make(chan error, 1)}
 				select {

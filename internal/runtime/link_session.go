@@ -14,9 +14,14 @@ import (
 
 // negotiateLink ends after local installation and LINK_ACCEPT. Link liveness
 // is owned by the caller's UDP supervisor, never by this TCP connection.
-func (r *Runner) negotiateLink(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, install func(engine.Result) error) error {
-	protocol := engine.New(engine.Config{
+func (r *Runner) negotiateLink(ctx context.Context, conn net.Conn, desired reconcile.LinkPlan, initiator bool, install func(engine.Result) error) error {
+	return engine.New(r.linkProtocol(ctx, desired, initiator, install)).Run(ctx, conn)
+}
+
+func (r *Runner) linkProtocol(ctx context.Context, desired reconcile.LinkPlan, initiator bool, install func(engine.Result) error) engine.Config {
+	return engine.Config{
 		Context:         engine.LinkBoundSession,
+		Initiator:       initiator,
 		LocalUID:        message.UID{UUID: r.Desired.UUID, Name: r.Desired.UID.Name},
 		LocalLoopbackV6: r.Desired.LoopbackV6,
 		LoopbackPoolV6:  r.Desired.LoopbackPoolV6,
@@ -33,13 +38,13 @@ func (r *Runner) negotiateLink(ctx context.Context, conn net.Conn, desired recon
 		FrameError: func(err error) {
 			r.log(Event{Event: "velvet-frame", Status: "discarded", Peer: desired.PeerName, Error: err.Error()})
 		},
-	})
-	return protocol.Run(ctx, conn)
+		OperationalMessage: func(s *engine.Session, m message.Message) error { return r.durable.handleLink(desired, s, m) },
+	}
 }
 
 func (r *Runner) recordEndpointEvidence(ctx context.Context, interfaceName string, endpoint netip.AddrPort) error {
-	r.dynamic.resourceMu.Lock()
-	defer r.dynamic.resourceMu.Unlock()
+	r.links.resourceMu.Lock()
+	defer r.links.resourceMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -69,6 +74,9 @@ func (r *Runner) commitLink(ctx context.Context, desired reconcile.LinkPlan, dyn
 		active:  true,
 	}
 	r.mu.Unlock()
+	if err := r.durable.refreshPeerMetadata(result.RemoteUID, desired.PeerPublicKey, result.RemoteLoopbackV6); err != nil {
+		r.log(Event{Event: "velvet-durable", Status: "metadata-save-failed", RemoteUID: result.RemoteUID.UUID.String(), Error: err.Error()})
+	}
 	if r.babel != nil {
 		r.babel.SetLinkState(desired.InterfaceName, true, localAddresses)
 	}
@@ -112,11 +120,13 @@ func (r *Runner) hasDirectLinkToLoopback(loopback netip.Addr) bool {
 
 func (r *Runner) removeDynamicState(plan reconcile.LinkPlan) {
 	r.mu.Lock()
-	if state, exists := r.states[plan.InterfaceName]; exists && state.dynamic && state.desired.OwnerAlias == plan.OwnerAlias {
+	state, exists := r.states[plan.InterfaceName]
+	removed := exists && state.dynamic && state.desired.OwnerAlias == plan.OwnerAlias
+	if removed {
 		delete(r.states, plan.InterfaceName)
 	}
 	r.mu.Unlock()
-	if r.babel != nil {
+	if removed && r.babel != nil {
 		r.babel.SetLinkState(plan.InterfaceName, false, nil)
 	}
 }
@@ -124,8 +134,8 @@ func (r *Runner) removeDynamicState(plan reconcile.LinkPlan) {
 // withdrawLinkAdjacency withdraws an expired adjacency, retaining WG and local
 // addresses for recovery. It is also used by dynamic Link supervision.
 func (r *Runner) withdrawLinkAdjacency(ctx context.Context, plan reconcile.LinkPlan) error {
-	r.dynamic.resourceMu.Lock()
-	defer r.dynamic.resourceMu.Unlock()
+	r.links.resourceMu.Lock()
+	defer r.links.resourceMu.Unlock()
 	r.mu.RLock()
 	state, exists := r.states[plan.InterfaceName]
 	r.mu.RUnlock()

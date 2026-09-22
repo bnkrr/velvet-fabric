@@ -26,6 +26,8 @@ const (
 )
 
 type DesiredState struct {
+	Ports              spec.PortChoice
+	Durable            spec.DurableSettings
 	UID                spec.NodeUID
 	UUID               uuid.UUID
 	FabricPSK          []byte
@@ -51,6 +53,8 @@ type DynamicLinksPlan struct {
 }
 
 type LinkPlan struct {
+	WaitingPort bool // Runtime placeholder while a configured port is unavailable.
+	Ports       spec.PortChoice
 	// Probing keeps a tentative interface DOWN; ReceiveOnly gates outbound WG.
 	Probing          bool
 	ReceiveOnly      bool
@@ -130,7 +134,9 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 		return nil, fmt.Errorf("derive loopbacks: %w", err)
 	}
 	desired := &DesiredState{
-		UID: nodeSpec.Node.UID, UUID: uid, FabricPSK: fabricPSK,
+		Ports:   spec.ChoosePorts(nodeSpec.Node.ListenPort, nodeSpec.Node.PortRange),
+		Durable: spec.EffectiveDurable(nodeSpec.DynamicLinks),
+		UID:     nodeSpec.Node.UID, UUID: uid, FabricPSK: fabricPSK,
 		LinkPoolV4: link4, LinkPoolV6: link6, LoopbackPoolV6: loop6,
 		LoopbackV6: localLoop6, VFPPort: nodeSpec.Fabric.EffectiveVFPPort(),
 		FabricTableID:      nodeSpec.Fabric.EffectiveRoutingTableID(),
@@ -156,7 +162,7 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 		if err != nil {
 			return nil, fmt.Errorf("peer %q: %w", peer.Name, err)
 		}
-		if other, exists := ports[bootstrap.ListenPort]; exists {
+		if other, exists := ports[bootstrap.ListenPort]; exists && bootstrap.ListenPort != 0 {
 			return nil, fmt.Errorf("peer %q and peer %q use listen port %d; set a listen_port override", peer.Name, other, bootstrap.ListenPort)
 		}
 		ports[bootstrap.ListenPort] = peer.Name
@@ -166,10 +172,11 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 			keepalive = &value
 		}
 		item := LinkPlan{
+			Ports:    nodeSpec.PeerPorts(peer),
 			PeerName: peer.Name, InterfaceName: bootstrap.InterfaceName,
 			OwnerAlias: "velvet:link:" + uid.String() + ":" + peer.Name,
 			PrivateKey: privateKey, PeerPublicKey: peerKey, PresharedKey: bootstrap.PresharedKey,
-			ListenPort: bootstrap.ListenPort, Endpoints: append([]string(nil), peer.Endpoints...), Keepalive: keepalive,
+			ListenPort: nodeSpec.PeerPorts(peer).Port, Endpoints: append([]string(nil), peer.Endpoints...), Keepalive: keepalive,
 			BootstrapAddress: bootstrap.LocalAddress,
 			LinkOverrides:    append([]string(nil), peer.LinkAddresses...),
 		}
@@ -272,12 +279,7 @@ func compileBabel(desired *DesiredState, nodeSpec *spec.NodeSpec) *BabelPlan {
 		Protocol:    BabelDynamicProtocol, DeviceOnly: true, ManageRules: false,
 		Views: []BabelView{{TableID: desired.FabricTableID}},
 	}
-	// Provisioned Links retain configuration-based initial routing admission.
-	// Exact owned names let runtime withdraw an expired Link without a wildcard
-	// continuing to admit it. Dynamic Links still enter only at commit.
-	for _, link := range desired.Links {
-		plan.Interfaces = append(plan.Interfaces, link.InterfaceName)
-	}
+	// All interfaces enter Babel only after link-local VFP installation.
 	plan.Origins = append(plan.Origins, BabelOrigin{Destination: netip.PrefixFrom(desired.LoopbackV6, 128)})
 	for _, announcement := range nodeSpec.Fabric.Announcements {
 		prefix, _ := netip.ParsePrefix(announcement.Prefix)

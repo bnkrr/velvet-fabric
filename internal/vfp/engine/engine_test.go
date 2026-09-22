@@ -166,7 +166,7 @@ func TestRoutedSessionCarriesDynamicOperation(t *testing.T) {
 
 func testConfig(id uuid.UUID, name string, v6 netip.Addr, accept func(message.UID, link.Proposal) bool, result chan<- Result) Config {
 	return Config{
-		LocalUID: message.UID{UUID: id, Name: name}, LocalLoopbackV6: v6,
+		Initiator: name == "a", LocalUID: message.UID{UUID: id, Name: name}, LocalLoopbackV6: v6,
 		LinkPoolV4: netip.MustParsePrefix("10.40.0.0/16"), LinkPoolV6: netip.MustParsePrefix("fd40::/48"),
 		LoopbackPoolV6: netip.MustParsePrefix("fd41::/48"),
 		FabricPSK:      bytes.Repeat([]byte{3}, 32), Accept: accept,

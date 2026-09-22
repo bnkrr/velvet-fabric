@@ -38,6 +38,11 @@ const (
 	LinkPong           Type = 0x0e
 	PolicyQuery        Type = 0x0f
 	PolicyUpdate       Type = 0x10
+	DurablePropose     Type = 0x11
+	DurableSaved       Type = 0x12
+	DurableDecline     Type = 0x13
+	DurableCheck       Type = 0x14
+	DurableStatus      Type = 0x15
 )
 
 func (t Type) IsPolicy() bool { return t == PolicyQuery || t == PolicyUpdate }
@@ -59,14 +64,16 @@ const (
 	SealedProbeTLV       uint16 = 0x000b
 	DeclineReasonTLV     uint16 = 0x000c
 	DynamicLinkPolicyTLV uint16 = 0x000d
+	FlagsTLV             uint16 = 0x000e
+	StatusTLV            uint16 = 0x000f
 )
 
 var ErrFrame = errors.New("invalid VFP frame")
 var ErrConnection = errors.New("invalid VFP connection")
 
 type UID struct {
-	UUID uuid.UUID
-	Name string
+	UUID uuid.UUID `json:"uuid"`
+	Name string    `json:"name,omitempty"`
 }
 
 type DeclineReason uint8
@@ -83,18 +90,22 @@ type DynamicLinkPolicy struct {
 }
 
 type Message struct {
-	DeclineReason DeclineReason
-	Policy        *DynamicLinkPolicy
-	Type          Type
-	ProbeKey      [32]byte
-	Data          []byte
-	UID           *UID
-	LoopbackV6    netip.Addr
-	LinkPrefixV4  netip.Prefix
-	LinkPrefixV6  netip.Prefix
-	OperationID   [16]byte
-	WGPublicKey   [32]byte
-	Endpoint      netip.AddrPort
+	FixedEndpoints []FixedEndpoint
+	AgreementID    [16]byte
+	Flags          Flags
+	Status         Status
+	DeclineReason  DeclineReason
+	Policy         *DynamicLinkPolicy
+	Type           Type
+	ProbeKey       [32]byte
+	Data           []byte
+	UID            *UID
+	LoopbackV6     netip.Addr
+	LinkPrefixV4   netip.Prefix
+	LinkPrefixV6   netip.Prefix
+	OperationID    [16]byte
+	WGPublicKey    [32]byte
+	Endpoint       netip.AddrPort
 }
 
 func Read(r io.Reader) ([]byte, error) {
@@ -139,8 +150,11 @@ func Decode(frame []byte) (Message, error) {
 		return Message{}, ErrFrame
 	}
 	result := Message{Type: Type(frame[5])}
-	if result.Type < Open || result.Type > PolicyUpdate || result.Type == 0x05 {
+	if result.Type < Open || result.Type > DurableStatus || result.Type == 0x05 {
 		return Message{}, fmt.Errorf("%w: unknown message type 0x%02x", ErrFrame, frame[5])
+	}
+	if result.Type.IsDurable() {
+		return decodeDurable(result.Type, frame[HeaderLength:])
 	}
 	selected := map[uint16][]byte{}
 	cursor := tlv.NewCursor(frame[HeaderLength:])
@@ -261,6 +275,12 @@ func Decode(frame []byte) (Message, error) {
 func Encode(m Message) ([]byte, error) {
 	body := make([]byte, 0, 64)
 	switch m.Type {
+	case DurablePropose, DurableSaved, DurableDecline, DurableCheck, DurableStatus:
+		var err error
+		body, err = encodeDurable(m)
+		if err != nil {
+			return nil, err
+		}
 	case Open, PolicyQuery, PolicyUpdate:
 		if m.UID == nil {
 			return nil, errors.New("message requires NODE_UID")

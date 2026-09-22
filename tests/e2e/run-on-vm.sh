@@ -5,14 +5,14 @@ cd "${repo_root}"
 selection=${1:-all}
 case ${selection} in
   --help|-h)
-    echo "usage: $0 [all|static|crud|static-core|dynamic|nat [CASE...]]"
+    echo "usage: $0 [all|static|ports|crud|static-core|dynamic|nat [CASE...]]"
     echo 'VM/build configuration: tests/VM.md'
     exit 0 ;;
-  all|static|crud|static-core|dynamic) ;;
+  all|static|ports|crud|static-core|dynamic) ;;
   nat)
     for nat_case in "${@:2}"; do
       case ${nat_case} in
-        preserve|remap|delayed-remap|blocked|control-loss|random|observer-fallback|lifecycle|v6-lifecycle) ;;
+        preserve|remap|delayed-remap|blocked|control-loss|random|observer-fallback|lifecycle|v6-lifecycle|v4-durable-range|v6-durable-system|v4-durable-fixed|v4-durable-failure|v4-durable-one-fixed) ;;
         *)
           if [[ ! ${nat_case} =~ ^v[46]-(delayed-handshake|retry-blackout|policy-wakeup|policy-restart-query)$ &&
                 ! ${nat_case} =~ ^v[46]-single-(preserve|remap|random)-(public|nat)-init$ &&
@@ -37,6 +37,7 @@ root, selection, *cases = sys.argv[1:]
 velvet, babel, ctl = (root + '/' + name for name in ('velvetd', 'babel-rs', 'velvetctl'))
 commands = {
     'static': ['sh', root + '/tests/e2e/netns-static.sh', velvet],
+    'ports': ['sh', root + '/tests/e2e/netns-static.sh', velvet, 'ports'],
     'crud': ['sh', root + '/tests/e2e/netns-core-crud.sh', velvet],
     'static-core': ['sh', root + '/tests/e2e/netns-wg-admin-core.sh', velvet],
     'dynamic': ['sh', root + '/tests/e2e/netns-dynamic.sh', velvet, babel, ctl],

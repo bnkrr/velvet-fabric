@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +16,8 @@ import (
 const maxCounterproposals = 64
 
 type Config struct {
+	Initiator                bool             // TCP initiator sends the first business message.
+	FirstMessage             *message.Message // Optional DURABLE_PROPOSE on an established Link.
 	Context                  SessionContext
 	LocalUID                 message.UID
 	LocalLoopbackV6          netip.Addr
@@ -189,7 +190,7 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 					return err
 				}
 			}
-			if fsm.operational && e.config.Context == LinkBoundSession {
+			if fsm.operational && e.config.Context == LinkBoundSession && fsm.link != nil && fsm.link.established {
 				return nil
 			}
 			if fsm.operational && !operationalNotified {
@@ -199,19 +200,26 @@ func (e *Engine) Run(ctx context.Context, conn net.Conn) error {
 					RemoteLoopbackV6: fsm.remoteLoopbackV6(), send: send, close: conn.Close,
 				}
 				operationalNotified = true
-				if err := conn.SetDeadline(time.Time{}); err != nil {
-					return fmt.Errorf("clear VFP establishment deadline: %w", err)
-				}
-				if !establishmentTimer.Stop() {
-					select {
-					case <-establishmentTimer.C:
-					default:
+				if e.config.Context == RoutedSession {
+					if err := conn.SetDeadline(time.Time{}); err != nil {
+						return fmt.Errorf("clear VFP establishment deadline: %w", err)
 					}
+					if !establishmentTimer.Stop() {
+						select {
+						case <-establishmentTimer.C:
+						default:
+						}
+					}
+					establishmentDeadline = nil
 				}
-				establishmentDeadline = nil
 				if e.config.Operational != nil {
 					if err := e.config.Operational(operationalSession); err != nil {
 						return fmt.Errorf("enter operational VFP state: %w", err)
+					}
+				}
+				if event.message.Type == message.DurablePropose && e.config.OperationalMessage != nil {
+					if err := e.config.OperationalMessage(operationalSession, event.message); err != nil {
+						return err
 					}
 				}
 			}
@@ -304,6 +312,11 @@ func (s *sessionFSM) handle(in message.Message) (*message.Message, disposition, 
 	if !s.stateReceived {
 		return s.handleNodeState(in)
 	}
+	if !s.config.Initiator && s.link != nil && s.link.waitingForRemoteProposal && in.Type == message.DurablePropose {
+		s.link = nil
+		s.operational = true
+		return nil, discardFrame, nil
+	}
 	return s.link.handle(in)
 }
 
@@ -359,6 +372,13 @@ func (s *sessionFSM) handleNodeState(in message.Message) (*message.Message, disp
 		s.operational = true
 		return nil, discardFrame, nil
 	}
+	if s.config.Initiator && s.config.FirstMessage != nil {
+		if s.config.FirstMessage.Type != message.DurablePropose {
+			return nil, closeConnection, errors.New("invalid initial Link business message")
+		}
+		s.operational = true
+		return s.config.FirstMessage, discardFrame, nil
+	}
 	s.link = &staticLinkFSM{
 		config: s.config, remoteUID: s.remoteUID,
 		remoteV6: in.LoopbackV6,
@@ -368,7 +388,7 @@ func (s *sessionFSM) handleNodeState(in message.Message) (*message.Message, disp
 }
 
 func (s *staticLinkFSM) start() (*message.Message, disposition, error) {
-	if bytes.Compare(s.config.LocalUID.UUID[:], s.remoteUID.UUID[:]) < 0 {
+	if s.config.Initiator {
 		proposal, err := s.nextProposal()
 		if err != nil {
 			return nil, closeConnection, err
@@ -458,9 +478,9 @@ func (s *sessionFSM) remoteLoopbackV6() netip.Addr {
 
 func validOperationalMessage(context SessionContext, kind message.Type) bool {
 	if context == RoutedSession {
-		return kind == message.DynamicLinkPropose || kind == message.DynamicLinkAccept || kind == message.DynamicLinkDecline || kind == message.DiscoveryControl
+		return kind == message.DynamicLinkPropose || kind == message.DynamicLinkAccept || kind == message.DynamicLinkDecline || kind == message.DiscoveryControl || kind == message.DurableCheck || kind == message.DurableStatus
 	}
-	return false
+	return kind == message.DurablePropose || kind == message.DurableSaved || kind == message.DurableDecline
 }
 
 func proposalMessage(p link.Proposal) message.Message {

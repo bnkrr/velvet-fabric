@@ -24,6 +24,7 @@ class PendingLinks:
             materialized = set(obs['materialized_ifindices'])
             pending = {name for name in obs['wg'] if name.startswith('vdl-')
                        and obs['ifindices'].get(name) not in materialized}
+            pending.update(obs.get('durable_waiting', ()))
             obs['pending'] = sorted(pending)
             for name in pending:
                 index = obs['ifindices'].get(name)
@@ -40,7 +41,7 @@ class PendingLinks:
                 # UDP 30s + final validation 30s + deferred cleanup 10s +
                 # cleanup 5s, with 15s for observation/scheduling. No refresh
                 # merely because a new proposal reused the same interface.
-                if now - current[key] > 90:
+                if now - current[key] > 90 and name not in obs.get('durable_by_interface', {}):
                     raise AssertionError(f'node {node}/{name}: tentative WG incarnation exceeded 90s')
                 if any(route.get('dev') == name for route in obs['fib']):
                     raise NotConverged(f'node {node}/{name}: tentative WG entered FIB')
@@ -223,9 +224,12 @@ def audit(topology, observations):
                 if remote != static[name]:
                     raise NotConverged(f'node {node}/{name}: wrong static identity')
             elif name.startswith('vdl-'):
-                dynamic_count += 1
+                if not observation.get('durable_by_interface', {}).get(name, {}).get('confirmed'):
+                    dynamic_count += 1
                 if not topology.dynamic or remote not in topology.active:
                     raise NotConverged(f'node {node}/{name}: stale/unexpected dynamic WG interface')
+                if topology.modes[node] == 'off' or topology.modes[remote] == 'off':
+                    raise NotConverged(f'node {node}/{name}: automatic Link bypassed off')
             else:
                 raise NotConverged(f'node {node}: unexpected WG interface {name}')
             if remote == node or not peer['handshake']:
@@ -242,12 +246,15 @@ def audit(topology, observations):
                               p['public'] == link['public'] and p['handshake'] for p in candidate['peers'])]
             if not reciprocal:
                 raise NotConverged(f'node {node}/{name}: nonreciprocal WG peer')
+            if name.startswith('vdl-') and remote in static.values():
+                raise NotConverged(f'node {node}/{name}: automatic Link duplicates healthy Static')
             if not {'0.0.0.0/0', '::/0'} <= set(peer['allowed']):
                 raise NotConverged(f'node {node}/{name}: uncommitted WG AllowedIPs')
             interfaces[name] = remote
             peers.add(remote)
-        if not topology.required(node) <= peers:
-            raise NotConverged(f'node {node}: missing required neighbors {sorted(topology.required(node) - peers)}')
+        required = topology.required(node) - set(observation.get('durable_recovery_peers', ()))
+        if not required <= peers:
+            raise NotConverged(f'node {node}: missing required neighbors {sorted(required - peers)}')
         runtime = observation['status']['runtime']
         if runtime['established_links'] != len(static) or runtime['dynamic_links'] != dynamic_count:
             raise NotConverged(f'node {node}: VFP counts disagree with current WG topology')
@@ -276,7 +283,7 @@ def audit(topology, observations):
                 if network(route['dst']) == prefix(node) and route.get('dev') == 'vv-loop' and route.get('protocol') == 'kernel':
                     continue
                 raise NotConverged(f'node {node}: overlay route leaked to main table')
-        for peer in topology.required(node):
+        for peer in required:
             if forwarding[node][prefix(peer)] != peer:
                 raise NotConverged(f'node {node}: required direct link uses fallback to {peer}')
     for source in sorted(topology.active):
