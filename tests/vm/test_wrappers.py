@@ -19,6 +19,7 @@ class WrapperTests(unittest.TestCase):
         shutil.copytree(source, self.repo / 'tests', ignore=shutil.ignore_patterns('__pycache__'))
         shutil.copytree(source.parent / 'examples', self.repo / 'examples',
                         ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(source.parent / 'packaging', self.repo / 'packaging')
         self.bin = self.base / 'tools'
         self.bin.mkdir()
         self.log = self.base / 'calls.jsonl'
@@ -54,6 +55,8 @@ elif tool == 'git':
         entry = tarfile.TarInfo('Cargo.toml'); data = b'# test source\\n'; entry.size = len(data)
         archive.addfile(entry, io.BytesIO(data))
 elif tool == 'ssh':
+    if os.environ.get('VM_TEST_FAIL_PREFLIGHT') and '/proc/1/comm' in args[-1]:
+        sys.exit(1)
     # Real local shell quoting/archive extraction, but never execute VM tests.
     if '-tt' not in args:
         subprocess.run(args[-1], shell=True, input=sys.stdin.buffer.read(), check=True)
@@ -129,7 +132,7 @@ else:
                     self.assertEqual(cargo['env'][name], self.env[name])
                 archive = next(call for call in calls if call['tool'] == 'git')
                 self.assertEqual(archive['args'][1], str(self.babel))
-                self.assertEqual(archive['args'][3], 'dbeede34abd8dff2422c39ab18a15949b0f38f11')
+                self.assertEqual(archive['args'][3], (self.repo / 'tests/babel-revision').read_text().strip())
                 ssh = [call for call in calls if call['tool'] == 'ssh']
                 self.assertTrue(all('-F' not in call['args'] for call in ssh))
                 command = shlex.split(ssh[-1]['args'][-1])
@@ -141,6 +144,67 @@ else:
                 self.assertEqual(len(assets), ('e2e', 'directed', 'endless').index(suite) + 1)
                 self.assertTrue(all((asset / 'babel-rs').is_file() for asset in assets))
                 self.assertFalse(list((self.repo / '.local/experiments').glob('vm-build.*')))
+
+    def test_all_includes_both_resilience_suites_and_packages_units(self):
+        result = self.run_wrapper('e2e', 'all')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        commands = shlex.split(calls[-1]['args'][-1])[2]
+        self.assertEqual(commands.count('/netns-resilience.py'), 2)
+        self.assertIn('dynamic', commands)
+        self.assertIn('/netns-udp-nat.py', commands)
+        assets = next(self.remote.glob('assets-*'))
+        for name in ('velvetd.service', 'velvet-babel@.service', 'velvet-recovery.service', 'velvet-recovery.timer'):
+            self.assertTrue((assets / 'packaging/systemd' / name).is_file())
+        self.assertTrue(any('systemd' in call['args'][-1] for call in calls if call['tool'] == 'ssh'))
+
+    def test_missing_systemd_fails_all_before_build_or_upload(self):
+        result = self.run_wrapper('e2e', 'all', env={**self.env, 'VM_TEST_FAIL_PREFLIGHT': '1'})
+        self.assertNotEqual(result.returncode, 0)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual([call['tool'] for call in calls], ['ssh'])
+        self.assertFalse(self.remote.exists())
+        self.assertFalse(list((self.repo / '.local/experiments').glob('vm-build.*')))
+
+    def test_netns_selection_explicitly_excludes_systemd(self):
+        result = self.run_wrapper('e2e', 'netns')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertNotIn('/netns-resilience.py', calls[-1]['args'][-1])
+        self.assertFalse(any('systemd' in call['args'][-1] for call in calls if call['tool'] == 'ssh'))
+
+    def test_resilience_all_runs_only_the_two_systemd_suites(self):
+        result = self.run_wrapper('e2e', 'resilience-all')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        command = calls[-1]['args'][-1]
+        self.assertEqual(command.count('/netns-resilience.py'), 2)
+        self.assertNotIn('/netns-udp-nat.py', command)
+
+    def test_working_tree_source_is_explicit_and_honors_manifest(self):
+        (self.babel / 'Cargo.toml').write_text('# workspace fixture')
+        env = {**self.env, 'VELVET_BABEL_SOURCE': 'working-tree'}
+        result = self.run_wrapper('e2e', 'resilience', env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertFalse(any(call['tool'] == 'git' for call in calls))
+        cargo = next(call for call in calls if call['tool'] == 'cargo')
+        self.assertEqual(cargo['args'][cargo['args'].index('--manifest-path') + 1], str(self.babel / 'Cargo.toml'))
+
+    def test_revision_override_and_invalid_sources(self):
+        env = {**self.env, 'VELVET_BABEL_REVISION': '1' * 40}
+        result = self.run_wrapper('e2e', 'static', env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(next(c for c in calls if c['tool'] == 'git')['args'][3], '1' * 40)
+        for overrides in ({'VELVET_BABEL_REVISION': 'main'},
+                          {'VELVET_BABEL_SOURCE': 'unknown'},
+                          {'VELVET_BABEL_SOURCE': 'working-tree', 'VELVET_BABEL_REVISION': '1' * 40}):
+            self.log.unlink()
+            result = self.run_wrapper('e2e', 'static', env={**self.env, **overrides})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.log.exists())
+            self.log.touch()
 
 
 if __name__ == '__main__':

@@ -50,8 +50,9 @@ cleanup() {
   for pid in ${pids}; do kill -TERM "${pid}" 2>/dev/null || true; done
   sleep 1
   for node in ${nodes}; do
+    for child in $(ip netns pids "$(namespace "${node}")" 2>/dev/null); do kill -TERM "${child}" 2>/dev/null || true; done
     ip netns del "$(namespace "${node}")" 2>/dev/null || true
-    rm -rf -- "/run/velvet/$(uuid "${node}")" "/var/lib/velvet/$(uuid "${node}")"
+    rm -rf -- "/run/velvet/$(uuid "${node}")" "/run/velvet-babel/$(uuid "${node}")" "/var/lib/velvet/$(uuid "${node}")"
   done
   ip link del "${bridge}" 2>/dev/null || true
   rm -rf -- "${runtime}"
@@ -185,7 +186,7 @@ kill -0 "${parent_ea}"
 # Match the pinned Babel restart suite's 240s bound before starting Fabric's
 # unchanged forwarding checks. Require current sequences in both directions;
 # an early ping can succeed using stale pre-crash kernel routes.
-python3 - "/run/velvet/$(uuid ea)/babel-rs.ctl" "/run/velvet/$(uuid xc)/babel-rs.ctl" "${runtime}/babel-crash-recovery.status" <<'PY'
+python3 - "/run/velvet-babel/$(uuid ea)/babel-rs.ctl" "/run/velvet-babel/$(uuid xc)/babel-rs.ctl" "${runtime}/babel-crash-recovery.status" <<'PY'
 import json
 from pathlib import Path
 import socket
@@ -290,13 +291,14 @@ wait_route8() {
   done
 }
 
-# Stopping the managed leaf withdraws its origins; restarting the same
+# Stopping both leaf daemons withdraws its origins; restarting the same
 # velvetd/babel-rs pair must restore Router-ID state and reconverge.
 wait_route8 present
 check_host_routing
 pid_xc=$(cat "${runtime}/xc.pid")
 kill -TERM "${pid_xc}"
 wait "${pid_xc}" || true
+for child in $(ip netns pids "$(namespace xc)"); do kill -TERM "${child}"; done
 wait_route8 absent
 check_host_routing
 ip netns exec "$(namespace xc)" "${velvetd}" --config "${runtime}/xc.json" --reconcile-interval 5s >>"${runtime}/xc.log" 2>&1 &

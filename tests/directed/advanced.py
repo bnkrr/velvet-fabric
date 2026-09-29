@@ -30,7 +30,7 @@ def await_event(r, predicate, reason, seconds=90):
 def babel(r, node, command, **params):
     with socket.socket(socket.AF_UNIX) as sock:
         sock.settimeout(2)
-        sock.connect(f'/run/velvet/{r.uids[node]}/babel-rs.ctl')
+        sock.connect(f'/run/velvet-babel/{r.uids[node]}/babel-rs.ctl')
         with sock.makefile('rwb') as stream:
             json.loads(stream.readline())
             stream.write((json.dumps({'api_version': 1, 'id': 1, 'command': command, 'params': params}) + '\n').encode())
@@ -72,11 +72,8 @@ def restart(r, node):
     old['thread'].join(timeout=3)
     # Preserve namespace, addresses, NAT mappings, UUID/state and old kernel
     # interfaces. This is an actual velvetd crash, not a delete/re-add event.
-    until = time.monotonic() + 12
-    while r.run('ip', 'netns', 'pids', r.namespace(node)):
-        if time.monotonic() >= until:
-            raise AssertionError('managed Babel survived its killed parent')
-        time.sleep(0.1)
+    babel_pid = old['resources']['babel']['pid']
+    assert Path(f'/proc/{babel_pid}').exists(), 'Fabric crash stopped independent Babel'
     r.start_daemon(node)
     assert r.nodes[node]['proc'].pid != old_pid
     r.record('crash-restarted', node=node, old_pid=old_pid, new_pid=r.nodes[node]['proc'].pid)
@@ -187,11 +184,10 @@ def family_change(r):
         for n, peer in ((2, 3), (3, 2)):
             table(r, n, 'family_gate', f'{family} saddr {r.wan(peer)} meta l4proto udp')
         try:
-            def withdrawn():
-                return all(not any(str(route.get('protocol')) == '202' for route in
-                    json.loads(r.ip(n, '-6', '-j', 'route', 'show', 'table', '20000',
-                                    'exact', address(p) + '/128'))) for n, p in ((2, 3), (3, 2)))
-            wait_for(r, withdrawn, 40, 'failed direct adjacency did not withdraw within health budget')
+            def control_lost():
+                return all(any(link.get('committed') and not link.get('active') for link in
+                    r.command(n)['runtime'].get('links', [])) for n in (2, 3))
+            wait_for(r, control_lost, 40, 'control session did not expire within health budget')
             # A higher-cost Babel alternative can wait for feasibility history.
             # Require current selected routes before testing Fabric forwarding.
             routing_prerequisite(r, 2, 3)
@@ -231,7 +227,7 @@ def family_change(r):
                 if time.monotonic() >= until:
                     raise TimeoutError('family configuration reload')
                 time.sleep(0.1)
-            assert not Path(f'/proc/{old_babel}').exists()
+            assert Path(f'/proc/{old_babel}').exists(), 'reload stopped independent Babel'
             r.nodes[n]['resources'].pop('babel', None)
         def switched():
             family = 6 if r.args.underlay == 'ipv6' else 4

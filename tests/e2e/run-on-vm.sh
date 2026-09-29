@@ -5,10 +5,10 @@ cd "${repo_root}"
 selection=${1:-all}
 case ${selection} in
   --help|-h)
-    echo "usage: $0 [all|static|ports|crud|static-core|dynamic|examples|nat [CASE...]]"
+    echo "usage: $0 [all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|resilience|resilience-dynamic|nat [CASE...]]"
     echo 'VM/build configuration: tests/VM.md'
     exit 0 ;;
-  all|static|ports|crud|static-core|dynamic|examples) ;;
+  all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|resilience|resilience-dynamic) ;;
   nat)
     for nat_case in "${@:2}"; do
       case ${nat_case} in
@@ -27,9 +27,12 @@ esac
 source tests/lib/vm.sh
 trap '[[ -z ${build_dir:-} ]] || rm -rf -- "${build_dir}"' EXIT
 vm_configure
-babel_revision=dbeede34abd8dff2422c39ab18a15949b0f38f11 # v0.6.0
+case "$selection" in
+  all|resilience*)
+    vm_exec sh -c 'test "$(id -u)" = 0 && test "$(cat /proc/1/comm)" = systemd' ;;
+esac
 vm_build with-ctl
-tar -cf "${build_dir}/tests.tar" tests/e2e/*.sh tests/e2e/*.py examples
+tar -cf "${build_dir}/tests.tar" tests/e2e/*.sh tests/e2e/*.py examples packaging/systemd
 vm_upload velvetd velvetctl babel-rs tests.tar
 command=$(python3 - "${asset_root}" "${selection}" "${@:2}" <<'PY'
 import shlex, sys
@@ -42,9 +45,18 @@ commands = {
     'static-core': ['sh', root + '/tests/e2e/netns-wg-admin-core.sh', velvet],
     'dynamic': ['sh', root + '/tests/e2e/netns-dynamic.sh', velvet, babel, ctl],
     'examples': ['python3', root + '/tests/e2e/netns-examples.py', velvet, babel, ctl],
+    'resilience': ['python3', root + '/tests/e2e/netns-resilience.py', root],
+    'resilience-dynamic': ['python3', root + '/tests/e2e/netns-resilience.py', root, 'dynamic'],
     'nat': ['python3', root + '/tests/e2e/netns-udp-nat.py', velvet, babel, *cases],
 }
-selected = list(commands) if selection == 'all' else [selection]
+if selection == 'all':
+    selected = list(commands)
+elif selection == 'netns':
+    selected = [name for name in commands if not name.startswith('resilience')]
+elif selection == 'resilience-all':
+    selected = ['resilience', 'resilience-dynamic']
+else:
+    selected = [selection]
 print(' && '.join(shlex.join(commands[name]) for name in selected))
 PY
 )

@@ -88,7 +88,7 @@ encrypted envelope; unauthorized datagrams receive no response.
 
 Linux release archives contain `velvetd` and `velvetctl` for `amd64` and `arm64`,
 with SHA256 checksums on the [Releases page](https://github.com/bnkrr/velvet-fabric/releases).
-For optional managed dynamic routing, install `babel-rs v0.6.0` separately and
+For optional managed dynamic routing, install the Babel build pinned in `tests/babel-revision` separately and
 set `babel.executable` to its executable path in NodeSpec.
 
 Build the daemon and local control client:
@@ -226,20 +226,20 @@ Link. Each Link sends VFP LINK_PING over its own WG interface every 10 seconds;
 a fresh matching LINK_PONG confirms bidirectional reachability and can carry the
 current endpoint observation. Unknown, late and duplicate replies are ignored.
 
-After 30 seconds without confirmation, Velvet withdraws the protocol-202 peer
-adjacency route, usable endpoint evidence and managed Babel admission, allowing
-the alternate Fabric path to take over. WG and negotiated local addresses remain
-for recovery. Static Links keep trying while configured; Dynamic Links allow a
-further 30 seconds before removal. Discovery/TCP can renegotiate peer state,
-while valid PONGs can restore the retained Link without reopening TCP. Initial
-successful negotiation establishes the Link; `--once` may then exit and provides
-no ongoing supervision. All interfaces require successful Link establishment before initial
-Babel admission; expired ones are excluded until recovery. No Babel dependency
-is required for Link liveness.
+After 30 seconds without confirmation, Velvet marks the control session lost
+and retries. A committed Link keeps its WG interface, addresses, neighbor
+loopback fallback and Babel admission. Static Links continue recovery while
+configured. Ordinary Dynamic Links are removed after
+`dynamic_links.recovery_timeout_seconds` without confirmation (default 1800,
+range 30–604800); retries and process restarts preserve that deadline. Durable
+Links retain their existing conditional-exit policy. Committed Links use WG
+PersistentKeepalive of 25 seconds unless the static peer explicitly configures
+another value. Initial negotiation confirms reachability; subsequent matching
+PONGs refresh the control session. Babel detects routing-neighbor loss independently.
 
 An omitted field that Velvet defines as derived still contributes its derived
 value to desired state. A setting left to the kernel, such as an omitted route
-metric or persistent keepalive, is neither written nor compared. Omitted route
+metric, is neither written nor compared. Keepalive is derived at Link commit. Omitted route
 collections are treated as empty Velvet-owned desired state, but omission does
 not grant ownership of unrelated kernel objects.
 
@@ -329,20 +329,36 @@ The `babel` section is optional. When present, `enabled` is required and
 ```
 
 When enabled, `velvetd` generates and validates a strict `babel-rs`
-configuration, starts one process for all local WireGuard Links, and
-automatically originates the node loopback. It reloads the child online as
-Link membership or origins change and restarts an unexpected exit with bounded exponential
-backoff. Parent death terminates the child.
+configuration and automatically originates the node loopback. It attaches to
+one independent Babel daemon and synchronizes configuration as Links change.
+Fabric stopping or losing its control connection does not stop Babel. The
+packaged systemd units restart each daemon independently; direct invocation
+starts a detached Babel process and can restart it while Fabric is running.
+Explicitly disabling Babel stops it before Fabric removes its managed routes.
 
-The managed integration targets `babel-rs` v0.6.0 (`dbeede3`).
-Generated configuration uses structured `[[interfaces]]` rules with patterns
-for static Links and exact names for committed Dynamic Links. Tentative WG interfaces are excluded until
-VFP commit, including during final connectivity validation. Withdrawal removes
-the exact name through an online reload; a link-local-only Link needs no ordinary
-origin to participate. It explicitly selects the `wired` metric preset used by the
-previous integration; upgrading does not automatically enable RTT scoring.
-The generated daemon cleanup budget is five seconds; Fabric allows six seconds
-after an accepted shutdown request or fallback SIGTERM before forcing exit.
+The integration targets the exact Babel commit in `tests/babel-revision`. Configurations live in
+`/var/lib/velvet/<uuid>/babel-rs.toml`; the control socket lives in
+`/run/velvet-babel/<uuid>/babel-rs.ctl`. Configured static interfaces and committed
+automatic interfaces enter Babel; tentative automatic interfaces do not.
+Control-session loss preserves admission; deleting a Link removes admission.
+Generated wired cost is 96. Fabric loopback host announcement metrics must be
+multiples of 96, leaving the priority gap needed by neighbor fallbacks; ordinary
+business announcements keep their existing metric range.
+
+Within the same table and prefix, explicit static routes precede finite Babel
+routes, then automatic neighbor loopback fallback routes (priority 131008),
+then Babel unreachable routes (131070). Link subnet routes keep their existing
+priority. This lets Babel route around a broken direct Link without requiring
+Fabric to delete the neighbor fallback.
+
+Full crash recovery requires a Babel build with FIB recovery support; older
+v0.6.0 releases lack it. The accompanying Babel implementation defaults to clear
+on normal exit and a 240-second startup recovery window after a crash. It adopts
+old owned IPv4/IPv6 routes until fresh routes confirm them or their original
+deadline expires; repeated crashes do not renew the deadline. Optional retain
+exit is implemented in Babel but Fabric leaves the default clear policy enabled.
+Build the updated Babel checkout alongside Fabric for this behavior. Remote
+Babel timers still apply; this is not a guarantee of uninterrupted forwarding.
 
 `babel-rs` uses UDP/6696 and `ff02::1:6` on every managed WireGuard interface.
 It owns dynamic routes with protocol `203`; `velvetd` owns static routes and
@@ -420,9 +436,18 @@ first NAT traversal implementation, not exhaustive NAT support: arbitrary
 random allocation and simultaneous destination-dependent mappings may fall back.
 
 Dynamic interfaces are locally named `vdl-<remote-name>-<uuid-prefix4>` (or
-`vdl-<uuid-prefix4>` without a remote name). They are runtime state, survive an
-effectively unchanged reload, and are discarded and relearned after an
-effective configuration change.
+`vdl-<uuid-prefix4>` without a remote name).
+
+Normal shutdown, crashes and reloads retain committed Links. Private receipts
+in `/var/lib/velvet/<uuid>/warm-links.json` bind each saved negotiation and last
+confirmation to node identity, boot, namespace and interface generation.
+Startup validates per-Link configuration and kernel key material, addresses
+and AllowedIPs, then restores management and Babel admission without waiting
+for a new PONG. Unrelated configuration changes do not invalidate Links.
+Control health is reported separately as `active`; `committed` reports retained
+forwarding state. Invalid receipts use ordinary cleanup and discovery and
+never recreate missing interfaces. Across a host reboot, static configuration
+and Durable agreements provide recovery.
 
 ## Durable Links
 
@@ -486,11 +511,28 @@ loads and validates a complete NodeSpec candidate. An invalid candidate leaves
 the active generation running; if starting a valid replacement fails,
 `velvetd` starts the previous generation again.
 
-[`packaging/systemd/velvetd.service`](packaging/systemd/velvetd.service) is a
-deployment template with restart-on-failure, runtime and state directories,
-and a minimal capability set. Install `babel-rs` at the configured path when
-dynamic routing is enabled; do not separately enable its standalone service
-for a Velvet-managed instance.
+Install all four files from [`packaging/systemd/`](packaging/systemd/) into
+`/etc/systemd/system/`, run `systemctl daemon-reload`, then enable and start
+`velvetd.service` and `velvet-recovery.timer`. Install `babel-rs` at the configured
+path. Fabric enables and starts `velvet-babel@<uuid>.service` when routing is enabled; do not
+start an additional standalone Babel service in that namespace.
+
+Fabric reports systemd readiness after local initialization and uses completed
+kernel maintenance to feed a 60-second watchdog. Remote PONG loss and Babel
+unavailability do not prevent local readiness. Restart-on-failure preserves
+committed resources. A separate timer checks persistent failure episodes,
+stops the matching Babel service and removes this instance's kernel resources
+when local recovery has failed for 30 minutes. Repeated restarts do not extend
+the deadline; one minute of healthy maintenance ends the episode. Intentional
+normal stops retain resources and do not start a retirement deadline.
+
+Adjust `--recovery-window` and `--recovery-stable` in the Fabric unit's ExecStart
+via a systemd override; adjust restart/watchdog settings there as needed.
+If changing the configuration path, update both recovery commands as well.
+The cleanup timer uses the recorded identity and tables even when configuration
+cannot be loaded, holds the daemon's namespace lock, and preserves persistent
+identity/configuration/Durable records. These guarantees require both Link
+endpoints to run the updated Fabric behavior.
 
 ## Development and testing
 

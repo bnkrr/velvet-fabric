@@ -45,13 +45,16 @@ def exercise_durable(config, ns, ip, runtime, processes, logs, uuids, daemon, wa
             time.sleep(.5)
         raise AssertionError(description)
 
-    def restart(node):
+    def restart(node, cold=False):
         i = 'abc'.index(node)
         # Obtain the test namespace via the running process, avoiding any
         # dependency on the caller's namespace naming convention.
         namespace = namespaces[node]
         processes[i].terminate()
         processes[i].wait(timeout=15)
+        if cold:
+            remote = 'b' if node == 'a' else 'a'
+            ip(node, 'link', 'del', f'vdl-{remote}-7100')
         processes[i] = sp.Popen(['ip', 'netns', 'exec', namespace, daemon,
                                 '--config', str(runtime / f'{node}.json'), '--reconcile-interval', '1s'],
                                stdout=logs[i], stderr=sp.STDOUT)
@@ -86,8 +89,22 @@ def exercise_durable(config, ns, ip, runtime, processes, logs, uuids, daemon, wa
     for node in 'ab':
         restart(node)
         wait_for(restored, 'cold bootstrap without routed VFP after restarting ' + node)
-    ns('a', 'ping', '-6', '-n', '-c', '2', '-W', '2', '-I', 'fd78:7777::1', 'fd78:7777::2')
-    print('durable: cold bootstrap and payload passed', flush=True)
+    wait_for(lambda: ' 0% packet loss' in ns('a', 'ping', '-6', '-n', '-c', '1', '-W', '1', '-I', 'fd78:7777::1', 'fd78:7777::2', check=False),
+             'Babel did not converge after cutting bootstrap paths', 75)
+    print('durable: retained restart without bootstrap and payload passed', flush=True)
+    # A process restart now preserves WG. Explicitly lose the kernel interface
+    # as well, so durable recovery cannot pass by reusing an existing tunnel.
+    for node, remote in (('a', 'b'), ('b', 'a')):
+        interface = f'vdl-{remote}-7100'
+        old_index = json.loads(ip(node, '-j', 'link', 'show', 'dev', interface))[0]['ifindex']
+        restart(node, cold=True)
+        wait_for(restored, 'durable recovery after kernel Link loss at ' + node)
+        new_index = json.loads(ip(node, '-j', 'link', 'show', 'dev', interface))[0]['ifindex']
+        assert new_index != old_index, 'cold recovery reused the old WG interface'
+        assert records(node)[0]['agreement_id'] == saved[node]['agreement_id'], 'cold recovery lost agreement'
+    wait_for(lambda: ' 0% packet loss' in ns('a', 'ping', '-6', '-n', '-c', '1', '-W', '1', '-I', 'fd78:7777::1', 'fd78:7777::2', check=False),
+             'payload did not recover after kernel Link loss', 75)
+    print('durable: kernel-loss restart without bootstrap and payload passed', flush=True)
     if config.get('fixed_count') == 1:
         path = runtime / 'b.json'
         spec = json.loads(path.read_text())

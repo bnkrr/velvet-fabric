@@ -317,3 +317,31 @@ func writeJSON(t *testing.T, path string, value any) {
 		t.Fatal(err)
 	}
 }
+
+func TestRecoveryTimeoutAndLoopbackMetricValidation(t *testing.T) {
+	enabled := true
+	for _, tc := range []struct {
+		prefix string
+		metric uint32
+		reject bool
+	}{
+		{"fd41::2/128", 96, false}, {"fd41::2/128", 65472, false},
+		{"fd41::2/128", 65534, true}, {"192.0.2.0/24", 65534, false},
+	} {
+		value := validSpec(t)
+		value.Babel = &BabelSpec{Enabled: &enabled}
+		value.Fabric.Announcements = []Announcement{{Prefix: tc.prefix, Metric: &tc.metric}}
+		problems := validateRouting(&value, map[string]struct{}{"b": {}})
+		if (len(problems) > 0) != tc.reject {
+			t.Fatalf("%s metric %d: %v", tc.prefix, tc.metric, problems)
+		}
+	}
+	for _, seconds := range []int{0, 29, 30, 1800, 604800, 604801} {
+		value := validSpec(t)
+		value.DynamicLinks = &DynamicLinksSpec{Mode: DynamicLinksActive, RecoveryTimeoutSeconds: &seconds}
+		problems := validateRouting(&value, map[string]struct{}{"b": {}})
+		if (len(problems) > 0) != (seconds < 30 || seconds > 604800) {
+			t.Fatalf("timeout %d: %v", seconds, problems)
+		}
+	}
+}

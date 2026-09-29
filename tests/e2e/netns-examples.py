@@ -142,11 +142,13 @@ def scenario(example, velvetd, babel, velvetctl):
             for log in logs.values():
                 log.close()
             for namespace in namespaces.values():
+                for pid in subprocess.run(["ip", "netns", "pids", namespace], capture_output=True, text=True).stdout.split():
+                    subprocess.run(["kill", "-TERM", pid], capture_output=True)
                 subprocess.run(["ip", "netns", "del", namespace], capture_output=True)
             subprocess.run(["ip", "link", "del", bridge], capture_output=True)
             for config in configs.values():
                 uid = config["node"]["uid"]["uuid"]
-                for directory in (Path("/run/velvet") / uid, Path("/var/lib/velvet") / uid):
+                for directory in (Path("/run/velvet") / uid, Path("/run/velvet-babel") / uid, Path("/var/lib/velvet") / uid):
                     shutil.rmtree(directory, ignore_errors=True)
 
 

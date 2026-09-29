@@ -15,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
@@ -133,108 +132,86 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 }
 
+// Run owns the configuration connection, never the daemon's lifetime.
 func (m *Manager) runOnce(ctx context.Context) error {
-	data, digest, err := m.prepare()
-	if err != nil {
-		return err
-	}
-	path, err := resolveExecutable(m.plan.Executable)
-	if err != nil {
-		return err
-	}
-	if output, err := exec.CommandContext(ctx, path, "check", "--config", m.plan.ConfigPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("babel-rs config check: %v: %s", err, bytes.TrimSpace(output))
-	}
-	command := exec.Command(path, "run", "--config", m.plan.ConfigPath, "--control-socket", m.plan.ControlPath)
-	command.Stdout = os.Stderr
-	command.Stderr = os.Stderr
-	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
-	if err := command.Start(); err != nil {
-		return fmt.Errorf("start babel-rs: %w", err)
-	}
-	waited := make(chan error, 1)
-	go func() { waited <- command.Wait() }()
-	// Every return after Start owns stopping and reaping the child, including
-	// failed control reloads and unexpected active config digests.
-	exited := false
-	defer func() {
-		if !exited {
-			stop(m.plan.ControlPath, command, waited)
-		}
-	}()
-	exited, err = m.waitReady(ctx, waited, digest, command.Process.Pid)
-	if err != nil {
-		return err
-	}
-	m.emit(Event{Status: "running"})
-	activeData := data
-	statusTicker := time.NewTicker(5 * time.Second)
-	defer statusTicker.Stop()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	first := true
+	lastPID := 0
 	for {
+		previous, _ := os.ReadFile(m.plan.ConfigPath)
+		data, digest, err := m.prepare()
+		if err != nil {
+			return err
+		}
+		executable, err := resolveExecutable(m.plan.Executable)
+		if err != nil {
+			return err
+		}
+		candidate, err := os.CreateTemp(filepath.Dir(m.plan.ConfigPath), ".babel-check-*")
+		if err != nil {
+			return err
+		}
+		if _, err = candidate.Write(data); err != nil {
+			candidate.Close()
+			os.Remove(candidate.Name())
+			return err
+		}
+		if err = candidate.Close(); err != nil {
+			os.Remove(candidate.Name())
+			return err
+		}
+		if output, err := exec.CommandContext(ctx, executable, "check", "--config", candidate.Name()).CombinedOutput(); err != nil {
+			os.Remove(candidate.Name())
+			return fmt.Errorf("babel-rs rejected generated config: %v: %s", err, bytes.TrimSpace(output))
+		}
+		os.Remove(candidate.Name())
+		if err := writeAtomic(m.plan.ConfigPath, data, 0600); err != nil {
+			return err
+		}
+		if err := ensureService(ctx, m.plan); err != nil {
+			return err
+		}
+		var status daemonStatus
+		readyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		for {
+			err = controlRequest(readyCtx, m.plan.ControlPath, "status", &status)
+			if err == nil && status.Ready {
+				break
+			}
+			if !waitContext(readyCtx, 100*time.Millisecond) {
+				cancel()
+				return fmt.Errorf("babel-rs control unavailable: %w", readyCtx.Err())
+			}
+		}
+		cancel()
+		changed := status.ActiveConfigSHA256 != digest
+		if changed {
+			var result reloadResult
+			if err := controlRequest(ctx, m.plan.ControlPath, "reload", &result); err != nil {
+				if len(previous) > 0 {
+					_ = writeAtomic(m.plan.ConfigPath, previous, 0600)
+				}
+				return fmt.Errorf("babel-rs reload rejected: %w", err)
+			}
+			if result.ActiveConfigSHA256 != digest {
+				return fmt.Errorf("babel-rs activated config digest %s, want %s", result.ActiveConfigSHA256, digest)
+			}
+		}
+		pid := servicePID(m.plan)
+		m.refreshStatus(ctx, pid)
+		if first || pid != lastPID {
+			m.emit(Event{Status: "running"})
+			first = false
+		} else if changed {
+			m.emit(Event{Status: "reloaded"})
+		}
+		lastPID = pid
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-m.updates:
-			candidate, candidateDigest, prepareErr := m.prepare()
-			if prepareErr != nil {
-				m.recordError(prepareErr)
-				continue
-			}
-			if bytes.Equal(candidate, activeData) {
-				continue
-			}
-			if output, checkErr := exec.CommandContext(ctx, path, "check", "--config", m.plan.ConfigPath).CombinedOutput(); checkErr != nil {
-				_ = writeAtomic(m.plan.ConfigPath, activeData, 0o600)
-				m.recordError(fmt.Errorf("babel-rs rejected generated config: %v: %s", checkErr, bytes.TrimSpace(output)))
-				continue
-			}
-			var result reloadResult
-			if reloadErr := controlRequest(ctx, m.plan.ControlPath, "reload", &result); reloadErr != nil {
-				var alive daemonStatus
-				if controlRequest(ctx, m.plan.ControlPath, "status", &alive) == nil {
-					_ = writeAtomic(m.plan.ConfigPath, activeData, 0o600)
-					m.recordError(fmt.Errorf("babel-rs reload rejected: %w", reloadErr))
-					continue
-				}
-				return fmt.Errorf("babel-rs control reload failed: %w", reloadErr)
-			}
-			if result.ActiveConfigSHA256 != candidateDigest {
-				return fmt.Errorf("babel-rs activated config digest %s, want %s", result.ActiveConfigSHA256, candidateDigest)
-			}
-			activeData = candidate
-			m.refreshStatus(ctx, command.Process.Pid)
-			m.emit(Event{Status: "reloaded"})
-		case <-statusTicker.C:
-			m.refreshStatus(ctx, command.Process.Pid)
-		case waitErr := <-waited:
-			exited = true
-			if waitErr == nil {
-				return fmt.Errorf("babel-rs exited unexpectedly with status 0")
-			}
-			return fmt.Errorf("babel-rs exited: %w", waitErr)
-		}
-	}
-}
-
-func (m *Manager) waitReady(ctx context.Context, waited <-chan error, digest string, pid int) (bool, error) {
-	deadline := time.NewTimer(10 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case err := <-waited:
-			return true, fmt.Errorf("babel-rs exited before readiness: %v", err)
-		case <-deadline.C:
-			return false, fmt.Errorf("babel-rs did not become ready within 10s")
 		case <-ticker.C:
-			var status daemonStatus
-			if controlRequest(ctx, m.plan.ControlPath, "status", &status) == nil && status.Ready && status.ActiveConfigSHA256 == digest {
-				m.setStatus(Status{State: "running", PID: pid, Version: status.Version, ConfigGeneration: status.ConfigGeneration, ActiveConfigSHA256: status.ActiveConfigSHA256, AttachedInterfaces: status.AttachedInterfaces, Neighbors: status.Neighbors, SelectedRoutes: status.SelectedRoutes})
-				return false, nil
-			}
 		}
 	}
 }
@@ -281,9 +258,6 @@ func (m *Manager) prepare() ([]byte, string, error) {
 	}
 	m.mu.Unlock()
 	data := Render(&plan, linkOrigins)
-	if err := writeAtomic(m.plan.ConfigPath, data, 0o600); err != nil {
-		return nil, "", err
-	}
 	digest := fmt.Sprintf("%x", sha256.Sum256(data))
 	return data, digest, nil
 }
@@ -335,6 +309,7 @@ func Render(plan *reconcile.BabelPlan, linkOrigins map[string][]netip.Prefix) []
 		output.WriteString(strconv.Quote(name))
 	}
 	output.WriteString("]\nlink_type = \"wired\"\n\n")
+	output.WriteString("[interfaces.metric]\ntype = \"wired\"\nnominal_cost = 96\n\n")
 	for _, origin := range origins {
 		output.WriteString("[[origins]]\n")
 		fmt.Fprintf(&output, "destination = %s\n", strconv.Quote(origin.Destination.String()))
@@ -412,29 +387,6 @@ func resolveExecutable(value string) (string, error) {
 		return "", fmt.Errorf("find babel-rs in PATH: %w", err)
 	}
 	return path, nil
-}
-
-func stop(controlPath string, command *exec.Cmd, waited <-chan error) {
-	if command.Process == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	err := controlRequest(ctx, controlPath, "shutdown", nil)
-	cancel()
-	if err != nil {
-		// Without an accepted control request, SIGTERM starts cleanup now.
-		_ = command.Process.Signal(syscall.SIGTERM)
-	}
-	select {
-	case <-waited:
-		return
-	case <-time.After(daemonShutdownTimeout + time.Second):
-		_ = command.Process.Kill()
-		select {
-		case <-waited:
-		case <-time.After(time.Second):
-		}
-	}
 }
 
 func waitContext(ctx context.Context, duration time.Duration) bool {

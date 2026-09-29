@@ -137,12 +137,16 @@ func materializedLinkRoutes(state *reconcile.DesiredState, linkIndex int, local 
 			continue
 		}
 		bits := 128
+		var source net.IP
 		if address.Is4() {
 			bits = 32
+		} else {
+			source = net.IP(state.LoopbackV6.AsSlice())
 		}
 		result = append(result, netlink.Route{
-			LinkIndex: linkIndex, Dst: prefixIPNet(netip.PrefixFrom(address, bits)), Src: net.IP(state.LoopbackV6.AsSlice()),
-			Scope: netlink.SCOPE_LINK, Protocol: LinkProtocol, Table: state.FabricTableID, Type: unix.RTN_UNICAST,
+			LinkIndex: linkIndex, Dst: prefixIPNet(netip.PrefixFrom(address, bits)), Src: source,
+			Priority: reconcile.NeighborFallbackPriority,
+			Scope:    netlink.SCOPE_LINK, Protocol: LinkProtocol, Table: state.FabricTableID, Type: unix.RTN_UNICAST,
 		})
 	}
 	return result

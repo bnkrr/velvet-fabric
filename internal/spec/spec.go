@@ -61,6 +61,7 @@ type BabelSpec struct {
 }
 
 type DynamicLinksSpec struct {
+	RecoveryTimeoutSeconds *int         `json:"recovery_timeout_seconds,omitempty"`
 	Durable                *DurableSpec `json:"durable,omitempty"`
 	Mode                   string       `json:"mode"`
 	AllowCandidatePrefixes []string     `json:"allow_candidate_prefixes,omitempty"`
@@ -584,6 +585,20 @@ func validUnicast(addr netip.Addr) bool {
 
 func validateRouting(s *NodeSpec, peerNames map[string]struct{}) []string {
 	var problems []string
+	if s.DynamicLinks != nil && s.DynamicLinks.RecoveryTimeoutSeconds != nil && (*s.DynamicLinks.RecoveryTimeoutSeconds < 30 || *s.DynamicLinks.RecoveryTimeoutSeconds > 604800) {
+		problems = append(problems, "dynamic_links.recovery_timeout_seconds must be between 30 and 604800")
+	}
+	if s.Babel.IsEnabled() {
+		pool, err := netip.ParsePrefix(s.Fabric.LoopbackPrefixV6)
+		if err == nil {
+			for _, a := range s.Fabric.Announcements {
+				prefix, parseErr := netip.ParsePrefix(a.Prefix)
+				if parseErr == nil && prefix.Bits() == 128 && pool.Contains(prefix.Addr()) && a.Metric != nil && *a.Metric%96 != 0 {
+					problems = append(problems, "fabric loopback host announcement metric must be a multiple of 96 when Babel is enabled")
+				}
+			}
+		}
+	}
 	tables := map[int]string{s.Fabric.EffectiveRoutingTableID(): "fabric.routing_table_id"}
 	fabricRoutes, routeProblems := validateRoutes("fabric.routes", s.Fabric.Routes, peerNames)
 	problems = append(problems, routeProblems...)

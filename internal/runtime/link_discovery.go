@@ -36,18 +36,7 @@ func (r *Runner) runLink(ctx context.Context, desired reconcile.LinkPlan, establ
 		if ctx.Err() != nil {
 			return
 		}
-		// A local supervisor failure (not TCP failure) must not leave an
-		// unmonitored direct route indefinitely shadowing the Fabric fallback.
-		for ctx.Err() == nil {
-			if e := r.withdrawLinkAdjacency(ctx, desired); e == nil {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-		}
+		r.markLinkLost(desired)
 		r.log(Event{Event: "velvet-link-supervisor", Status: "retrying", Interface: desired.InterfaceName, Error: errorText(err)})
 		select {
 		case <-ctx.Done():

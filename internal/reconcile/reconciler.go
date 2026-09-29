@@ -27,7 +27,8 @@ type Reconciler struct{ backend Backend }
 
 func New(backend Backend) *Reconciler { return &Reconciler{backend: backend} }
 
-// Retire old interface generations before reserving their replacement ports.
+// Retire old interface generations except verified RetainedLinks before
+// reserving replacement ports.
 func (r *Reconciler) PrepareRuntime(ctx context.Context, desired *DesiredState) error {
 	if backend, ok := r.backend.(interface {
 		PrepareRuntime(context.Context, *DesiredState) error
@@ -138,4 +139,23 @@ func (r *Reconciler) LinkReady(ctx context.Context, plan LinkPlan) bool {
 	}
 	port, err := r.backend.ListenPort(ctx, plan.InterfaceName)
 	return err == nil && port == plan.ListenPort
+}
+
+// CanAdoptLink is deliberately stricter than port readiness and never repairs
+// an interface while deciding whether its old generation may be retained.
+func (r *Reconciler) CanAdoptLink(ctx context.Context, plan LinkPlan, local []netip.Prefix) bool {
+	backend, ok := r.backend.(interface {
+		CanAdoptLink(context.Context, LinkPlan, []netip.Prefix) bool
+	})
+	return ok && backend.CanAdoptLink(ctx, plan, local)
+}
+
+// Keepalive starts only after a Link has completed authenticated negotiation.
+func (r *Reconciler) KeepLinkAlive(ctx context.Context, plan LinkPlan) error {
+	if backend, ok := r.backend.(interface {
+		KeepLinkAlive(context.Context, LinkPlan) error
+	}); ok {
+		return backend.KeepLinkAlive(ctx, plan)
+	}
+	return nil
 }

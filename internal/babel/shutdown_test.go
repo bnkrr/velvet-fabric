@@ -1,6 +1,7 @@
 package babel
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -8,6 +9,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
 )
 
 // A daemon with no usable control socket still gets its five-second cleanup
@@ -63,7 +66,13 @@ func TestStopAllowsBabelShutdownBudgetWithoutControl(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	stop(filepath.Join(dir, "missing-control"), command, waited)
+	record := serviceRecord{Plan: reconcile.BabelPlan{StatePath: filepath.Join(dir, "state"), ControlPath: filepath.Join(dir, "missing-control")}, PID: command.Process.Pid, Start: processStart(command.Process.Pid), Namespace: currentNamespace()}
+	if err := saveService(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := StopInstance(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
 	<-done
 	if data, err := os.ReadFile(marker); err != nil || string(data) != "cleaned" || !command.ProcessState.Success() {
 		t.Fatalf("child was interrupted before its cleanup budget: marker=%q error=%v state=%s", data, err, command.ProcessState)

@@ -12,24 +12,29 @@ concurrency:
   group: e2e-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  BABEL_RS_REVISION: dbeede34abd8dff2422c39ab18a15949b0f38f11 # v0.6.0
-
 jobs:
   linux-netns:
     name: Linux netns fabric
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Includes both production five-minute QUERY recovery cycles.
+    timeout-minutes: 60
     steps:
       - name: Check out velvet-fabric
         uses: actions/checkout@v7
         with:
           path: velvet-fabric
+      - name: Read pinned Babel revision
+        id: babel
+        shell: bash
+        run: |
+          revision=$(cat velvet-fabric/tests/babel-revision)
+          [[ $revision =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
       - name: Check out compatible babel-rs
         uses: actions/checkout@v7
         with:
           repository: bnkrr/babel-rs
-          ref: ${{ env.BABEL_RS_REVISION }}
+          ref: ${{ steps.babel.outputs.revision }}
           path: babel-rs
       - uses: actions/setup-go@v7
         with:
@@ -55,6 +60,9 @@ jobs:
       - name: Test static Link establishment
         working-directory: velvet-fabric
         run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"
+      - name: Test distinct control and WireGuard ports
+        working-directory: velvet-fabric
+        run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd" ports
       - name: Test Core reconciliation
         working-directory: velvet-fabric
         run: sudo sh tests/e2e/netns-core-crud.sh "$PWD/.local/bin/velvetd"
@@ -81,3 +89,63 @@ jobs:
           sudo python3 tests/e2e/netns-udp-nat.py
           "$PWD/.local/bin/velvetd"
           "$PWD/../babel-rs/target/release/babel-rs"
+
+  resilience:
+    name: Systemd resilience (${{ matrix.scenario }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [static, dynamic]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: velvet-fabric
+      - name: Read pinned Babel revision
+        id: babel
+        shell: bash
+        run: |
+          revision=$(cat velvet-fabric/tests/babel-revision)
+          [[ $revision =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: bnkrr/babel-rs
+          ref: ${{ steps.babel.outputs.revision }}
+          path: babel-rs
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.1
+          cache-dependency-path: velvet-fabric/go.sum
+      - name: Verify systemd VM and install tools
+        run: |
+          test "$(cat /proc/1/comm)" = systemd
+          sudo systemctl show --property=Version
+          sudo apt-get update
+          sudo apt-get install --yes iproute2 iputils-ping wireguard-tools nftables
+          sudo modprobe wireguard
+      - name: Build Babel
+        working-directory: babel-rs
+        run: cargo build --locked --release --package babel-rs
+      - name: Build and stage Fabric
+        working-directory: velvet-fabric
+        run: |
+          mkdir -p .local/experiments/resilience/packaging/systemd
+          CGO_ENABLED=0 go build -trimpath -o .local/experiments/resilience/velvetd ./cmd/velvetd
+          cp ../babel-rs/target/release/babel-rs .local/experiments/resilience/
+          cp packaging/systemd/* .local/experiments/resilience/packaging/systemd/
+      - name: Run systemd and forwarding regressions
+        working-directory: velvet-fabric
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -o pipefail
+          sudo timeout --signal=TERM --kill-after=60s 12m python3 tests/e2e/netns-resilience.py \
+            "$PWD/.local/experiments/resilience" "$SCENARIO" 2>&1 | tee .local/experiments/resilience/test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: systemd-resilience-${{ matrix.scenario }}
+          path: velvet-fabric/.local/experiments/resilience/test.log
+          include-hidden-files: true

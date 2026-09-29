@@ -11,6 +11,19 @@ vm_configure() {
   [[ ${VELVET_VM_HOST} != -* && ${VELVET_VM_REMOTE_ROOT} == /* && ${VELVET_VM_REMOTE_ROOT} != / ]] || {
     echo 'invalid VM host or absolute remote asset directory' >&2; return 2;
   }
+  babel_source=${VELVET_BABEL_SOURCE:-revision}
+  babel_revision=${VELVET_BABEL_REVISION:-$(cat "${repo_root}/tests/babel-revision")}
+  case "$babel_source" in
+    revision)
+      [[ $babel_revision =~ ^[0-9a-f]{40}$ ]] || {
+        echo 'VELVET_BABEL_REVISION must be a full 40-character commit SHA' >&2; return 2;
+      } ;;
+    working-tree)
+      [[ -z ${VELVET_BABEL_REVISION:-} ]] || {
+        echo 'working-tree cannot be combined with VELVET_BABEL_REVISION' >&2; return 2;
+      } ;;
+    *) echo 'VELVET_BABEL_SOURCE must be revision or working-tree' >&2; return 2 ;;
+  esac
   go_bin=${VELVET_GO_BIN:-go}
   cargo_bin=${VELVET_CARGO_BIN:-cargo}
   babel_repo=$(cd "${VELVET_BABEL_REPO}" && pwd)
@@ -28,13 +41,20 @@ vm_build() {
   if [[ ${1:-} == with-ctl ]]; then
     CGO_ENABLED=0 GOOS=linux "${go_bin}" build -trimpath -o "${build_dir}/velvetctl" ./cmd/velvetctl
   fi
-  mkdir "${build_dir}/babel-source"
-  git -C "${babel_repo}" archive "${babel_revision}" | tar -x -C "${build_dir}/babel-source"
+  if [[ $babel_source == working-tree ]]; then
+    babel_manifest="${babel_repo}/Cargo.toml"
+    printf 'Babel source: working tree %s\n' "${babel_repo}"
+  else
+    mkdir "${build_dir}/babel-source"
+    git -C "${babel_repo}" archive "${babel_revision}" | tar -x -C "${build_dir}/babel-source"
+    babel_manifest="${build_dir}/babel-source/Cargo.toml"
+    printf 'Babel source: revision %s\n' "${babel_revision}"
+  fi
   # Respect Cargo's environment/config, including target, toolchain and caches.
   # Its artifact output also handles cross targets and custom target directories.
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${repo_root}/.local/cache/babel-rs}" \
     "${cargo_bin}" build --locked --release --message-format=json \
-    --manifest-path "${build_dir}/babel-source/Cargo.toml" --package babel-rs > "${build_dir}/cargo.jsonl"
+    --manifest-path "${babel_manifest}" --package babel-rs > "${build_dir}/cargo.jsonl"
   python3 - "${build_dir}" <<'PY'
 import json, pathlib, shutil, sys
 root = pathlib.Path(sys.argv[1])

@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -122,9 +121,15 @@ func TestManagerLifecycle(t *testing.T) {
 				case <-time.After(10 * time.Second):
 					t.Error("manager did not stop")
 				}
-				if pid != 0 && syscall.Kill(pid, 0) == nil {
-					_ = syscall.Kill(pid, syscall.SIGKILL)
-					t.Error("manager leaked Babel child")
+				if err := StopInstance(context.Background(), dir); err != nil {
+					t.Error(err)
+				}
+				until := time.Now().Add(time.Second)
+				for pid != 0 && processStart(pid) != "" && time.Now().Before(until) {
+					time.Sleep(time.Millisecond)
+				}
+				if pid != 0 && processStart(pid) != "" {
+					t.Error("explicit stop left Babel running")
 				}
 			})
 			await := func(want string) Event {
@@ -135,16 +140,16 @@ func TestManagerLifecycle(t *testing.T) {
 						t.Fatalf("event %#v, want %s", event, want)
 					}
 					return event
-				case <-time.After(10 * time.Second):
+				case <-time.After(15 * time.Second):
 					t.Fatalf("missing %s event", want)
 				}
 				return Event{}
 			}
 			if scenario == "check-fails" || scenario == "early-exit" {
 				event := await("retrying")
-				expected := "config check"
+				expected := "rejected generated config"
 				if scenario == "early-exit" {
-					expected = "exited before readiness"
+					expected = "control unavailable"
 				}
 				if !strings.Contains(event.Error, expected) {
 					t.Fatal(event.Error)
@@ -160,7 +165,7 @@ func TestManagerLifecycle(t *testing.T) {
 				manager.SetLinkState("vl-test", true, []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24")})
 				switch scenario {
 				case "check-reject", "reload-reject":
-					event := await("degraded")
+					event := await("retrying")
 					expected := "rejected generated config"
 					if scenario == "reload-reject" {
 						expected = "reload rejected"
@@ -172,9 +177,9 @@ func TestManagerLifecycle(t *testing.T) {
 					if err != nil || !bytes.Equal(active, restored) {
 						t.Fatalf("rejected config was not restored: %v", err)
 					}
-					after := manager.Status()
-					if after.PID != pid || after.ActiveConfigSHA256 != before.ActiveConfigSHA256 || after.LastError == "" {
-						t.Fatalf("rejection lost active state: %#v", after)
+					var current daemonStatus
+					if err := controlRequest(context.Background(), plan.ControlPath, "status", &current); err != nil || current.ActiveConfigSHA256 != before.ActiveConfigSHA256 || servicePID(plan) != pid {
+						t.Fatalf("rejection disrupted independent daemon: %v %#v", err, current)
 					}
 				case "digest-mismatch":
 					if event := await("retrying"); !strings.Contains(event.Error, "activated config digest") {
@@ -194,6 +199,28 @@ func TestManagerLifecycle(t *testing.T) {
 			case <-done:
 			case <-time.After(10 * time.Second):
 				t.Fatal("cancel did not stop manager")
+			}
+			if pid != 0 && servicePID(plan) != pid {
+				t.Fatal("manager cancellation stopped independent Babel")
+			}
+			if scenario == "reload-success" {
+				// A new Fabric manager attaches to the same Babel process.
+				next := New(plan, nil)
+				next.SetLinkState("vl-test", true, []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24")})
+				resumed, stop := context.WithCancel(context.Background())
+				finished := make(chan struct{})
+				go func() { next.Run(resumed); close(finished) }()
+				deadline := time.Now().Add(5 * time.Second)
+				for next.Status().State != "running" && time.Now().Before(deadline) {
+					time.Sleep(10 * time.Millisecond)
+				}
+				if next.Status().PID != pid {
+					stop()
+					<-finished
+					t.Fatal("reattachment replaced Babel")
+				}
+				stop()
+				<-finished
 			}
 			if status := manager.Status(); status.State != "stopped" || status.PID != 0 {
 				t.Fatalf("stale final status: %#v", status)

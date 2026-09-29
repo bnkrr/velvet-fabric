@@ -32,7 +32,7 @@ def main():
         errors += [str(e['table']) for e in tables if 'table' in e and token in e['table']['name']]
         for uid in manifest['uids'].values():
             uuid.UUID(uid)
-            for base in ('/run/velvet', '/var/lib/velvet'):
+            for base in ('/run/velvet', '/run/velvet-babel', '/var/lib/velvet'):
                 if (Path(base) / uid).exists():
                     errors.append(str(Path(base) / uid))
         try:

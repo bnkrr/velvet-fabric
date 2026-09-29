@@ -2,16 +2,20 @@
 Description=Velvet Fabric node daemon
 Documentation=https://github.com/bnkrr/velvet-fabric
 After=network-pre.target
-Wants=network-pre.target
+Wants=network-pre.target velvet-recovery.timer
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/velvetd --config /etc/velvet/node.json
+Type=notify
+ExecStart=/usr/bin/velvetd --config /etc/velvet/node.json --babel-systemd
 ExecReload=/bin/kill -HUP $MAINPID
-KillMode=mixed
+ExecStopPost=/usr/bin/velvetd --config /etc/velvet/node.json --recovery-record
+WatchdogSec=60s
+KillMode=control-group
+TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=2s
-RuntimeDirectory=velvet
+RuntimeDirectory=velvet velvet-babel
+RuntimeDirectoryPreserve=yes
 RuntimeDirectoryMode=0700
 StateDirectory=velvet
 StateDirectoryMode=0700

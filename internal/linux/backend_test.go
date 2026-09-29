@@ -30,6 +30,18 @@ func TestPrefixIPNetPreservesHostAddress(t *testing.T) {
 	}
 }
 
+func TestWarmAdoptionRejectsIncompleteAllowedIPs(t *testing.T) {
+	full := defaultAllowedIPs()
+	for _, prefixes := range [][]net.IPNet{nil, full[:1], {full[0], full[0]}, {*prefixIPNet(netip.MustParsePrefix("192.0.2.0/24")), full[1]}} {
+		if adoptableAllowedIPs(prefixes) {
+			t.Fatalf("accepted incomplete receive configuration: %v", prefixes)
+		}
+	}
+	if !adoptableAllowedIPs(full) || !adoptableAllowedIPs([]net.IPNet{full[1], full[0]}) {
+		t.Fatal("rejected complete receive configuration")
+	}
+}
+
 func TestEndpointRotationAndFreshHandshake(t *testing.T) {
 	backend := New()
 	key := wgtypes.Key{1}
@@ -252,5 +264,41 @@ func TestWireGuardValueHelpers(t *testing.T) {
 	allowed := defaultAllowedIPs()
 	if len(allowed) != 2 || allowed[0].String() != "0.0.0.0/0" || allowed[1].String() != "::/0" {
 		t.Fatalf("default allowed IPs = %v", allowed)
+	}
+}
+
+func TestFallbackPriorityMigrationAndOrdering(t *testing.T) {
+	for _, peer := range []string{"fd00::2", "192.0.2.2"} {
+		routes := materializedLinkRoutes(&reconcile.DesiredState{FabricTableID: 20000}, 7, nil, []netip.Addr{netip.MustParseAddr(peer)})
+		if routes[0].Priority <= 131007 || routes[0].Priority >= 131070 {
+			t.Fatal("fallback priority outside finite/infinite Babel gap")
+		}
+		old := routes[0]
+		old.Priority = 0
+		if anyRouteMatches(old, routes) {
+			t.Fatal("legacy high-priority adjacency survives migration")
+		}
+		if !anyRouteMatches(routes[0], routes) {
+			t.Fatal("new fallback not recognized")
+		}
+	}
+}
+
+func TestLinkRouteMatchingUsesKernelDefaultMetric(t *testing.T) {
+	state := &reconcile.DesiredState{FabricTableID: 20000}
+	for _, prefix := range []string{"10.240.0.1/30", "fd77::1/126"} {
+		local := netip.MustParsePrefix(prefix)
+		wanted := materializedLinkRoutes(state, 10, []netip.Prefix{local}, nil)
+		installed := wanted[0]
+		if local.Addr().Is6() {
+			installed.Priority = 1024
+		}
+		if !anyRouteMatches(installed, wanted) {
+			t.Fatalf("installed numbered Link route rejected: %+v", installed)
+		}
+		installed.Priority++
+		if anyRouteMatches(installed, wanted) {
+			t.Fatalf("unexpected explicit metric accepted: %+v", installed)
+		}
 	}
 }

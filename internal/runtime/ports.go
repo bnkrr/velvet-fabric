@@ -158,6 +158,13 @@ func (r *Runner) reserveStaticPorts(ctx context.Context) error {
 			if (plan.Ports.Port != 0) != fixed {
 				continue
 			}
+			r.links.mu.Lock()
+			owned := r.links.resources[plan.OwnerAlias]
+			r.links.mu.Unlock()
+			if owned != nil && !owned.cleanup {
+				plan.ListenPort = owned.plan.ListenPort
+				continue
+			}
 			lease, err := r.reserveStaticPort(ctx, *plan)
 			if err != nil {
 				plan.WaitingPort = true

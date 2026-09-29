@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Velvet recovery deadline
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/velvetd --config /etc/velvet/node.json --recovery-check
+TimeoutStartSec=30s
+StateDirectory=velvet
+StateDirectoryMode=0700
+RuntimeDirectory=velvet
+RuntimeDirectoryPreserve=yes
+RuntimeDirectoryMode=0700

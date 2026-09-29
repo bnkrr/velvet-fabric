@@ -21,15 +21,18 @@ func (d *dynamicLinkEngine) startConnectivityLocked(attempt *dynamicAttempt) {
 
 func (d *dynamicLinkEngine) establishDynamic(ctx context.Context, attempt *dynamicAttempt) {
 	var err error
+supervise:
 	for {
 		err = d.runner.manageLink(ctx, attempt.plan, d.linkControl(attempt), nil)
-		if !d.runner.durable.has(attempt.remote) || ctx.Err() != nil {
+		_, committed := d.runner.committedLink(attempt.plan)
+		if (!committed && !d.runner.durable.has(attempt.remote)) || ctx.Err() != nil {
 			break
 		}
-		_ = d.runner.withdrawLinkAdjacency(ctx, attempt.plan)
+		d.runner.markLinkLost(attempt.plan)
+		d.linkControl(attempt).failed(ctx)
 		select {
 		case <-ctx.Done():
-			return
+			break supervise
 		case <-time.After(10 * time.Second):
 		}
 	}
@@ -175,7 +178,15 @@ func (d *dynamicLinkEngine) armConnectivityDeadlineLocked(attempt *dynamicAttemp
 	}
 	attempt.deadlineEpoch++
 	epoch := attempt.deadlineEpoch
-	attempt.deadlineTimer = time.AfterFunc(dynamicConnectivityTimeout, func() {
+	delay := dynamicConnectivityTimeout
+	if state, committed := d.runner.committedLink(attempt.plan); committed {
+		timeout := 30 * time.Minute
+		if plan := d.runner.Desired.DynamicLinks; plan != nil && plan.RecoveryTimeout > 0 {
+			timeout = plan.RecoveryTimeout
+		}
+		delay = time.Until(state.lastPong.Add(timeout))
+	}
+	attempt.deadlineTimer = time.AfterFunc(max(delay, 0), func() {
 		d.expireConnectivity(attempt, ctx, epoch)
 	})
 }

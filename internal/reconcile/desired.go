@@ -17,6 +17,12 @@ const LoopbackInterface = "vv-loop"
 
 const BabelDynamicProtocol = 203
 
+// Managed Babel uses cost 96 and loopback origin metrics divisible by 96.
+// Finite routes therefore end at 65535+65472; infinity exports at 131070.
+const NeighborFallbackPriority = 131008
+
+const DefaultKeepalive = 25 * time.Second
+
 type RouteType uint8
 
 const (
@@ -26,6 +32,9 @@ const (
 )
 
 type DesiredState struct {
+	// RetainedLinks protects verified runtime generations during startup cleanup.
+	// They are not configured or treated as static peers.
+	RetainedLinks      []LinkPlan `json:"-"`
 	Ports              spec.PortChoice
 	Durable            spec.DurableSettings
 	UID                spec.NodeUID
@@ -50,6 +59,7 @@ type DesiredState struct {
 type DynamicLinksPlan struct {
 	Mode                   string
 	AllowCandidatePrefixes []netip.Prefix
+	RecoveryTimeout        time.Duration
 }
 
 type LinkPlan struct {
@@ -88,6 +98,7 @@ type RulePlan struct {
 }
 
 type BabelPlan struct {
+	ServiceName string
 	Executable  string
 	ConfigPath  string
 	ControlPath string
@@ -145,7 +156,10 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 		PrivateKey:         privateKey,
 	}
 	if nodeSpec.DynamicLinks != nil {
-		dynamic := &DynamicLinksPlan{Mode: nodeSpec.DynamicLinks.Mode}
+		dynamic := &DynamicLinksPlan{Mode: nodeSpec.DynamicLinks.Mode, RecoveryTimeout: 30 * time.Minute}
+		if nodeSpec.DynamicLinks.RecoveryTimeoutSeconds != nil {
+			dynamic.RecoveryTimeout = time.Duration(*nodeSpec.DynamicLinks.RecoveryTimeoutSeconds) * time.Second
+		}
 		for _, raw := range nodeSpec.DynamicLinks.AllowCandidatePrefixes {
 			dynamic.AllowCandidatePrefixes = append(dynamic.AllowCandidatePrefixes, netip.MustParsePrefix(raw))
 		}
@@ -272,17 +286,18 @@ func compileBabel(desired *DesiredState, nodeSpec *spec.NodeSpec) *BabelPlan {
 	if executable == "" {
 		executable = "babel-rs"
 	}
-	runtimeRoot := filepath.Join("/run/velvet", desired.UUID.String())
+	runtimeRoot := filepath.Join("/run/velvet-babel", desired.UUID.String())
 	stateRoot := filepath.Join("/var/lib/velvet", desired.UUID.String())
 	plan := &BabelPlan{
 		Executable:  executable,
-		ConfigPath:  filepath.Join(runtimeRoot, "babel-rs.toml"),
+		ConfigPath:  filepath.Join(stateRoot, "babel-rs.toml"),
 		ControlPath: filepath.Join(runtimeRoot, "babel-rs.ctl"),
 		StatePath:   filepath.Join(stateRoot, "babel-rs-state.toml"),
 		Protocol:    BabelDynamicProtocol, DeviceOnly: true, ManageRules: false,
 		Views: []BabelView{{TableID: desired.FabricTableID}},
 	}
-	// All interfaces enter Babel only after link-local VFP installation.
+	// Runtime adds committed automatic interfaces; configured static selectors
+	// retain their configuration-based startup admission.
 	plan.Origins = append(plan.Origins, BabelOrigin{Destination: netip.PrefixFrom(desired.LoopbackV6, 128)})
 	for _, announcement := range nodeSpec.Fabric.Announcements {
 		prefix, _ := netip.ParsePrefix(announcement.Prefix)

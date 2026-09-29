@@ -12,6 +12,7 @@ type LinkStatus struct {
 	Interface      string          `json:"interface"`
 	Peer           string          `json:"peer"`
 	Retention      string          `json:"retention"`
+	Committed      bool            `json:"committed"`
 	Active         bool            `json:"active"`
 	ListenPort     int             `json:"listen_port"`
 	PortMode       string          `json:"port_mode"`
@@ -51,7 +52,7 @@ func (r *Runner) linkStatus(durable []DurableStatus) []LinkStatus {
 			retention = "durable"
 		}
 		state := states[name]
-		value := LinkStatus{Interface: name, Peer: plan.PeerName, Retention: retention, Active: state.active && state.desired.OwnerAlias == plan.OwnerAlias, ListenPort: plan.ListenPort, PortMode: "system", WaitingPort: plan.WaitingPort, CleanupPending: cleanups[name]}
+		value := LinkStatus{Committed: state.committed, Interface: name, Peer: plan.PeerName, Retention: retention, Active: state.active && state.desired.OwnerAlias == plan.OwnerAlias, ListenPort: plan.ListenPort, PortMode: "system", WaitingPort: plan.WaitingPort, CleanupPending: cleanups[name]}
 		if plan.WaitingPort {
 			value.ListenPort = 0
 		}

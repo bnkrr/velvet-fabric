@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/velvet-fabric/velvet-fabric/internal/reconcile"
@@ -196,4 +197,54 @@ func (b *Backend) LinkReady(ctx context.Context, plan reconcile.LinkPlan) bool {
 	}
 	defer client.Close()
 	return verifyBootstrapLink(client, plan) == nil
+}
+
+func (b *Backend) CanAdoptLink(ctx context.Context, plan reconcile.LinkPlan, local []netip.Prefix) bool {
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
+	if ctx.Err() != nil || plan.WaitingPort || plan.Probing || plan.ReceiveOnly {
+		return false
+	}
+	client, err := wgctrl.New()
+	if err != nil {
+		return false
+	}
+	defer client.Close()
+	if verifyBootstrapLink(client, plan) != nil {
+		return false
+	}
+	wg, err := client.Device(plan.InterfaceName)
+	if err != nil || len(wg.Peers) != 1 || !adoptableAllowedIPs(wg.Peers[0].AllowedIPs) {
+		return false
+	}
+	device, err := requireExactlyOwnedWireGuardInterface(plan.InterfaceName, plan.OwnerAlias)
+	if err != nil {
+		return false
+	}
+	addresses, err := netlink.AddrList(device, netlink.FAMILY_ALL)
+	if err != nil {
+		return false
+	}
+	for _, prefix := range local {
+		if !addressPresent(addresses, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
+func adoptableAllowedIPs(prefixes []net.IPNet) bool {
+	if len(prefixes) != 2 {
+		return false
+	}
+	v4, v6 := false, false
+	for _, prefix := range prefixes {
+		switch prefix.String() {
+		case "0.0.0.0/0":
+			v4 = true
+		case "::/0":
+			v6 = true
+		}
+	}
+	return v4 && v6
 }

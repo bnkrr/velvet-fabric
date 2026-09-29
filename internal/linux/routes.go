@@ -252,7 +252,14 @@ func rulesByProtocol(protocol uint8) ([]netlink.Rule, error) {
 
 func anyRouteMatches(route netlink.Route, candidates []netlink.Route) bool {
 	for _, candidate := range candidates {
-		if routesMatch(route, candidate) {
+		// Linux normalizes an unspecified IPv6 route metric to 1024.
+		// Compare that installed value while still rejecting obsolete explicit
+		// priorities on automatic neighbor fallbacks.
+		priority := candidate.Priority
+		if priority == 0 && candidate.Dst != nil && candidate.Dst.IP.To4() == nil {
+			priority = 1024
+		}
+		if routesMatch(route, candidate) && route.Priority == priority {
 			return true
 		}
 	}

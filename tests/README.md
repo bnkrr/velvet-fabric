@@ -91,9 +91,10 @@ multi-hop Fabric path.
 
 ## Babel compatibility
 
-The managed integration and privileged tests pin `babel-rs` v0.6.0 at
-`dbeede34abd8dff2422c39ab18a15949b0f38f11`. Local wrappers build a Git archive of
-that commit, and hosted CI checks out the same published revision.
+The managed integration, local build helper and privileged CI share the full
+Babel commit in `tests/babel-revision`. Local wrappers export that commit by
+default; `VELVET_BABEL_SOURCE=working-tree` explicitly tests paired development
+changes. Resilience requires the new FIB recovery configuration and status API.
 `manager_test.go` covers the structured `[[interfaces]]`/`match` configuration, static names and dynamic
 interface patterns, explicit wired policy, top-level shutdown budget, origins
 and export views. The real netns suites exercise Babel's own config validator,
@@ -135,7 +136,7 @@ original IPv4 cases and dual-stack lifecycle checks are:
 | `control-loss` | Routed VFP is reset during an accepted attempt; no commit, resources released, multi-hop ping works |
 | `random` | Broad randomized SNAT allocation produces bounded fallback with cleanup and multi-hop ping |
 | `observer-fallback` | Static observer cannot receive measurements; a second public Fabric observer supplies evidence needed to connect |
-| `lifecycle`, `v6-lifecycle` | TCP failure preserves the Link; UDP expiry withdraws adjacency, then fresh UDP recovers the same WG interface. Disable cleans up through UDP timeout and restores multi-hop routing; re-enable rebuilds |
+| `lifecycle`, `v6-lifecycle` | TCP failure preserves the Link; UDP expiry marks control loss while retaining forwarding, then fresh UDP recovers the same WG interface. Disable cleans up through UDP timeout and restores multi-hop routing; re-enable rebuilds |
 
 Twenty further cases cover address families and asymmetric reachability:
 
@@ -165,10 +166,9 @@ unsolicited UDP so router-local ICMP handling does not create unintended conntra
 The `lifecycle` and `v6-lifecycle` cases assert that link-local TCP closes after
 negotiation, then block TCP while checking the direct route and actual traffic
 for longer than the UDP health deadline. They subsequently block only Link-local
-VFP UDP, verify both protocol-202 adjacency withdrawals, and restore UDP while TCP is
-still blocked: the same WG ifindex must recover. Finally, disabling one endpoint
-must reclaim the remote Dynamic Link within 30 seconds of UDP failure detection
-plus 30 seconds of recovery (75 seconds including scheduling margin), restore
+VFP UDP, verify both control sessions expire while protocol-202 fallback remains,
+and restore UDP while TCP is still blocked: the same WG ifindex must recover. Finally, disabling one endpoint
+must reclaim the remote Dynamic Link within the configured 60-second confirmation deadline (75 seconds including scheduling margin), restore
 multi-hop routing and carry real traffic. Babel convergence and same-WG recovery
 are checked separately so routing convergence does not consume the recovery
 window. IPv6 uses
@@ -222,7 +222,7 @@ return to the bounded retry scheduler rather than exhausting a configuration
 generation.
 
 The eight-node crash check separates supervisor recovery from routing readiness.
-After the new Babel child is ready, it waits up to 240 seconds for both endpoints
+After the new Babel daemon is ready, it waits up to 240 seconds for both endpoints
 to learn routes carrying the current origin sequences, with healthy route export.
 This matches the pinned Babel restart suite: a random sequence behind surviving
 feasibility history can take about three minutes to recover. Only then do the
@@ -328,3 +328,14 @@ readiness and fresh routed READY responses. Repeated CHECKs use new TCP sessions
 Promotion stability is shortened only in these test configurations; the failure
 window is the production default. Run finite VM suites serially as described in
 [VM setup](VM.md).
+
+
+The `tests/e2e/run-on-vm.sh resilience` and `resilience-dynamic` suites
+install temporary systemd units in isolated network namespaces. They require
+systemd as PID 1 and root access, and remove their units/namespaces on exit.
+The static suite checks route-priority migration, multihop forwarding, independent
+Babel startup, Fabric crash/hang recovery and deadline cleanup. The dynamic
+suite checks the persisted long timeout and subsequent Link regrowth. They are
+included in `all` and CI. Use `netns` for an explicitly reduced run without
+systemd, or `resilience-all` for both resilience cases. FIB retention is a
+mandatory assertion; an old Babel binary fails before fixture setup.

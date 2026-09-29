@@ -143,6 +143,9 @@ func desiredLinkNames(desired *reconcile.DesiredState) map[string]struct{} {
 	for _, plan := range desired.Links {
 		names[plan.InterfaceName] = struct{}{}
 	}
+	for _, plan := range desired.RetainedLinks {
+		names[plan.InterfaceName] = struct{}{}
+	}
 	return names
 }
 

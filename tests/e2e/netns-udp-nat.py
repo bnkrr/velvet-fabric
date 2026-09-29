@@ -248,6 +248,8 @@ def scenario(case):
                     "peers": peers, "babel": {"enabled": True, "executable": BABEL}}
             if node in ("a", "b"):
                 spec["dynamic_links"] = {"mode": "active" if config.get("initiator", node) == node else "passive", "allow_candidate_prefixes": [wan_prefix]}
+            if node in ("a", "b") and config.get("mode") == "lifecycle":
+                spec["dynamic_links"]["recovery_timeout_seconds"] = 60
             if node in ("a", "b") and config.get("durable_test"):
                 spec["dynamic_links"]["durable"] = {"stable_seconds": 2}
                 if config["ports"] == "range":
@@ -455,15 +457,15 @@ def scenario(case):
  iifname "{device}" udp dport 58420 counter drop
  }}
 }}""")
-            wait_for(lambda: all(any(e.get("event") == "velvet-dynamic-link" and e.get("status") == "recovering" for e in events(n)) for n in ("a", "b")), "UDP liveness failure did not withdraw both adjacencies")
-            stage("UDP adjacency withdrawn")
-            # Protocol-202 withdrawal is synchronous; Babel convergence has its
-            # own clock. Verify same-WG recovery before its finite window ends.
+            wait_for(lambda: all(any(e.get("event") == "velvet-dynamic-link" and e.get("status") == "recovering" for e in events(n)) for n in ("a", "b")), "UDP liveness failure did not mark both control sessions lost")
+            stage("UDP control session lost")
+            # Control loss preserves protocol-202 fallback and Babel admission.
+            # Verify same-WG recovery before the long timeout ends.
             # The subsequent shutdown fault separately requires routed fallback.
             for node, target in (("a", 2), ("b", 1)):
-                assert "proto 202" not in ip(node, "-6", "route", "show", "table", "20000", "exact", f"fd78:7777::{target}/128"), "expired adjacency route was not withdrawn"
+                assert "proto 202" in ip(node, "-6", "route", "show", "table", "20000", "exact", f"fd78:7777::{target}/128"), "control loss removed committed neighbor fallback"
             ns("a", "nft", "delete", "table", "inet", "velvet_link_udp_loss")
-            stage("UDP restored after both adjacency withdrawals")
+            stage("UDP restored after both control sessions expired")
             wait_for(lambda: all(any(e.get("event") == "velvet-dynamic-link" and e.get("status") == "recovered" for e in events(n)) for n in ("a", "b")), "same-WG UDP recovery failed", seconds=25)
             assert json.loads(ip("a", "-j", "link", "show", device))[0]["ifindex"] == original_index, "recovery replaced the Link"
             assert f"dev {device}" in ip("a", "-6", "route", "show", "table", "20000", "exact", "fd78:7777::2/128")
@@ -471,8 +473,8 @@ def scenario(case):
             ns("a", "nft", "delete", "table", "inet", "velvet_tcp_only")
             config_path = runtime / "a.json"
             config = json.loads(config_path.read_text())
-            # No TCP close is needed: UDP failure detection (30s) followed
-            # by the separate 30s recovery window must reclaim the remote Link.
+            # The configured 60-second long deadline, measured from the last
+            # confirmation, must reclaim the remote ordinary Dynamic Link.
             ns("a", "nft", "-f", "-", input=f"""table inet velvet_shutdown_loss {{
  chain output {{ type filter hook output priority -20; policy accept;
  {address_match} daddr {observed_address("b")} meta l4proto udp drop
@@ -543,7 +545,7 @@ def scenario(case):
             run("ip", "link", "del", device, check=False)
         run("ip", "link", "del", bridge, check=False)
         for uid in uuids:
-            for root in ("/run/velvet", "/var/lib/velvet"):
+            for root in ("/run/velvet", "/run/velvet-babel", "/var/lib/velvet"):
                 shutil.rmtree(Path(root) / uid, ignore_errors=True)
         if succeeded:
             shutil.rmtree(runtime)

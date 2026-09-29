@@ -133,6 +133,10 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, con
 	healthy, busy := false, false
 	ready, changed := false, false
 	nextPing, nextNegotiation := time.Time{}, time.Time{}
+	if receipt := r.takeWarmLink(plan); receipt != nil {
+		result, remote, ready = &receipt.Result, receipt.Remote, true
+		health.lastPong = receipt.LastPong
+	}
 	start := func(conn net.Conn, target netip.Addr) {
 		initiator := conn == nil
 		busy = true
@@ -200,10 +204,19 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, con
 			}
 		}
 		health.lastPong = now
+		r.mu.Lock()
+		state := r.states[plan.InterfaceName]
+		state.lastPong = now
+		r.states[plan.InterfaceName] = state
+		r.mu.Unlock()
+		r.rememberWarmLink(plan, *result, remote)
 		return nil
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	if err := ping(time.Now()); err != nil {
+		return err
+	}
 	helloDelay := linkHelloDelay()
 	if control.passive {
 		// The routed proposer starts WG traffic. Give its handshake and
@@ -338,8 +351,10 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, con
 			hello.Reset(linkHelloDelay())
 		case now := <-ticker.C:
 			if healthy && health.expired(now) {
-				if err = withdraw(); err != nil {
-					return err
+				r.markLinkLost(plan)
+				healthy = false
+				if control.failed != nil {
+					control.failed(ctx)
 				}
 			}
 			if result != nil && !now.Before(nextPing) {

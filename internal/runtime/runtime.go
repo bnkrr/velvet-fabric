@@ -2,9 +2,10 @@ package runtime
 
 import (
 	"context"
-	"fmt"
 	"net/netip"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,9 +26,11 @@ type Event struct {
 }
 
 type Runner struct {
+	progress       atomic.Int64
 	links          linkManager
 	ports          portPool
 	durable        *durableManager
+	warm           *warmLinks
 	Desired        *reconcile.DesiredState
 	Reconciler     *reconcile.Reconciler
 	Interval       time.Duration
@@ -54,12 +57,14 @@ type Status struct {
 }
 
 type materializedState struct {
-	desired reconcile.LinkPlan
-	local   []netip.Prefix
-	peers   []netip.Addr
-	remote  uuid.UUID
-	dynamic bool
-	active  bool
+	desired   reconcile.LinkPlan
+	local     []netip.Prefix
+	peers     []netip.Addr
+	remote    uuid.UUID
+	dynamic   bool
+	active    bool
+	committed bool
+	lastPong  time.Time
 }
 
 func (r *Runner) Run(ctx context.Context, once bool) error {
@@ -67,7 +72,20 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 	compiled := *r.Desired
 	compiled.Links = append([]reconcile.LinkPlan(nil), r.Desired.Links...)
 	r.Desired = &compiled
-	if err := r.Reconciler.PrepareRuntime(ctx, r.Desired); err != nil {
+	if r.Desired.Babel == nil {
+		root := r.PolicyStateDir
+		if root == "" {
+			root = "/var/lib/velvet"
+		}
+		if err := babel.StopInstance(ctx, filepath.Join(root, r.Desired.UUID.String())); err != nil {
+			r.signalReady(err)
+			return err
+		}
+	}
+	retained := r.prepareWarmLinks(ctx)
+	initial := compiled
+	initial.RetainedLinks = retained
+	if err := r.Reconciler.PrepareRuntime(ctx, &initial); err != nil {
 		r.signalReady(err)
 		return err
 	}
@@ -75,24 +93,21 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		r.signalReady(err)
 		return err
 	}
-	if err := r.Reconciler.Reconcile(ctx, r.Desired); err != nil {
+	if err := r.Reconciler.Reconcile(ctx, &initial); err != nil {
 		r.signalReady(err)
 		return err
 	}
 	r.log(Event{Event: "velvet-reconcile", Status: "success", NodeUID: r.Desired.UUID.String()})
 
 	ctx, cancel := context.WithCancel(ctx)
-	babelDone := r.startBabel(ctx)
-	defer func() {
-		cancel()
-		waitForBabel(babelDone)
-	}()
+	defer cancel()
 	r.mu.Lock()
 	r.states = make(map[string]materializedState)
 	r.mu.Unlock()
-	if err := r.waitBabelReady(ctx); err != nil {
-		r.signalReady(err)
-		return err
+	if r.Desired.Babel != nil {
+		r.babel = babel.New(r.Desired.Babel, func(event babel.Event) {
+			r.log(Event{Event: "babel-rs", Status: event.Status, NodeUID: r.Desired.UUID.String(), Error: event.Error})
+		})
 	}
 
 	r.dynamic = newDynamicLinkEngine(r)
@@ -104,6 +119,8 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		r.signalReady(err)
 		return err
 	}
+	babelDone := r.startBabel(ctx)
+	defer func() { cancel(); waitForBabel(babelDone) }()
 	var workers sync.WaitGroup
 	defer func() {
 		cancel()
@@ -111,6 +128,7 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		r.dynamic.stop()
 	}()
 	workers.Go(func() { r.durable.run(ctx) })
+	r.progress.Store(time.Now().UnixNano())
 	r.signalReady(nil)
 
 	established := make(chan struct{}, len(r.Desired.Links))
@@ -135,9 +153,6 @@ func (r *Runner) startBabel(ctx context.Context) chan struct{} {
 	if r.Desired.Babel == nil {
 		return nil
 	}
-	r.babel = babel.New(r.Desired.Babel, func(event babel.Event) {
-		r.log(Event{Event: "babel-rs", Status: event.Status, NodeUID: r.Desired.UUID.String(), Error: event.Error})
-	})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -165,29 +180,6 @@ func waitForLinks(ctx context.Context, established <-chan struct{}, count int) e
 		}
 	}
 	return nil
-}
-
-func (r *Runner) waitBabelReady(ctx context.Context) error {
-	if r.babel == nil {
-		return nil
-	}
-	deadline := time.NewTimer(15 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		status := r.babel.Status()
-		if status.State == "running" {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return fmt.Errorf("babel-rs did not attach all configured interfaces: %s", status.LastError)
-		case <-ticker.C:
-		}
-	}
 }
 
 func (r *Runner) signalReady(err error) {
@@ -254,20 +246,25 @@ func (r *Runner) maintain(ctx context.Context) {
 				r.log(Event{Event: "velvet-reconcile", Status: "failed", NodeUID: r.Desired.UUID.String(), Error: err.Error()})
 				continue
 			}
-			r.maintainMaterialized(ctx)
+			if r.maintainMaterialized(ctx) {
+				r.progress.Store(time.Now().UnixNano())
+			}
 		}
 	}
 }
 
-func (r *Runner) maintainMaterialized(ctx context.Context) {
+func (r *Runner) maintainMaterialized(ctx context.Context) bool {
+	healthy := true
 	// A snapshot must not outlive Dynamic-Link deletion and interface reuse.
 	r.dynamic.resourceMu.Lock()
 	defer r.dynamic.resourceMu.Unlock()
 	for _, state := range r.materializedStates() {
 		if err := r.Reconciler.Materialize(ctx, r.Desired, state.desired, state.local, state.peers); err != nil {
+			healthy = false
 			r.log(Event{Event: "velvet-reconcile", Status: "failed", Peer: state.desired.PeerName, Interface: state.desired.InterfaceName, Error: err.Error()})
 		}
 	}
+	return healthy
 }
 
 func (r *Runner) materializedStates() []materializedState {
@@ -305,4 +302,10 @@ func (r *Runner) InheritDynamic(previous *Runner) {
 		copy.pendingQuery = false
 		r.policySeed[addr] = &copy
 	}
+}
+
+// Progress is advanced by completed maintenance, not by the notification ticker.
+func (r *Runner) Progressing(now time.Time) bool {
+	last := r.progress.Load()
+	return last != 0 && now.Sub(time.Unix(0, last)) < max(3*r.Interval, 15*time.Second)
 }

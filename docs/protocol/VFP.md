@@ -934,11 +934,11 @@ needed. Receiving PING alone proves no bidirectional reachability.
 
 The initial profile sends PING immediately after successful negotiation/installation,
 then every 10 seconds, with a 10-second response validity. An established
-adjacency expires after 30 seconds without a matching PONG. Timers are local;
+control session is marked lost after 30 seconds without a matching PONG. Timers are local;
 no timer TLV is exchanged. Successful TCP negotiation confirms initial
 reachability and permits adjacency route installation and managed Babel
 admission; the liveness clock starts then.
-A fresh PONG renews that confirmation or recovers a withdrawn adjacency. TCP EOF,
+A fresh PONG renews that confirmation or recovers a lost control session. TCP EOF,
 TCP keepalive and merely reconnecting do not refresh or expire this timer.
 Completing a new negotiation may confirm the newly installed state. The
 provisioning-only --once mode may exit after initial local commit; it provides
@@ -947,7 +947,7 @@ no subsequent supervision.
 A matching PONG's optional WG_ENDPOINT replaces the evidence for the Link and
 its current local WG listen port. Every reply can repeat the current endpoint;
 subsequent PINGs naturally recover lost reports. Evidence is never updated by
-an unsolicited datagram. Withdrawal of an expired adjacency removes its usable
+an unsolicited datagram. Loss of control-session confirmation removes its usable
 evidence; a later fresh PONG can restore it. Deleting/reconfiguring the Link
 also invalidates its evidence and outstanding challenge.
 
@@ -955,13 +955,23 @@ Configured static interfaces may enter managed routing before initial VFP
 negotiation, preserving their configuration-based startup semantics. Dynamic
 interfaces require successful negotiation before admission.
 
-On expiry, withdraw negotiated adjacency routes and managed routing admission
-before relying on the alternate Fabric path. Preserve the WG interface and
-negotiated addresses while recovering; normal reconciliation MUST NOT reinstall
-withdrawn adjacency routes. Static Links continue recovery while configured.
-Dynamic Links allow a further 30-second recovery window, then remove their
-resources. A fresh matching PONG may recover the existing negotiated Link;
-when peer state is absent or uncertain, rerun ordinary TCP negotiation.
+On control expiry, retain committed WG interfaces, negotiated addresses,
+neighbor fallback routes and managed routing admission. Continue ordinary
+PING and discovery retries. Static Links remain while configured. Ordinary
+Dynamic Links use a local configurable long recovery timeout (default 30
+minutes from the last confirmation), persisted across process restarts;
+retries alone do not extend it. At that deadline remove the Link and its
+routing admission. Durable Links use the existing conditional-exit policy in
+Section 8.17. Babel independently detects routing-neighbor loss. A matching
+PONG recovers control health on the retained Link; when peer state is absent
+or uncertain, rerun ordinary TCP negotiation.
+
+Committed Links use WG PersistentKeepalive independently of the Fabric process
+(default 25 seconds; respect explicit static settings). Tentative probing and
+handoff retain their zero-keepalive semantics. Fabric shutdown retains
+committed Links, and validated startup adoption restores routing admission
+before fresh control confirmation. Full retention requires both endpoints to
+implement these lifecycle rules.
 
 ### 8.11 Baseline discovery, selection, and inference
 
@@ -1103,8 +1113,8 @@ IDLE -> PROPOSING -> PROBING/HANDOFF -> ATTEMPTING -> UP -> RECOVERING -> UP
 
 Loss of TCP after negotiation is not a Link failure. LINK_PING/PONG owns
 adjacency health under Section 8.10. After UDP liveness expires, transition to
-RECOVERING, withdraw adjacency routes/admission, and give the retained WG
-interface a fresh 30-second recovery deadline. Fresh UDP confirmation after
+RECOVERING while retaining the committed data plane and routing admission.
+The long recovery deadline remains anchored to the last confirmation. Fresh UDP confirmation after
 retained or renewed negotiation returns it to UP. On expiry remove the Dynamic
 Link. This is not a new routed Proposal and does not reset the retry budget.
 

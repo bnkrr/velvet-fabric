@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/velvet-fabric/velvet-fabric/internal/link"
@@ -61,17 +62,22 @@ func (r *Runner) commitLink(ctx context.Context, desired reconcile.LinkPlan, dyn
 	if result.RemoteLoopbackV6.IsValid() {
 		peerLoopbacks = []netip.Addr{result.RemoteLoopbackV6}
 	}
+	if err := r.Reconciler.KeepLinkAlive(ctx, desired); err != nil {
+		return err
+	}
 	if err := r.Reconciler.Materialize(ctx, r.Desired, desired, localAddresses, peerLoopbacks); err != nil {
 		return err
 	}
 	r.mu.Lock()
 	r.states[desired.InterfaceName] = materializedState{
-		desired: desired,
-		local:   append([]netip.Prefix(nil), localAddresses...),
-		peers:   append([]netip.Addr(nil), peerLoopbacks...),
-		remote:  result.RemoteUID.UUID,
-		dynamic: dynamic,
-		active:  true,
+		desired:   desired,
+		local:     append([]netip.Prefix(nil), localAddresses...),
+		peers:     append([]netip.Addr(nil), peerLoopbacks...),
+		remote:    result.RemoteUID.UUID,
+		dynamic:   dynamic,
+		active:    true,
+		committed: true,
+		lastPong:  time.Now(),
 	}
 	r.mu.Unlock()
 	if err := r.durable.refreshPeerMetadata(result.RemoteUID, desired.PeerPublicKey, result.RemoteLoopbackV6); err != nil {
@@ -119,6 +125,7 @@ func (r *Runner) hasDirectLinkToLoopback(loopback netip.Addr) bool {
 }
 
 func (r *Runner) removeDynamicState(plan reconcile.LinkPlan) {
+	r.forgetWarmLink(plan)
 	r.mu.Lock()
 	state, exists := r.states[plan.InterfaceName]
 	removed := exists && state.dynamic && state.desired.OwnerAlias == plan.OwnerAlias
@@ -131,22 +138,24 @@ func (r *Runner) removeDynamicState(plan reconcile.LinkPlan) {
 	}
 }
 
-// withdrawLinkAdjacency withdraws an expired adjacency, retaining WG and local
-// addresses for recovery. It is also used by dynamic Link supervision.
+// withdrawLinkAdjacency revokes an obsolete negotiated adjacency before a
+// replacement proposal is installed. Control-session loss uses markLinkLost.
 func (r *Runner) withdrawLinkAdjacency(ctx context.Context, plan reconcile.LinkPlan) error {
 	r.links.resourceMu.Lock()
 	defer r.links.resourceMu.Unlock()
 	r.mu.RLock()
 	state, exists := r.states[plan.InterfaceName]
 	r.mu.RUnlock()
-	if !exists || !state.active || state.desired.OwnerAlias != plan.OwnerAlias {
+	if !exists || (!state.active && len(state.peers) == 0) || state.desired.OwnerAlias != plan.OwnerAlias {
 		return nil
 	}
+	r.forgetWarmLink(plan)
 	if err := r.Reconciler.Materialize(ctx, r.Desired, plan, state.local, nil); err != nil {
 		return err // Retain bookkeeping so runLink retries the withdrawal.
 	}
 	r.mu.Lock()
 	state.active = false
+	state.committed = false
 	state.peers = nil
 	r.states[plan.InterfaceName] = state
 	r.mu.Unlock()
@@ -158,4 +167,27 @@ func (r *Runner) withdrawLinkAdjacency(ctx context.Context, plan reconcile.LinkP
 	}
 	r.log(Event{Event: "velvet-link-withdraw", Status: "success", Interface: plan.InterfaceName})
 	return nil
+}
+
+// Control loss does not revoke an already committed forwarding resource.
+func (r *Runner) markLinkLost(plan reconcile.LinkPlan) {
+	r.mu.Lock()
+	state, ok := r.states[plan.InterfaceName]
+	if ok && state.desired.OwnerAlias == plan.OwnerAlias {
+		state.active = false
+		r.states[plan.InterfaceName] = state
+	}
+	r.mu.Unlock()
+	if r.dynamic != nil {
+		r.dynamic.mu.Lock()
+		r.dynamic.removeEvidenceLocked(plan.InterfaceName)
+		r.dynamic.mu.Unlock()
+	}
+}
+
+func (r *Runner) committedLink(plan reconcile.LinkPlan) (materializedState, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state, ok := r.states[plan.InterfaceName]
+	return state, ok && state.committed && state.desired.OwnerAlias == plan.OwnerAlias
 }

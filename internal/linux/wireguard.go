@@ -3,6 +3,7 @@
 package linux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -166,4 +167,29 @@ func defaultAllowedIPs() []net.IPNet {
 		*prefixIPNet(netip.MustParsePrefix("0.0.0.0/0")),
 		*prefixIPNet(netip.MustParsePrefix("::/0")),
 	}
+}
+
+func (b *Backend) KeepLinkAlive(ctx context.Context, plan reconcile.LinkPlan) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.kernelMu.Lock()
+	defer b.kernelMu.Unlock()
+	device, err := netlink.LinkByName(plan.InterfaceName)
+	if err != nil {
+		return err
+	}
+	if !isExactlyOwnedWireGuardInterface(device, plan.OwnerAlias) {
+		return fmt.Errorf("interface %q is not owned by Link %q", plan.InterfaceName, plan.OwnerAlias)
+	}
+	interval := reconcile.DefaultKeepalive
+	if plan.Keepalive != nil {
+		interval = *plan.Keepalive
+	}
+	client, err := wgctrl.New()
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	return client.ConfigureDevice(plan.InterfaceName, wgtypes.Config{Peers: []wgtypes.PeerConfig{{PublicKey: plan.PeerPublicKey, UpdateOnly: true, PersistentKeepaliveInterval: &interval}}})
 }

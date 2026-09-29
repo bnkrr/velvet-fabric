@@ -1,0 +1,10 @@
+[Unit]
+Description=Monitor Velvet recovery deadline
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

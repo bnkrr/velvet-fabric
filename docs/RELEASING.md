@@ -7,7 +7,7 @@ publishing its GitHub Release happens afterward.
 
 1. Finish the changes and run the relevant local checks described in
    [validation](../tests/README.md). Privileged tests must use the exact Babel
-   revision pinned in `.github/workflows/e2e.yml`.
+   revision pinned in `tests/babel-revision`.
 2. Commit from a clean worktree. Select an unused version and create its tag
    on that commit. Push the commit and tag; do not move a published tag.
 3. Wait for both `ci.yml` and `e2e.yml` push runs for the **tag ref and commit**

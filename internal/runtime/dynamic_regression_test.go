@@ -501,3 +501,28 @@ func TestDynamicWinningProposalReleasesSupersededRoutedSession(t *testing.T) {
 		})
 	}
 }
+
+func TestCommittedDeadlineUsesLastConfirmationAcrossRetries(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		d, session, proposal := dynamicFixture(t, &runtimeBackend{})
+		a := d.prepareInbound(session, proposal)
+		ctx, cancel := context.WithCancel(d.ctx)
+		defer cancel()
+		a.cancel, a.state = cancel, dynamicRecovering
+		d.runner.Desired.DynamicLinks.RecoveryTimeout = time.Minute
+		d.runner.states[a.plan.InterfaceName] = materializedState{desired: a.plan, committed: true, lastPong: time.Now(), dynamic: true}
+		d.armConnectivityDeadlineLocked(a, ctx)
+		time.Sleep(40 * time.Second)
+		// A new supervisor or adoption uses the same persisted confirmation.
+		d.armConnectivityDeadlineLocked(a, ctx)
+		time.Sleep(19 * time.Second)
+		if ctx.Err() != nil {
+			t.Fatal("deadline expired early")
+		}
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if ctx.Err() == nil {
+			t.Fatal("retry extended long recovery deadline")
+		}
+	})
+}

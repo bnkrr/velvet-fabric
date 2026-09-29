@@ -168,6 +168,12 @@ func (d *dynamicLinkEngine) start(ctx context.Context) error {
 	for _, target := range d.targets {
 		target.pendingUpdate = target.uid != uuid.Nil
 	}
+	if err := d.runner.adoptWarmLinks(); err != nil {
+		d.cancel()
+		listener.Close()
+		ps.Close()
+		return err
+	}
 	d.workers.Go(func() { d.readPolicy(ctx) })
 	d.workers.Go(func() {
 		<-ctx.Done()
@@ -195,7 +201,9 @@ func (d *dynamicLinkEngine) stop() {
 	plans := make([]reconcile.LinkPlan, 0, len(d.attempts)+len(d.pendingCleanups))
 	for _, attempt := range d.attempts {
 		stopAttempt(attempt)
-		plans = append(plans, attempt.plan)
+		if _, committed := d.runner.committedLink(attempt.plan); !committed {
+			plans = append(plans, attempt.plan)
+		}
 	}
 	for _, cleanup := range d.pendingCleanups {
 		cleanup.timer.Stop()
