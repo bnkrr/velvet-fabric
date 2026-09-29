@@ -229,8 +229,11 @@ def audit(topology, observations):
             remote = owners.get(peer['public'])
             state = states.get(name, {})
             materialized = observation.get('ifindices', {}).get(name) in observation.get('materialized_ifindices', ())
+            # A cold peer's tentative receiver does not make the survivor's
+            # retained incarnation reciprocal, even when its keys match.
             reciprocal_present = remote in observations and any(
-                candidate.startswith('vdl-') and any(p['public'] == link['public'] for p in value['peers'])
+                candidate.startswith('vdl-') and candidate not in observations[remote].get('pending', ())
+                and any(p['public'] == link['public'] for p in value['peers'])
                 for candidate, value in observations[remote]['wg'].items())
             obsolete = name not in static if name in configured else not reciprocal_present
             if (obsolete and materialized and state.get('committed') and not state.get('active')

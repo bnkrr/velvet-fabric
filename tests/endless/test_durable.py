@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from coverage_model import Coverage
 from durable_model import DurableAudit, agreement
-from model import NotConverged, PendingLinks, audit, address
+from model import NotConverged, PendingLinks, audit, address, prefix
 from netns import Runner
 from mutations import policy, direct_pair
 from test_model import observation_fixture
@@ -199,6 +199,53 @@ class DurableTests(unittest.TestCase):
         checker.observe(topology, obs, now=1801)
         with self.assertRaisesRegex(AssertionError, 'exceeded failure window'):
             checker.observe(topology, obs, now=1892)
+
+    def asymmetric_recovery(self):
+        topology, obs, checker, node, peer = fixture()
+        for a, b in ((node, peer), (peer, node)):
+            item, name = obs[a], f'vdl-{b}'
+            state = next(s for s in item['status']['runtime']['links'] if s['interface'] == name)
+            state.update(active=False, committed=a == peer)
+            for route in item['fib']:
+                if route['dev'] == name:
+                    route['dev'] = 'vl-boot-00'
+        # The cold node has a new, uncommitted receiver; its survivor retains
+        # the previously committed incarnation and only a neighbor fallback.
+        cold, name = obs[node], f'vdl-{peer}'
+        cold['materialized_ifindices'].remove(cold['ifindices'][name])
+        cold['wg'][name]['peers'][0]['handshake'] = 0
+        obs[peer]['fib'].append({'dst': prefix(node), 'dev': f'vdl-{node}',
+                                 'protocol': 202, 'metric': 131008})
+        checker.observe(topology, obs, now=1)
+        PendingLinks().observe(obs, 1)
+        return topology, obs, checker, node, peer
+
+    def test_cold_durable_receiver_allows_survivor_retention_and_live_fallback(self):
+        topology, obs, checker, node, peer = self.asymmetric_recovery()
+        self.assertEqual(len(audit(topology, obs)), 30)
+        self.assertIn(f'vdl-{peer}', obs[node]['pending'])
+        self.assertIn(f'vdl-{node}', obs[peer]['retained'])
+        coverage = Coverage('ipv4')
+        coverage.verified(topology, obs)
+        for pair in ((node, peer), (peer, node)):
+            self.assertEqual(coverage.pairs[pair]['outcome'], 'fallback')
+            self.assertEqual(coverage.pairs[pair]['requirement'], 'durable-recovery')
+        checker.observe(topology, obs, now=1801)
+        with self.assertRaisesRegex(AssertionError, 'exceeded failure window'):
+            checker.observe(topology, obs, now=1892)
+
+    def test_cold_durable_receiver_cannot_hide_survivor_routing_faults(self):
+        for fault, error in (('selected-fallback', 'retained dead fallback is best'),
+                             ('learned-route', 'FIB uses a dead/unknown interface')):
+            with self.subTest(fault=fault):
+                topology, obs, _, node, peer = self.asymmetric_recovery()
+                item, name = obs[peer], f'vdl-{node}'
+                if fault == 'selected-fallback':
+                    item['fib'] = [r for r in item['fib'] if r['dst'] != prefix(node) or r['dev'] == name]
+                else:
+                    item['fib'].append({'dst': prefix(node), 'dev': name, 'protocol': 203, 'metric': 140000})
+                with self.assertRaisesRegex(NotConverged, error):
+                    audit(topology, obs)
 
     def test_offline_peer_does_not_accumulate_recovery_budget(self):
         topology, obs, checker, node, peer = self.waiting()
