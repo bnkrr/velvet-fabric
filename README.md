@@ -86,6 +86,12 @@ encrypted envelope; unauthorized datagrams receive no response.
 
 ## Quick start
 
+For an offline, multi-node configuration form, open
+[`web/config.html`](web/config.html) directly in a browser. It supports the full
+NodeSpec, static and Babel routing examples, local key generation, validation
+and ZIP export. The HTML is self-contained and needs no server or build step;
+see the [generator notes](web/README.md).
+
 Linux release archives contain `velvetd` and `velvetctl` for `amd64` and `arm64`,
 with SHA256 checksums on the [Releases page](https://github.com/bnkrr/velvet-fabric/releases).
 For optional managed dynamic routing, install the Babel build pinned in `tests/babel-revision` separately and

@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Velvet 配置生成器</title>
+<style>
+:root { font: 15px/1.55 system-ui, sans-serif; color: #20252d; background: #f5f6f8; }
+* { box-sizing: border-box; }
+body { margin: 0 auto; padding: 24px; max-width: 1500px; }
+h1 { font-size: 23px; margin: 0 0 5px; } h2 { font-size: 18px; margin: 0 0 12px; }
+h3 { font-size: 16px; margin: 0; } p { margin: 8px 0; }
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; border: 1px solid #b8c1cf; background: white; border-radius: 5px; padding: 6px 11px; }
+button:hover { background: #edf1f8; } button:disabled { opacity: .5; cursor: default; }
+button.primary, button[aria-current="true"] { background: #254d83; color: white; border-color: #254d83; }
+button.danger { color: #9c2932; }
+input, select, textarea { width: 100%; padding: 7px; border: 1px solid #b8c1cf; border-radius: 4px; background: white; color: inherit; }
+textarea { resize: vertical; min-height: 78px; font: 13px/1.5 ui-monospace, monospace; }
+input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px solid #3566a4; outline-offset: 2px; }
+input[aria-invalid="true"], textarea[aria-invalid="true"], select[aria-invalid="true"] { border-color: #a32230; }
+label { display: grid; gap: 4px; min-width: 0; font-size: 14px; align-content: start; }
+small, .hint { color: #586478; font-size: 13px; } .required { color: #a32230; }
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 13px 0; }
+.layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(310px, 1fr); gap: 18px; align-items: start; }
+.panel, section { border: 1px solid #d8dde5; background: white; border-radius: 6px; padding: 17px; margin-bottom: 14px; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 12px 0; }
+.wide { grid-column: 1 / -1; } .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.item { border: 1px solid #dde2ea; border-radius: 4px; padding: 12px; margin: 12px 0; }
+summary { cursor: pointer; font-weight: 600; padding: 4px 0; } details { margin: 10px 0; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 ui-monospace, monospace; background: #f5f6f8; padding: 12px; max-height: 65vh; overflow: auto; }
+#notice { white-space: pre-wrap; } #notice:not(:empty) { padding: 10px; border: 1px solid #9aafca; background: #edf3fb; margin: 10px 0; }
+#issues { max-height: 280px; overflow: auto; padding-left: 22px; font-size: 13px; }
+#issues li { margin: 7px 0; overflow-wrap: anywhere; } .error { color: #9c2932; } .warning { color: #80591d; }
+.link-button { border: 0; padding: 0; background: none; color: inherit; text-align: left; text-decoration: underline; }
+.mono { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.sticky { position: sticky; top: 16px; } #raw { min-height: 300px; }
+@media (max-width: 850px) { body { padding: 12px; } .layout { grid-template-columns: 1fr; } .sticky { position: static; } }
+@media (max-width: 480px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Velvet 配置生成器</h1>
+  <p class="hint">离线编辑多个节点的完整 NodeSpec。所有内容只在当前页面内存中处理；关闭前请导出。无需安装、服务端或联网。</p>
+  <div class="toolbar">
+    <button id="add-node">添加节点</button>
+    <button id="import">导入 JSON</button><input id="files" type="file" accept=".json,application/json" multiple hidden>
+    <button id="static-example">载入静态路由示例</button>
+    <button id="dynamic-example">载入 Babel 路由示例</button>
+    <button id="export-all" class="primary">一键导出 ZIP</button>
+  </div>
+  <p class="hint">示例均为 A–B–C；Babel 示例启用动态路由，未启用动态建链。导出的配置含密钥。部署时设为 <code>0600</code>，再运行 <code>velvetctl resolve --config node.json</code>。</p>
+</header>
+<div id="notice" role="status" aria-live="polite"></div>
+<nav id="nodes" class="toolbar" aria-label="节点列表"></nav>
+<main class="layout">
+  <div id="editor"></div>
+  <aside class="sticky">
+    <div class="panel">
+      <h2>配置检查</h2>
+      <p id="check-status" aria-live="polite">正在检查…</p>
+      <ul id="issues"></ul>
+      <p class="hint">检查配置格式和部分跨节点一致性；端点实际可达性、主机路由和程序路径需在目标节点确认。</p>
+    </div>
+    <div class="panel">
+      <div class="row"><h2 id="preview-title">NodeSpec</h2><button id="download-node">下载当前节点</button></div>
+      <pre id="preview" tabindex="0" aria-label="当前节点 JSON"></pre>
+      <details><summary>直接编辑 JSON</summary>
+        <p class="hint">编辑完整 NodeSpec 后应用；未知字段会明确报错，不会静默丢弃。</p>
+        <textarea id="raw" aria-label="NodeSpec JSON 编辑器" spellcheck="false"></textarea>
+        <div class="toolbar"><button id="load-raw">从当前配置载入</button><button id="apply-raw">应用 JSON</button></div>
+      </details>
+    </div>
+  </aside>
+</main>
+<script>
+'use strict';
+// This file is both source and distributable. No network or build-time dependencies.
+const VelvetConfig = (() => {
+  const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const clone = value => JSON.parse(JSON.stringify(value));
+  const encode = text => new TextEncoder().encode(text);
+  const b64 = bytes => btoa(String.fromCharCode(...bytes));
+  const unb64 = text => Uint8Array.from(atob(text.trim()), c => c.charCodeAt(0));
+  const fromURL = text => unb64(text.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - text.length % 4) % 4));
+  const isKey = value => {
+    try { return typeof value === 'string' && /^[A-Za-z0-9+/]{43}=$/.test(value.trim()) && unb64(value).length === 32; }
+    catch { return false; }
+  };
+  const randomKey = () => b64(crypto.getRandomValues(new Uint8Array(32)));
+  function uuid() {
+    const b = crypto.getRandomValues(new Uint8Array(16)); b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
+    const h = [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  }
+  // Native X25519 only: PKCS#8 RFC 8410 wraps the 32-byte private key.
+  // Public keys are derived by the browser, never by a hand-written crypto implementation.
+  async function publicKey(privateKey) {
+    if (!isKey(privateKey)) throw Error('WireGuard 私钥必须是 32 字节 Base64');
+    const der = new Uint8Array(48);
+    der.set([0x30, 0x2e, 0x02, 0x01, 0, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20]);
+    der.set(unb64(privateKey), 16);
+    const key = await crypto.subtle.importKey('pkcs8', der, 'X25519', true, ['deriveBits']);
+    return b64(fromURL((await crypto.subtle.exportKey('jwk', key)).x));
+  }
+  async function keyPair() {
+    const b = crypto.getRandomValues(new Uint8Array(32)); b[0] &= 248; b[31] = (b[31] & 127) | 64;
+    const privateKey = b64(b);
+    return {privateKey, publicKey: await publicKey(privateKey)};
+  }
+  async function createNode(name, shared) {
+    const key = await keyPair();
+    const fabric = {psk: shared?.psk || randomKey(), loopback_prefix_v6: shared?.loopback_prefix_v6 || 'fd78:abcd::/48'};
+    for (const k of ['link_prefix_v4', 'link_prefix_v6', 'vfp_port']) if (shared && own(shared, k)) fabric[k] = shared[k];
+    return {api_version: 'velvet.io/v1alpha1', kind: 'NodeSpec', fabric,
+      node: {uid: {name, uuid: uuid()}, private_key: key.privateKey}, peers: []};
+  }
+  function effectivePorts(spec, peer) {
+    return own(peer, 'listen_port') || own(peer, 'port_range') ? peer : (spec.node || {});
+  }
+  async function connect(a, b, aPort, bPort, aEndpoint = '', bEndpoint = '') {
+    const [ap, bp] = await Promise.all([publicKey(a.node.private_key), publicKey(b.node.private_key)]);
+    const alias = (s, fallback) => s.node.uid?.name || fallback;
+    const an = alias(a, 'nodea'), bn = alias(b, 'nodeb');
+    if (a === b || ap === bp) throw Error('请选择两个不同身份的节点');
+    if (a.peers.some(p => p.name === bn) || b.peers.some(p => p.name === an)) throw Error('Peer 名称已存在，请在现有 Peer 中编辑或使用不同别名');
+    a.peers.push({name: bn, public_key: bp, endpoints: bEndpoint ? [bEndpoint] : [], listen_port: aPort});
+    b.peers.push({name: an, public_key: ap, endpoints: aEndpoint ? [aEndpoint] : [], listen_port: bPort});
+  }
+  async function examples(dynamic) {
+    const psk = randomKey();
+    const nodes = await Promise.all(['a', 'b', 'c'].map(name => createNode(name, {psk})));
+    nodes.forEach((s, i) => {
+      s.fabric.routing_table_id = 20000;
+      s.node.loopback_address_v6 = `fd78:abcd::${i + 1}`;
+      s.domains = {internet: {table_id: 20001, source_prefixes: ['10.100.20.0/24']}};
+      if (dynamic) s.babel = {enabled: true, executable: '/usr/local/bin/babel-rs'};
+    });
+    await connect(nodes[0], nodes[1], 51001, 51002, '192.0.2.1:51001', '192.0.2.2:51002');
+    await connect(nodes[1], nodes[2], 51003, 51004, '192.0.2.2:51003', '192.0.2.3:51004');
+    nodes.forEach(s => s.peers.forEach(p => p.interface_name = `vl-${s.node.uid.name}-${p.name}`));
+    nodes[0].fabric.announcements = ['10.100.20.0/24'];
+    nodes[2].domains.internet.announcements = ['0.0.0.0/0'];
+    if (!dynamic) {
+      nodes[0].fabric.routes = {b: ['fd78:abcd::3/128']};
+      nodes[1].fabric.routes = {a: ['10.100.20.0/24']};
+      nodes[2].fabric.routes = {b: ['10.100.20.0/24', 'fd78:abcd::1/128']};
+      nodes[0].domains.internet.routes = {b: ['0.0.0.0/0']};
+      nodes[1].domains.internet.routes = {c: ['0.0.0.0/0']};
+    }
+    return nodes;
+  }
+  // Shape validation is also used before importing data into the form.
+  const T = {string: 'string', number: 'number', bool: 'boolean'};
+  const range = {first: T.number, last: T.number};
+  const route = {$entry: true};
+  const routes = {$map: [route]};
+  const domain = {table_id: T.number, source_prefixes: [T.string], routes, announcements: [route]};
+  const schema = {
+    api_version: T.string, kind: T.string,
+    fabric: {psk: T.string, loopback_prefix_v6: T.string, link_prefix_v4: T.string, link_prefix_v6: T.string,
+      vfp_port: T.number, routing_table_id: T.number, routes, announcements: [route]},
+    node: {uid: {name: T.string, uuid: T.string}, private_key: T.string, loopback_address_v6: T.string, listen_port: T.number, port_range: range},
+    peers: [{name: T.string, public_key: T.string, endpoints: [T.string], listen_port: T.number, port_range: range,
+      link_addresses: [T.string], persistent_keepalive_seconds: T.number, interface_name: T.string}],
+    babel: {enabled: T.bool, executable: T.string},
+    dynamic_links: {mode: T.string, recovery_timeout_seconds: T.number, allow_candidate_prefixes: [T.string], durable: {soft_limit: T.number, stable_seconds: T.number}},
+    domains: {$map: domain}
+  };
+  function shape(value, rule = schema, path = '', errors = []) {
+    if (typeof rule === 'string') {
+      if (typeof value !== rule || (rule === 'number' && !Number.isSafeInteger(value))) errors.push(`${path}: 类型应为 ${rule === 'number' ? '整数' : rule}`);
+    } else if (Array.isArray(rule)) {
+      if (!Array.isArray(value)) errors.push(`${path}: 应为数组`);
+      else value.forEach((v, i) => shape(v, rule[0], `${path}[${i}]`, errors));
+    } else if (rule.$entry && typeof value === 'string') {
+      // Scalar route/announcement shorthand.
+    } else if (!value || typeof value !== 'object' || Array.isArray(value)) errors.push(`${path || 'NodeSpec'}: 应为对象`);
+    else {
+      const fields = rule.$entry ? {prefix: T.string, metric: T.number} : rule;
+      for (const [k, v] of Object.entries(value)) {
+        const p = path ? `${path}.${k}` : k;
+        if (rule.$map) shape(v, rule.$map, p, errors);
+        else if (!own(fields, k)) errors.push(`${p}: 当前 NodeSpec 不支持此字段`);
+        else shape(v, fields[k], p, errors);
+      }
+    }
+    return errors;
+  }
+  function imported(value) {
+    const errors = shape(value);
+    if (errors.length) throw Error(errors.join('\n'));
+    const s = clone(value);
+    s.fabric ??= {}; s.node ??= {}; s.node.uid ??= {}; s.peers ??= [];
+    // Other missing values stay missing and are reported by the normal validator.
+    return s;
+  }
+  function ip(raw) {
+    if (typeof raw !== 'string' || !raw || raw.includes('%')) return null;
+    if (!raw.includes(':')) {
+      const parts = raw.split('.');
+      if (parts.length !== 4 || parts.some(p => !/^(0|[1-9][0-9]{0,2})$/.test(p) || +p > 255)) return null;
+      return {size: 32, value: parts.reduce((n, p) => (n << 8n) | BigInt(p), 0n)};
+    }
+    let text = raw;
+    if (text.includes('.')) {
+      const colon = text.lastIndexOf(':'); const v4 = ip(text.slice(colon + 1));
+      if (!v4 || v4.size !== 32) return null;
+      text = text.slice(0, colon + 1) + (v4.value >> 16n).toString(16) + ':' + (v4.value & 65535n).toString(16);
+    }
+    const halves = text.split('::');
+    if (halves.length > 2) return null;
+    const left = halves[0] ? halves[0].split(':') : [];
+    const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+    if ([...left, ...right].some(p => !/^[0-9a-f]{1,4}$/i.test(p))) return null;
+    const missing = 8 - left.length - right.length;
+    if ((halves.length === 1 && missing !== 0) || (halves.length === 2 && missing < 1)) return null;
+    const parts = [...left, ...Array(missing).fill('0'), ...right];
+    return {size: 128, value: parts.reduce((n, p) => (n << 16n) | BigInt('0x' + p), 0n)};
+  }
+  function prefix(raw) {
+    if (typeof raw !== 'string') return null;
+    const parts = raw.split('/'); const addr = ip(parts[0]);
+    if (parts.length !== 2 || !addr || !/^(0|[1-9][0-9]*)$/.test(parts[1])) return null;
+    const bits = +parts[1];
+    if (bits > addr.size) return null;
+    const host = BigInt(addr.size - bits);
+    if ((addr.value >> host << host) !== addr.value) return null;
+    return {...addr, bits, id: `${addr.size}:${addr.value}/${bits}`};
+  }
+  const contains = (p, a) => p && a && p.size === a.size && p.value >> BigInt(p.size - p.bits) === a.value >> BigInt(p.size - p.bits);
+  const overlaps = (a, b) => contains(a, b) || contains(b, a);
+  const label = (s, i) => s.node?.uid?.name || `node${i + 1}`;
+  async function validate(specs) {
+    const issues = [];
+    const add = (node, path, text, warning = false) => issues.push({node, path, text, warning});
+    const pubs = await Promise.all(specs.map(async s => {
+      try { return isKey(s.node?.private_key) ? await publicKey(s.node.private_key) : null; }
+      catch { return null; }
+    }));
+    const uuids = new Map(), pubOwners = new Map(), loopbacks = new Map();
+    for (let n = 0; n < specs.length; n++) {
+      const s = specs[n]; const structural = shape(s);
+      if (structural.length) { structural.forEach(e => add(n, '', e)); continue; }
+      const error = (p, t) => add(n, p, t), warn = (p, t) => add(n, p, t, true);
+      const number = (v, p, min, max, required = false) => {
+        if (v === undefined && !required) return;
+        if (!Number.isSafeInteger(v) || v < min || v > max) error(p, `应为 ${min}–${max} 的整数`);
+      };
+      const key = (v, p) => { if (!isKey(v)) error(p, '必填：32 字节 Base64 密钥'); };
+      const cidr = (v, p, family, maxBits) => {
+        const q = prefix(v);
+        if (!q || (family && q.size !== family) || (maxBits !== undefined && q.bits > maxBits)) error(p, `需要有效的${family === 32 ? ' IPv4' : family === 128 ? ' IPv6' : ''}网络前缀（不能含主机位）${maxBits !== undefined ? `，最长 /${maxBits}` : ''}`);
+        return q;
+      };
+      const table = (v, p) => { number(v, p, 1, 4294967295, true); if ([253,254,255].includes(v)) error(p, '不能使用 Linux 保留表 253/254/255'); };
+      const ports = (o, p) => {
+        number(o.listen_port, p + '.listen_port', 0, 65535);
+        if (o.port_range !== undefined) {
+          if (o.listen_port !== undefined) error(p, 'listen_port 与 port_range 不能同时配置');
+          number(o.port_range.first, p + '.port_range.first', 1, 65535, true);
+          number(o.port_range.last, p + '.port_range.last', 1, 65535, true);
+          if (o.port_range.first > o.port_range.last) error(p + '.port_range', '起始端口不能大于结束端口');
+        }
+      };
+      if (s.api_version !== 'velvet.io/v1alpha1') error('api_version', '必须为 velvet.io/v1alpha1');
+      if (s.kind !== 'NodeSpec') error('kind', '必须为 NodeSpec');
+      const f = s.fabric || {}, node = s.node || {}, uid = node.uid || {}, peers = s.peers || [];
+      key(f.psk, 'fabric.psk'); key(node.private_key, 'node.private_key');
+      const pool = cidr(f.loopback_prefix_v6, 'fabric.loopback_prefix_v6', 128, 128);
+      const pools = {};
+      for (const [field, family, bits] of [['link_prefix_v4',32,30], ['link_prefix_v6',128,126]])
+        if (f[field]) pools[family] = cidr(f[field], 'fabric.' + field, family, bits);
+      number(f.vfp_port, 'fabric.vfp_port', 1, 65535);
+      const ft = f.routing_table_id ?? 20000; table(ft, 'fabric.routing_table_id');
+      if (!/^[a-z0-9]{0,5}$/.test(uid.name || '')) error('node.uid.name', '最多 5 个小写字母或数字');
+      if (!uid.uuid) warn('node.uid.uuid', '未设置；velvetctl 首次加载会生成并写回 UUID，也可在这里生成');
+      else if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uid.uuid) || /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(uid.uuid)) error('node.uid.uuid', '需要非零 UUID（8-4-4-4-12 格式）');
+      else {
+        const u = uid.uuid.toLowerCase();
+        if (uuids.has(u)) error('node.uid.uuid', `与节点 ${label(specs[uuids.get(u)], uuids.get(u))} 重复`);
+        uuids.set(u, n);
+      }
+      if (pubs[n]) {
+        if (pubOwners.has(pubs[n])) warn('node.private_key', '与另一节点使用同一密钥；这两个节点不能直接建立 WireGuard Link');
+        pubOwners.set(pubs[n], n);
+      } else if (isKey(node.private_key)) warn('node.private_key', '浏览器无法推导 X25519 公钥；请使用支持 X25519 的浏览器或在本机核验');
+      if (node.loopback_address_v6) {
+        const a = ip(node.loopback_address_v6);
+        if (!a || a.size !== 128 || a.value === 0n || a.value >> 120n === 255n || a.value >> 118n === 1018n || !contains(pool, a)) error('node.loopback_address_v6', '必须是 Fabric loopback 前缀内的非链路本地、非组播 IPv6 地址');
+        if (a) {
+          const k = `${a.size}:${a.value}`;
+          if (loopbacks.has(k)) error('node.loopback_address_v6', '与另一节点的显式 loopback 地址重复');
+          loopbacks.set(k, n);
+        }
+      }
+      ports(node, 'node');
+      const names = new Set(), interfaces = new Set(), usedPorts = new Set();
+      if (!peers.length) error('peers', '当前 NodeSpec 至少需要一个静态 Peer');
+      for (let i = 0; i < peers.length; i++) {
+        const p = peers[i], path = `peers[${i}]`;
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(p.name || '')) error(path + '.name', '必填：字母/数字开头，最多 64 个字母、数字、_、.、-');
+        if (names.has(p.name)) error(path + '.name', 'Peer 别名重复'); names.add(p.name);
+        key(p.public_key, path + '.public_key');
+        if (pubs[n] && p.public_key?.trim() === pubs[n]) error(path + '.public_key', '不能等于本节点公钥');
+        const seen = new Set();
+        for (const endpoint of p.endpoints || []) {
+          const m = /^(?:\[([^\]]+)\]|([^:\s]+)):(\d+)$/.exec(endpoint);
+          if (!m || +(m[3]) < 1 || +(m[3]) > 65535) error(path + '.endpoints', '需要 host:port 或 [IPv6]:port，端口为 1–65535');
+          if (seen.has(endpoint)) error(path + '.endpoints', '端点重复'); seen.add(endpoint);
+          if (/^(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|\[2001:db8:)/i.test(endpoint)) warn(path + '.endpoints', '这是文档示例地址；部署前换为真实可达端点');
+        }
+        ports(p, path); const choice = effectivePorts(s, p);
+        if (choice.listen_port > 0) {
+          if (usedPorts.has(choice.listen_port)) error(path + '.listen_port', '有效固定端口与另一 Peer 冲突（含继承的节点默认值）');
+          usedPorts.add(choice.listen_port);
+        }
+        number(p.persistent_keepalive_seconds, path + '.persistent_keepalive_seconds', 0, 65535);
+        let name = p.interface_name;
+        if (!name) {
+          const left = uid.name || (uid.uuid || '').replace(/-/g, '').slice(0,5) || 'node0';
+          const slug = (p.name || '').toLowerCase().replace(/[^a-z0-9]/g, '') || 'peer';
+          const readable = `vl-${left}-${slug}`;
+          // Long defaults use a Go-derived HMAC suffix and are checked by velvetctl.
+          if (readable.length <= 15) name = readable;
+        }
+        if (name) {
+          if (!/^[A-Za-z0-9_.-]{1,15}$/.test(name) || name === '.' || name === '..') error(path + '.interface_name', '接口名需要 1–15 个 ASCII 字母、数字、_、.、-');
+          if (interfaces.has(name)) error(path + '.interface_name', '有效接口名重复'); interfaces.add(name);
+        }
+        const families = new Set();
+        for (const raw of p.link_addresses || []) {
+          const q = cidr(raw, path + '.link_addresses');
+          if (!q) continue;
+          if (q.bits !== (q.size === 32 ? 30 : 126)) error(path + '.link_addresses', '必须为 IPv4 /30 或 IPv6 /126 网络');
+          if (families.has(q.size)) error(path + '.link_addresses', '每种地址族最多一个前缀'); families.add(q.size);
+          if (!contains(pools[q.size], q)) error(path + '.link_addresses', '需要对应 Fabric Link 地址池，且必须位于池内');
+        }
+      }
+      function routing(o, path, sources) {
+        const seen = new Set();
+        const entry = (v, p) => {
+          const q = cidr(typeof v === 'string' ? v : v.prefix, p + '.prefix');
+          if (typeof v === 'object') number(v.metric, p + '.metric', 0, 65534);
+          return q;
+        };
+        for (const [peer, entries] of Object.entries(o.routes || {})) {
+          const p = `${path}.routes.${peer}`;
+          if (!names.has(peer)) error(p, '下一跳必须引用本节点的静态 Peer 别名');
+          if (!entries.length) error(p, '路由组不能为空');
+          entries.forEach((v, i) => {
+            const q = entry(v, `${p}[${i}]`); if (!q) return;
+            if (seen.has(q.id)) error(p, '同一路由视图中的目的前缀重复'); seen.add(q.id);
+          });
+        }
+        const announced = new Set();
+        (o.announcements || []).forEach((v, i) => {
+          const p = `${path}.announcements[${i}]`, q = entry(v, p); if (!q) return;
+          if (seen.has(q.id)) error(p, '与同一视图中的静态路由冲突');
+          if (path === 'fabric' && s.babel?.enabled && q.bits === 128 && contains(pool, q) && typeof v === 'object' && v.metric !== undefined && v.metric % 96 !== 0) error(p + '.metric', 'Fabric loopback 主机声明的 metric 必须是 96 的倍数');
+          if (announced.has(q.id)) error(p, '声明前缀重复'); announced.add(q.id);
+          if (sources && !sources.some(x => x?.size === q.size)) error(p, 'Domain 必须有同地址族的 source_prefix');
+        });
+      }
+      routing(f, 'fabric');
+      const tables = new Set([ft]), allSources = [];
+      for (const [name, d] of Object.entries(s.domains || {})) {
+        const path = `domains.${name}`;
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) error(path, 'Domain 名称格式无效');
+        table(d.table_id, path + '.table_id');
+        if (d.table_id <= ft || tables.has(d.table_id)) error(path + '.table_id', '必须大于 Fabric 表 ID，且在本节点内唯一'); tables.add(d.table_id);
+        if (!d.source_prefixes?.length) error(path + '.source_prefixes', '至少填写一个源前缀');
+        const sources = (d.source_prefixes || []).map(raw => {
+          const q = cidr(raw, path + '.source_prefixes');
+          if (q && allSources.some(x => overlaps(q, x))) error(path + '.source_prefixes', '源前缀与本节点已配置前缀重叠（包括同一 Domain）');
+          if (q) allSources.push(q); return q;
+        });
+        routing(d, path, sources);
+      }
+      if (s.babel) {
+        if (typeof s.babel.enabled !== 'boolean') error('babel.enabled', '存在 babel 段时必填');
+        if (s.babel.executable && !s.babel.executable.startsWith('/')) error('babel.executable', '必须是目标 Linux 主机上的绝对路径');
+      }
+      if (s.dynamic_links) {
+        const d = s.dynamic_links;
+        number(d.recovery_timeout_seconds, 'dynamic_links.recovery_timeout_seconds', 30, 604800);
+        if (!['off','active','passive'].includes(d.mode)) error('dynamic_links.mode', '必须选择 off、active 或 passive');
+        if (['active','passive'].includes(d.mode) && !d.allow_candidate_prefixes?.length) error('dynamic_links.allow_candidate_prefixes', 'active/passive 模式下必填');
+        const seen = new Set();
+        (d.allow_candidate_prefixes || []).forEach(raw => {
+          const q = cidr(raw, 'dynamic_links.allow_candidate_prefixes'); if (!q) return;
+          if (seen.has(q.id)) error('dynamic_links.allow_candidate_prefixes', '前缀重复'); seen.add(q.id);
+        });
+        if (d.durable) {
+          number(d.durable.soft_limit, 'dynamic_links.durable.soft_limit', 0, 128);
+          number(d.durable.stable_seconds, 'dynamic_links.durable.stable_seconds', 1, 31536000);
+        }
+        if (d.mode !== 'off' && !s.babel?.enabled) warn('dynamic_links', '动态建链需要已有的 loopback 路由；未启用 Babel 时请配置必要的静态路由');
+      }
+    }
+    // Cross-node checks are warnings where NAT, external peers or local naming may explain differences.
+    specs.forEach((s, n) => {
+      if (shape(s).length) return;
+      (s.peers || []).forEach((p, i) => {
+        const r = pubs.findIndex(x => x && x === p.public_key?.trim()); if (r < 0 || r === n) return;
+        const remote = specs[r], path = `peers[${i}]`;
+        if (shape(remote).length) return;
+        const back = (remote.peers || []).filter(q => pubs[n] && q.public_key?.trim() === pubs[n]);
+        for (const k of ['psk','loopback_prefix_v6','link_prefix_v4','link_prefix_v6','vfp_port']) {
+          const a = s.fabric?.[k] ?? (k === 'vfp_port' ? 58420 : ''), b = remote.fabric?.[k] ?? (k === 'vfp_port' ? 58420 : '');
+          if (a !== b) add(n, path, `与 ${label(remote, r)} 的 fabric.${k} 不一致`, k.startsWith('link_prefix'));
+        }
+        if (!back.length) add(n, path, `${label(remote, r)} 缺少指向本节点的静态 Peer`, true);
+        if (back.length === 1) {
+          if (!p.endpoints?.length && !back[0].endpoints?.length) add(n, path + '.endpoints', '双方都未配置端点，静态 Link 没有初始发起者', true);
+          const port = effectivePorts(remote, back[0]).listen_port;
+          if (p.endpoints?.length && !port) add(n, path + '.endpoints', '对端为系统/范围分配端口，请确认填写的端点有固定的外部映射', true);
+        }
+        if (!!s.babel?.enabled !== !!remote.babel?.enabled) add(n, 'babel.enabled', `相邻节点 ${label(remote, r)} 的 Babel 开关不同，无法在此 Link 交换 Babel 路由`, true);
+      });
+      for (const [name, d] of Object.entries(s.domains || {})) {
+        for (let r = n + 1; r < specs.length; r++) {
+          const other = specs[r].domains?.[name];
+          if (other && JSON.stringify(d.source_prefixes) !== JSON.stringify(other.source_prefixes)) add(n, `domains.${name}.source_prefixes`, `与 ${label(specs[r], r)} 的同名 Domain 源集合/顺序不同；参与转发的节点应保持完整源集合和每族首个前缀一致`, true);
+        }
+      }
+    });
+    return issues;
+  }
+  // ZIP STORE (uncompressed): small config files need no compression library.
+  const crcTable = Array.from({length: 256}, (_, x) => {
+    for (let i = 0; i < 8; i++) x = (x >>> 1) ^ ((x & 1) ? 0xedb88320 : 0); return x >>> 0;
+  });
+  function crc32(bytes) { let c = 0xffffffff; for (const b of bytes) c = crcTable[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+  function zip(files) {
+    const chunks = [], central = []; let offset = 0, centralSize = 0;
+    function header(size) { const b = new Uint8Array(size); return [b, new DataView(b.buffer)]; }
+    for (const file of files) {
+      const name = encode(file.name), data = encode(file.text), crc = crc32(data);
+      const [h, v] = header(30); v.setUint32(0, 0x04034b50, true); v.setUint16(4, 20, true);
+      v.setUint16(6, 0x800, true); v.setUint16(12, 33, true); v.setUint32(14, crc, true);
+      v.setUint32(18, data.length, true); v.setUint32(22, data.length, true); v.setUint16(26, name.length, true);
+      chunks.push(h, name, data);
+      const [c, w] = header(46); w.setUint32(0, 0x02014b50, true); w.setUint16(4, 0x0314, true); w.setUint16(6, 20, true);
+      w.setUint16(8, 0x800, true); w.setUint16(14, 33, true); w.setUint32(16, crc, true);
+      w.setUint32(20, data.length, true); w.setUint32(24, data.length, true); w.setUint16(28, name.length, true);
+      w.setUint32(38, (0o100600 << 16) >>> 0, true); w.setUint32(42, offset, true);
+      central.push(c, name); centralSize += c.length + name.length; offset += h.length + name.length + data.length;
+    }
+    const [end, view] = header(22); view.setUint32(0, 0x06054b50, true);
+    view.setUint16(8, files.length, true); view.setUint16(10, files.length, true);
+    view.setUint32(12, centralSize, true); view.setUint32(16, offset, true);
+    return new Blob([...chunks, ...central, end], {type: 'application/zip'});
+  }
+  function filenames(specs) {
+    const used = new Set();
+    return specs.map((s, i) => {
+      const base = label(s, i).replace(/[^a-zA-Z0-9_-]/g, '_') || `node${i + 1}`;
+      let name = base, suffix = 2; while (used.has(name)) name = `${base}-${suffix++}`;
+      used.add(name); return name + '.json';
+    });
+  }
+  return {clone, isKey, randomKey, uuid, publicKey, keyPair, createNode, connect, examples, shape, imported,
+    ip, prefix, contains, effectivePorts, validate, label, zip, filenames, schema};
+})();
+
+// DOM code is kept separate so the same offline generator can be exercised with node --test.
+if (typeof document !== 'undefined') (() => {
+  const C = VelvetConfig, $ = id => document.getElementById(id);
+  const state = {nodes: [], selected: 0};
+  let handlers = new Map(), fields = new Map(), serial = 0, revision = 0, timer, busy = false;
+  const pubs = new Map();
+  const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const current = () => state.nodes[state.selected];
+  const json = s => JSON.stringify(s, null, 2) + '\n';
+  const notice = (text,kind='') => { $('notice').textContent = text; $('notice').dataset.kind=kind; };
+  async function run(fn) {
+    if (busy) return;
+    busy = true;
+    try { await fn(); } catch (e) { notice(e.message || String(e)); }
+    finally { busy = false; }
+  }
+  function action(text, fn, cls = '') {
+    const id = 'a' + serial++; handlers.set(id, fn);
+    return `<button type="button" data-action="${id}" class="${cls}">${esc(text)}</button>`;
+  }
+  function input(label, value, write, opt = {}) {
+    const id = 'f' + serial++; fields.set(id, {write, path: opt.path || '', type: opt.type});
+    const attrs = `id="${id}" data-field="${id}" ${opt.required ? 'aria-required="true"' : ''}`;
+    let control;
+    if (opt.choices) control = `<select ${attrs}>${opt.choices.map(([v,t]) => `<option value="${esc(v)}" ${String(value ?? '') === String(v) ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>`;
+    else if (opt.type === 'list') control = `<textarea ${attrs} spellcheck="false" placeholder="${esc(opt.placeholder)}">${esc((value || []).join('\n'))}</textarea>`;
+    else control = `<input ${attrs} type="${opt.type === 'number' ? 'number' : opt.secret ? 'password' : 'text'}" ${opt.type === 'number' ? 'step="1"' : ''} autocomplete="off" spellcheck="false" value="${esc(value)}" placeholder="${esc(opt.placeholder)}">`;
+    return `<label class="${opt.wide ? 'wide' : ''}" for="${id}"><span>${esc(label)} ${opt.required ? '<span class="required">*</span>' : ''}</span>${control}${opt.hint ? `<small>${esc(opt.hint)}</small>` : ''}</label>`;
+  }
+  function field(o, key, label, opt = {}) {
+    return input(label, o[key], value => { if (value === undefined) delete o[key]; else o[key] = value; }, opt);
+  }
+  function removeEmpty(o, key) { if (!o[key]?.length) delete o[key]; }
+  function portFields(o, path, peer = false) {
+    const mode = o.port_range !== undefined ? 'range' : o.listen_port === undefined ? '' : o.listen_port === 0 ? 'system' : 'fixed';
+    let html = input('UDP 端口模式', mode, value => {
+      delete o.listen_port; delete o.port_range;
+      if (value === 'range') o.port_range = {first: 40000, last: 49999};
+      if (value === 'fixed') o.listen_port = 51001;
+      if (value === 'system') o.listen_port = 0;
+      render();
+    }, {path, choices: [['',peer ? '未设置：继承节点默认' : '未设置：系统分配'], ['system','显式 0：系统分配'], ['fixed','固定端口'], ['range','端口范围']]});
+    if (mode === 'fixed') html += field(o, 'listen_port', '监听端口', {type:'number',required:true,path:path+'.listen_port'});
+    if (mode === 'range') html += field(o.port_range,'first','起始端口',{type:'number',required:true,path:path+'.port_range.first'}) + field(o.port_range,'last','结束端口（含）',{type:'number',required:true,path:path+'.port_range.last'});
+    return html;
+  }
+  function routeEditor(owner, path, announcements = false) {
+    const key = announcements ? 'announcements' : 'routes';
+    let html = '';
+    const groups = announcements ? [['', owner[key] || []]] : Object.entries(owner[key] || {});
+    for (const [peer, entries] of groups) entries.forEach((entry, i) => {
+      const p = `${path}.${key}${announcements ? '' : '.' + peer}[${i}]`;
+      const get = () => typeof entries[i] === 'string' ? {prefix: entries[i]} : entries[i];
+      const set = (k, v) => { const row = {...get()}; if (v === undefined) delete row[k]; else row[k] = v; entries[i] = row; };
+      html += '<div class="item"><div class="grid">';
+      if (!announcements) {
+        const names = [...new Set([peer,...current().peers.map(x => x.name)])];
+        html += input('下一跳 Peer', peer, value => {
+          if (value === peer) return;
+          if (!Object.hasOwn(owner.routes,value)) owner.routes[value]=[];
+          owner.routes[value].push(entries.splice(i,1)[0]);
+          if (!entries.length) delete owner.routes[peer]; render();
+        }, {required:true,path:p,choices:names.map(x => [x,x || '请选择 Peer'])});
+      }
+      html += input('目的网络前缀', get().prefix, v => set('prefix',v ?? ''), {required:true,path:p+'.prefix',placeholder:'10.100.20.0/24'});
+      html += input(announcements ? 'Babel origin metric（可选）' : '静态 metric（可选）', get().metric, v => set('metric',v), {type:'number',path:p+'.metric',placeholder:announcements ? '默认 0' : '省略：由内核选择'});
+      html += '</div>' + action('删除此项', () => { entries.splice(i,1); if (announcements) removeEmpty(owner,key); else if (!entries.length) delete owner.routes[peer]; render(); }, 'danger') + '</div>';
+    });
+    html += action(announcements ? '添加本地声明' : '添加静态路由', () => {
+      if (announcements) { owner.announcements ??= []; owner.announcements.push(''); }
+      else { owner.routes ??= {}; const p = current().peers[0]?.name || ''; if (!Object.hasOwn(owner.routes,p)) owner.routes[p]=[]; owner.routes[p].push(''); }
+      render();
+    });
+    return html;
+  }
+  function renderNodes() {
+    $('nodes').innerHTML = state.nodes.map((s,i) => `<button data-node="${i}" aria-current="${i === state.selected}">${esc(C.label(s,i))}</button>`).join('');
+  }
+  function render() {
+    handlers = new Map(); fields = new Map(); serial = 0;
+    renderNodes(); const s = current(); if (!s) { $('editor').textContent = '请添加节点或导入 JSON。'; refresh(); return; }
+    const n = s.node, f = s.fabric;
+    let h = `<section><div class="row"><h2>节点 ${esc(C.label(s,state.selected))}</h2>${action('删除节点', () => {
+      if (!confirm('删除当前节点？其他节点中指向它的 Peer 和路由将保留，请自行检查。')) return;
+      state.nodes.splice(state.selected,1); state.selected = Math.max(0,state.selected-1); render();
+    }, 'danger')}</div><p class="hint">* 必填；留空的可选字段不写入 JSON。api_version 固定为 velvet.io/v1alpha1，kind 为 NodeSpec。</p><div class="grid">`;
+    h += field(n.uid,'name','节点名',{path:'node.uid.name',placeholder:'最多 5 个小写字母/数字'});
+    h += field(n.uid,'uuid','UUID（可选）',{path:'node.uid.uuid',hint:'建议生成后保持不变；省略时由首次加载生成。'});
+    h += field(n,'private_key','WireGuard 私钥',{required:true,secret:true,path:'node.private_key',wide:true});
+    h += `</div><div class="toolbar">${action('生成 UUID', () => { n.uid.uuid = C.uuid(); render(); })}${action('生成 / 更换密钥', async () => {
+      if (n.private_key && !confirm('更换当前节点密钥？页面内引用旧公钥的 Peer 会同步更新。')) return;
+      let old; try { old = await C.publicKey(n.private_key); } catch {}
+      const pair = await C.keyPair(); n.private_key = pair.privateKey;
+      if (old) state.nodes.forEach(x => x.peers.forEach(p => { if (p.public_key === old) p.public_key = pair.publicKey; }));
+      render();
+    })}${action('显示 / 隐藏密钥', () => {
+      document.querySelectorAll('input[data-field]').forEach(e => { if (e.type === 'password') { e.type = 'text'; e.dataset.secret = 'yes'; } else if (e.dataset.secret) { e.type = 'password'; delete e.dataset.secret; } });
+    })}</div><p class="hint">本节点公钥：<span id="public-key" class="mono">正在计算…</span></p><div class="grid">`;
+    h += field(n,'loopback_address_v6','Loopback IPv6 覆盖（可选）',{path:'node.loopback_address_v6',placeholder:'省略：由 UUID 和 Fabric 参数派生'});
+    h += portFields(n,'node'); h += '</div></section>';
+    h += '<section><h2>Fabric</h2><div class="grid">';
+    h += field(f,'psk','共享 PSK',{required:true,secret:true,path:'fabric.psk',wide:true});
+    h += field(f,'loopback_prefix_v6','Loopback IPv6 前缀',{required:true,path:'fabric.loopback_prefix_v6',placeholder:'fd78:abcd::/48'});
+    h += field(f,'routing_table_id','Fabric 路由表 ID',{type:'number',path:'fabric.routing_table_id',placeholder:'默认 20000'});
+    h += field(f,'link_prefix_v4','Link IPv4 地址池（可选）',{path:'fabric.link_prefix_v4',placeholder:'10.240.0.0/16'});
+    h += field(f,'link_prefix_v6','Link IPv6 地址池（可选）',{path:'fabric.link_prefix_v6',placeholder:'fd77::/48'});
+    h += field(f,'vfp_port','VFP 端口',{type:'number',path:'fabric.vfp_port',placeholder:'默认 58420'});
+    h += `</div><div class="toolbar">${action('生成 PSK', () => { if (f.psk && !confirm('更换当前节点的 Fabric PSK？其他节点需使用相同 PSK。')) return; f.psk=C.randomKey(); render(); })}${action('将共享参数应用到全部节点', () => {
+      for (const target of state.nodes) for (const k of ['psk','loopback_prefix_v6','link_prefix_v4','link_prefix_v6','vfp_port']) {
+        if (Object.hasOwn(f,k)) target.fabric[k]=f[k]; else delete target.fabric[k];
+      }
+      notice('已同步 PSK、Loopback/Link 前缀和 VFP 端口；各节点路由与表 ID 独立保留。'); render();
+    })}</div></section>`;
+    h += '<section><h2>静态 Links / Peers</h2><p class="hint">每个 Peer 对应独立 WG 接口。endpoints 可留空等待对端发起；静态 Link 的两端都需要 Peer 配置。</p>';
+    if (state.nodes.length > 1) {
+      const pair = {target: String(state.nodes.findIndex((_,i) => i !== state.selected)), localPort: 51001, remotePort: 51002, localEndpoint: '', remoteEndpoint: ''};
+      h += '<details><summary>连接页面内的另一节点（生成双方 Peer）</summary><div class="grid">';
+      h += input('对端节点', pair.target, v => pair.target=v, {choices:state.nodes.flatMap((x,i) => i===state.selected ? [] : [[String(i),C.label(x,i)]])});
+      h += field(pair,'localPort','本端监听端口',{type:'number',required:true});
+      h += field(pair,'remotePort','对端监听端口',{type:'number',required:true});
+      h += field(pair,'localEndpoint','本端对外端点（填入对方 Peer）',{placeholder:'host:port；可留空等待对端'});
+      h += field(pair,'remoteEndpoint','对端对外端点（填入本方 Peer）',{placeholder:'host:port；NAT 外部端口可不同'});
+      h += '</div>' + action('创建双方静态 Peer', async () => {
+        for (const port of [pair.localPort,pair.remotePort]) if (!Number.isInteger(port) || port < 0 || port > 65535) throw Error('监听端口必须为 0–65535');
+        await C.connect(s,state.nodes[+pair.target],pair.localPort,pair.remotePort,pair.localEndpoint,pair.remoteEndpoint); render();
+      }) + '</details>';
+    }
+    s.peers.forEach((p,i) => {
+      const path = `peers[${i}]`;
+      h += `<div class="item"><div class="row"><h3>Peer ${i+1}</h3>${action('删除 Peer', () => { s.peers.splice(i,1); render(); },'danger')}</div><div class="grid">`;
+      h += input('本地 Peer 别名',p.name,v => {
+        const old=p.name; p.name=v ?? '';
+        for (const o of [s.fabric,...Object.values(s.domains || {})]) if (o.routes && Object.hasOwn(o.routes,old) && !Object.hasOwn(o.routes,p.name)) { o.routes[p.name]=o.routes[old]; delete o.routes[old]; }
+      },{required:true,path:path+'.name'});
+      h += field(p,'public_key','对端公钥',{required:true,path:path+'.public_key'});
+      h += field(p,'endpoints','对端端点（每行一个，可留空）',{type:'list',path:path+'.endpoints',wide:true,placeholder:'192.0.2.2:51002\n[2001:db8::2]:51002'});
+      h += portFields(p,path,true);
+      h += field(p,'persistent_keepalive_seconds','Persistent keepalive 秒数',{type:'number',path:path+'.persistent_keepalive_seconds',placeholder:'省略：不管理；0：关闭'});
+      h += field(p,'interface_name','接口名覆盖（可选）',{path:path+'.interface_name',placeholder:'省略：自动派生，最长 15 字符'});
+      h += field(p,'link_addresses','Link 网络前缀覆盖（每行一个）',{type:'list',path:path+'.link_addresses',wide:true,hint:'最多一个 IPv4 /30 和一个 IPv6 /126；必须位于 Fabric Link 地址池内。'});
+      h += '</div></div>';
+    });
+    h += action('手动添加 Peer', () => { s.peers.push({name:'',public_key:'',endpoints:[]}); render(); }) + '</section>';
+    h += '<section><h2>路由</h2><p class="hint">静态路由填写目的前缀和下一跳 Peer；Babel 从本地声明学习远端路由。启用 Babel 后仍可配置静态路由。</p><div class="grid">';
+    h += input('动态路由（Babel）',s.babel ? String(s.babel.enabled) : '',v => {
+      if (v === '') delete s.babel; else s.babel={...s.babel,enabled:v==='true'}; render();
+    },{path:'babel.enabled',choices:[['','未配置：仅静态路由'],['false','显式禁用 Babel'],['true','启用 Babel 动态路由']]});
+    if (s.babel) h += field(s.babel,'executable','目标节点 Babel 程序路径（可选）',{path:'babel.executable',placeholder:'省略：从目标节点 PATH 查找'});
+    h += '</div><h3>Fabric 本地声明</h3><p class="hint">在实际交付 Access/LAN 前缀的节点声明，例如 10.100.20.0/24。静态模式下声明仍用于本地交付；Babel 模式下还会传播。</p>';
+    h += routeEditor(f,'fabric',true);
+    h += '<h3 style="margin-top:16px">Fabric 静态路由</h3><p class="hint">Access 回程和远端节点 loopback 的下一跳。Babel 启用时通常可以省略。</p>' + routeEditor(f,'fabric');
+    h += '</section><section><h2>Domains</h2><p class="hint">按源前缀选择业务路由。每个参与转发的节点应配置完整源集合，同一地址族的第一项是 canonical source。出口在所属 Domain 中声明目的前缀，如 0.0.0.0/0。</p>';
+    for (const [name,d] of Object.entries(s.domains || {})) {
+      const path='domains.'+name;
+      h += `<div class="item"><div class="row"><h3>${esc(name)}</h3>${action('删除 Domain', () => { delete s.domains[name]; render(); },'danger')}</div><div class="grid">`;
+      h += field(d,'table_id','路由表 ID',{type:'number',required:true,path:path+'.table_id'});
+      h += field(d,'source_prefixes','源前缀（每行一个，顺序保留）',{type:'list',required:true,path:path+'.source_prefixes',wide:true});
+      h += '</div><div class="toolbar">' + action('重命名', () => {
+        const next=prompt('Domain 名称',name); if (!next || next===name) return;
+        if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(next) || Object.hasOwn(s.domains,next)) throw Error('Domain 名称无效或已存在');
+        s.domains[next]=d; delete s.domains[name]; render();
+      }) + action('将源集合复制到其他节点', () => {
+        for (const x of state.nodes) if (x !== s) {
+          x.domains ??= {};
+          if (!Object.hasOwn(x.domains,name)) x.domains[name]={table_id:d.table_id,source_prefixes:[]};
+          x.domains[name].source_prefixes=C.clone(d.source_prefixes || []);
+        }
+        notice('已复制 Domain 源集合；目标节点现有的路由、声明和表 ID 保留。新 Domain 使用当前表 ID，请检查冲突。'); render();
+      }) + '</div><h3>本地出口声明</h3>' + routeEditor(d,path,true) + '<h3 style="margin-top:16px">静态业务路由</h3>' + routeEditor(d,path) + '</div>';
+    }
+    h += action('添加 Domain', () => {
+      s.domains ??= {}; let name='internet', i=2; while (Object.hasOwn(s.domains,name)) name='domain'+i++;
+      const used=new Set(Object.values(s.domains).map(d => d.table_id)); let table=(f.routing_table_id ?? 20000)+1; while (used.has(table) || [253,254,255].includes(table)) table++;
+      s.domains[name]={table_id:table,source_prefixes:[]}; render();
+    }) + '</section>';
+    h += '<section><h2>动态建链</h2><p class="hint">与 Babel 动态路由独立。通过已有 Fabric 路径协商新的 WG 直连；启用时必须填写允许的对端 Candidate IP 范围。</p><div class="grid">';
+    h += input('动态建链模式',s.dynamic_links?.mode ?? '',v => {
+      if (v==='') delete s.dynamic_links; else s.dynamic_links={...s.dynamic_links,mode:v}; render();
+    },{path:'dynamic_links.mode',choices:[['','未配置：关闭'],['off','off：关闭'],['passive','passive：只接受'],['active','active：主动发起并接受']]});
+    if (s.dynamic_links) {
+      const d=s.dynamic_links;
+      h += field(d,'recovery_timeout_seconds','Dynamic Link 恢复超时（秒）',{type:'number',path:'dynamic_links.recovery_timeout_seconds',placeholder:'默认 1800',hint:'范围 30–604800；从最后一次确认计时，重启不会延长。'});
+      h += field(d,'allow_candidate_prefixes','允许的 Candidate 前缀（每行一个）',{type:'list',required:['active','passive'].includes(d.mode),path:'dynamic_links.allow_candidate_prefixes',wide:true,hint:'例如 0.0.0.0/0、::/0 表示允许整个对应地址族；可限制为自己的网络范围。'});
+      h += '</div><details><summary>Durable Link 设置（可选）</summary><p class="hint">健康动态 Link 自动协商持久化；这里配置策略，不生成运行时 agreement。</p><div class="grid">';
+      for (const [k,title,placeholder] of [['soft_limit','软数量上限','默认 2；可显式设为 0'],['stable_seconds','晋升前稳定时间（秒）','默认 1800']]) {
+        h += input(title,d.durable?.[k],v => {
+          if (v===undefined) { if (d.durable) { delete d.durable[k]; if (!Object.keys(d.durable).length) delete d.durable; } }
+          else { d.durable ??= {}; d.durable[k]=v; }
+        },{type:'number',path:'dynamic_links.durable.'+k,placeholder});
+      }
+      h += '</div></details>';
+    } else h += '</div>';
+    h += '</section>';
+    // Preserve expanded groups when structural edits redraw the form.
+    const opened=new Set([...$('editor').querySelectorAll('details[open]')].map(d => d.querySelector('summary').textContent));
+    $('editor').innerHTML=h;
+    $('editor').querySelectorAll('details').forEach(d => { d.open=opened.has(d.querySelector('summary').textContent); });
+    refresh();
+  }
+  function refresh() {
+    revision++; const rev=revision; clearTimeout(timer);
+    if ($('notice').dataset.kind==='validation') notice('');
+    renderNodes(); const s=current();
+    $('preview').textContent=s ? json(s) : '';
+    $('preview-title').textContent=s ? C.label(s,state.selected)+'.json' : 'NodeSpec';
+    $('download-node').disabled=!s; $('export-all').disabled=!state.nodes.length;
+    if (s && $('public-key')) {
+      const key=s.node.private_key;
+      if (!C.isKey(key)) $('public-key').textContent='请填写有效私钥';
+      else {
+        if (!pubs.has(key)) pubs.set(key,C.publicKey(key).catch(() => null));
+        pubs.get(key).then(pub => { if (rev===revision && $('public-key')) $('public-key').textContent=pub || '此浏览器不支持 X25519；请换用新版浏览器'; });
+      }
+    }
+    $('check-status').textContent='正在检查…';
+    timer=setTimeout(async () => {
+      const issues=await C.validate(state.nodes); if (rev!==revision) return;
+      const errors=issues.filter(x => !x.warning).length;
+      $('check-status').textContent=`${errors} 个错误 · ${issues.length-errors} 个提醒（全部节点）`;
+      $('issues').replaceChildren();
+      for (const item of issues) {
+        const li=document.createElement('li'); li.className=item.warning ? 'warning' : 'error';
+        const b=document.createElement('button'); b.className='link-button';
+        b.textContent=`${C.label(state.nodes[item.node],item.node)} · ${item.path || 'NodeSpec'}：${item.text}`;
+        b.onclick=() => {
+          state.selected=item.node; render();
+          const found=[...fields].find(([,v]) => v.path && (v.path===item.path || item.path.startsWith(v.path+'.')));
+          if (found) { const e=$(found[0]); let p=e.parentElement; while (p) { if (p.tagName==='DETAILS') p.open=true; p=p.parentElement; } e.focus(); }
+        };
+        li.append(b); $('issues').append(li);
+      }
+      for (const [id,v] of fields) {
+        const invalid=issues.some(x => !x.warning && x.node===state.selected && v.path && (x.path===v.path || x.path.startsWith(v.path+'.')));
+        $(id)?.setAttribute('aria-invalid',String(invalid));
+      }
+    },180);
+  }
+  $('editor').addEventListener('input',event => {
+    const e=event.target, f=fields.get(e.dataset.field); if (!f || e.tagName==='SELECT') return;
+    let value=e.value.trim();
+    if (f.type==='number') value=value==='' ? undefined : Number(value);
+    else if (f.type==='list') value=value ? value.split(/\r?\n/).map(x => x.trim()).filter(Boolean) : [];
+    else if (value==='') value=undefined;
+    f.write(value); refresh();
+  });
+  $('editor').addEventListener('change',event => {
+    const e=event.target, f=fields.get(e.dataset.field); if (!f) return;
+    if (e.tagName!=='SELECT') { if (/^peers\[\d+\]\.name$/.test(f.path)) render(); return; }
+    f.write(e.value); refresh();
+  });
+  $('editor').addEventListener('click',event => { const b=event.target.closest('[data-action]'); if (b) run(() => handlers.get(b.dataset.action)?.()); });
+  $('nodes').onclick=event => { const b=event.target.closest('[data-node]'); if (b) { state.selected=+b.dataset.node; render(); } };
+  function download(blob,name) {
+    const url=URL.createObjectURL(blob), a=document.createElement('a'); a.href=url; a.download=name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url),1000);
+  }
+  async function exportConfigs(all) {
+    const snapshot=C.clone(state.nodes), selected=state.selected;
+    if (!snapshot.length) return;
+    const issues=await C.validate(snapshot);
+    const errors=issues.filter(x => !x.warning && (all || x.node===selected));
+    if (errors.length) { notice(`请先修正${all ? '全部节点' : '当前节点'}的 ${errors.length} 个错误，再导出。`,'validation'); return; }
+    const names=C.filenames(snapshot);
+    if (all) download(C.zip(snapshot.map((s,i) => ({name:names[i],text:json(s)}))),'velvet-configs.zip');
+    else download(new Blob([json(snapshot[selected])],{type:'application/json'}),names[selected]);
+    notice('已导出。配置含私钥/PSK；解压或复制到目标主机后设为 0600，再用 velvetctl resolve 检查。');
+  }
+  $('download-node').onclick=() => run(() => exportConfigs(false));
+  $('export-all').onclick=() => run(() => exportConfigs(true));
+  $('add-node').onclick=() => run(async () => {
+    let i=1; while (state.nodes.some(s => s.node.uid.name==='n'+i)) i++;
+    state.nodes.push(await C.createNode('n'+i,current()?.fabric)); state.selected=state.nodes.length-1; render();
+  });
+  async function example(dynamic) {
+    if (state.nodes.length && !confirm('用三节点示例替换当前页面配置？未导出的修改和密钥会丢失。')) return;
+    state.nodes=await C.examples(dynamic); state.selected=0;
+    notice('已载入 '+(dynamic ? 'Babel 动态路由' : '静态路由')+'示例。已生成新密钥和 UUID；请替换文档端点地址。两种示例都未开启动态建链。'); render();
+  }
+  $('static-example').onclick=() => run(() => example(false));
+  $('dynamic-example').onclick=() => run(() => example(true));
+  $('import').onclick=() => $('files').click();
+  $('files').onchange=() => run(async () => {
+    try {
+      const files=[...$('files').files], imported=[];
+      for (const file of files) {
+        if (file.size>1024*1024) throw Error(`${file.name} 超过 1 MiB，请拆分为每节点配置`);
+        const value=JSON.parse(await file.text());
+        for (const s of Array.isArray(value) ? value : [value]) imported.push(C.imported(s));
+      }
+      if (!imported.length) return;
+      if (state.nodes.length && !confirm(`使用导入的 ${imported.length} 个节点替换当前配置？`)) return;
+      state.nodes=imported; state.selected=0; notice('已导入。可一次选择多个节点 JSON；原有密钥和可选字段保留。'); render();
+    } finally { $('files').value=''; }
+  });
+  $('load-raw').onclick=() => { if (current()) $('raw').value=json(current()); };
+  $('apply-raw').onclick=() => run(() => {
+    if (!current()) return;
+    state.nodes[state.selected]=C.imported(JSON.parse($('raw').value)); notice('已应用 JSON，请检查校验结果。'); render();
+  });
+  run(async () => {
+    try { state.nodes=[await C.createNode('a')]; }
+    catch {
+      state.nodes=[{api_version:'velvet.io/v1alpha1',kind:'NodeSpec',fabric:{psk:'',loopback_prefix_v6:'fd78:abcd::/48'},node:{uid:{name:'a'},private_key:''},peers:[]}];
+      notice('浏览器不支持本地 X25519 密钥生成。仍可导入/填写配置；自动生成密钥请使用支持 X25519 的新版浏览器。');
+    }
+    render();
+  });
+})();
+</script>
+</body>
+</html>
