@@ -99,6 +99,13 @@ go build -o bin/velvetd ./cmd/velvetd
 go build -o bin/velvetctl ./cmd/velvetctl
 ```
 
+To build all three binaries from local working trees, including uncommitted
+changes, run `python3 scripts/build-local.py`. It uses the adjacent `babel-rs/`
+checkout and writes a complete bundle under `.local/dist/latest/`. Use
+`--babel-source pinned` to build the Babel revision validated by Fabric E2E
+without changing that checkout. See the [local build helper](scripts/README.md)
+for toolchain options, checksums and installation.
+
 See [validation](tests/README.md) for test coverage and [VM setup](tests/VM.md)
 for the optional privileged test runners. Maintainers follow the
 [release procedure](docs/RELEASING.md), including CI and E2E acceptance of the

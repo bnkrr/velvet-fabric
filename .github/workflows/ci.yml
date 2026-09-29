@@ -33,6 +33,8 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
       - name: Check portable VM wrappers
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/vm -v
+      - name: Check local binary helper
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/build -v
       - name: Fuzz VFP frames
         run: go test ./internal/vfp/message -run '^$' -fuzz '^FuzzMessageDecode$' -fuzztime=5s -parallel=2
       - run: CGO_ENABLED=0 go build ./cmd/...
