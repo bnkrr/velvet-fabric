@@ -1,7 +1,9 @@
 """Negative controls for the independent verifier and NAT packet fixture."""
 import copy
 import json
+from pathlib import Path
 import socket
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -253,6 +255,34 @@ class NATTests(unittest.TestCase):
 
 
 class ProcessIdentityTests(unittest.TestCase):
+    def inspect_extra(self, parent=10, executable='/opt/babel-rs', command=b''):
+        runner = Runner.__new__(Runner)
+        runner.args = SimpleNamespace(babel=Path('/opt/babel-rs'))
+        runner.materialized_links = {}
+        runner.nodes = {1: {'proc': Mock(pid=10, poll=Mock(return_value=None)), 'ready': True}}
+        runner.uids = {1: 'node'}
+        runner.command = Mock(return_value={'runtime': {'babel': {'pid': 11}}})
+        runner.resources = Mock()
+        runner.run = Mock(return_value='10 11 12')
+        runner.namespace = Mock(return_value='test-node')
+        runner.expected_helpers = Mock(return_value=set())
+        with patch('netns.Path.read_text', return_value=f'PPid:\t{parent}\n'), \
+                patch('netns.os.readlink', return_value=executable), \
+                patch('netns.Path.read_bytes', return_value=command):
+            return runner._observe()
+
+    def test_exiting_babel_child_cannot_complete_stable_window(self):
+        # /proc/PID/exe can still identify Babel just before exit empties cmdline.
+        with self.assertRaisesRegex(NotConverged, 'command line unavailable'):
+            self.inspect_extra()
+
+    def test_other_extra_processes_still_fail_with_identity(self):
+        for parameters in ({'parent': 1}, {'executable': '/bin/sleep'},
+                           {'command': b'/opt/babel-rs\0run\0--config\0/var/lib/velvet/node/babel-rs.toml\0'}):
+            with self.subTest(**parameters):
+                with self.assertRaisesRegex(RuntimeError, 'unexpected namespace process 12.*parent=.*executable=.*argv='):
+                    self.inspect_extra(**parameters)
+
     def test_only_exact_supervised_babel_check_is_transient(self):
         argv = ['/opt/babel-rs', 'check', '--config', '/var/lib/velvet/node/babel-rs.toml']
         def accepts(parent=10, executable='/opt/babel-rs', command=None):

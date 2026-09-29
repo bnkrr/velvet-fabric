@@ -509,9 +509,15 @@ class Runner:
                     argv = (proc / 'cmdline').read_bytes().decode().rstrip('\0').split('\0')
                 except (FileNotFoundError, ProcessLookupError):
                     raise NotConverged(f'node {node}: process exited during inspection')
+                # Exit can empty cmdline after exe was read successfully. Only
+                # defer this known child; it still blocks the stable window and
+                # must disappear before the ordinary convergence deadline.
+                if parent == info['proc'].pid and executable == str(self.args.babel.resolve()) and argv == ['']:
+                    raise NotConverged(f'node {node}: Babel child command line unavailable during inspection')
                 if not is_babel_check(parent, executable, argv, info['proc'].pid,
                                       str(self.args.babel.resolve()), f'/var/lib/velvet/{self.uids[node]}/babel-rs.toml'):
-                    raise RuntimeError(f"node {node}: unexpected namespace process {pid}")
+                    raise RuntimeError(f"node {node}: unexpected namespace process {pid}: "
+                                       f"parent={parent} executable={executable!r} argv={argv!r}")
             if extra:
                 # Do not count a phase as stable until even valid short-lived
                 # config checkers have exited. A stuck checker hits the same

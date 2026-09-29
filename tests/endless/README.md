@@ -186,7 +186,9 @@ The independent model requires:
 - Exactly one velvetd and one managed Babel process per member, with no unexpected
   replacement or orphan after deletion. The supervisor's temporary Babel `check`
   process is identified by its parent, executable and exact config arguments;
-  it must exit before the stable window can complete. Other extra processes fail.
+  it must exit before the stable window can complete. If exit empties the command
+  line during inspection, the known Babel child also blocks stability until it
+  disappears. Other extra processes fail with their observed identity recorded.
   NAT process liveness and fresh status
   are also checked, separately from the member's processes.
 
