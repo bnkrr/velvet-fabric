@@ -201,6 +201,23 @@ func (d *durableManager) observe(ctx context.Context, plan reconcile.LinkPlan, l
 	if d == nil {
 		return nil
 	}
+	// Queued PONG observations can outlive their automatic interface, e.g.
+	// after Static takes over. Fence the generation before reading WG and keep
+	// cleanup/reuse excluded through both reads and the observation update.
+	d.r.links.resourceMu.Lock()
+	defer d.r.links.resourceMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if time.Since(now) >= linkFailureTimeout {
+		return nil
+	}
+	d.r.mu.RLock()
+	initial, current := d.r.states[plan.InterfaceName]
+	d.r.mu.RUnlock()
+	if !current || !initial.active || !initial.dynamic || initial.desired.OwnerAlias != plan.OwnerAlias {
+		return nil
+	}
 	port, err := d.r.Reconciler.ListenPort(ctx, plan.InterfaceName)
 	if err != nil {
 		return err
