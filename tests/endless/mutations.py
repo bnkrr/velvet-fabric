@@ -272,7 +272,11 @@ def direct_pair(r, node, peer):
                                 for p in links.values()):
             return False
         routes = json.loads(r.ip(a, '-6', '-j', 'route', 'show', 'table', '20000', 'exact', address(b) + '/128'))
-        if not any(str(route.get('protocol')) == '202' and route.get('dev') in links for route in routes):
+        finite = [route for route in routes if route.get('type', 'unicast') == 'unicast']
+        if not finite:
+            return False
+        best = min(route.get('metric', 0) for route in finite)
+        if any(route.get('dev') not in links for route in finite if route.get('metric', 0) == best):
             return False
     return r.ping(node, peer) and r.ping(peer, node)
 

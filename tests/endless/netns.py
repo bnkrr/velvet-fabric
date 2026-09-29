@@ -715,6 +715,19 @@ class Runner:
         namespaces = list(sorted(self.created)) + [f'r{n}' for n in sorted(self.routers)]
         if self.access:
             namespaces += [f'a{n}' for n in sorted(self.access.clients)]
+        # Fabric exit deliberately preserves independent Babel. Stop only the
+        # exact test executable in our namespaces before auditing for orphans.
+        for node in namespaces:
+            try:
+                for pid in self.run("ip", "netns", "pids", self.namespace(node)).split():
+                    try:
+                        if Path(f"/proc/{pid}/exe").resolve() == self.args.babel.resolve():
+                            os.kill(int(pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+            except Exception as error:
+                errors.append(str(error))
+        until = time.monotonic() + 10
         for node in namespaces:
             try:
                 # Restrict emergency process cleanup to namespaces owned by this run.

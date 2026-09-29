@@ -10,7 +10,7 @@ from coverage_model import Coverage
 from durable_model import DurableAudit, agreement
 from model import NotConverged, PendingLinks, audit, address
 from netns import Runner
-from mutations import policy
+from mutations import policy, direct_pair
 from test_model import observation_fixture
 
 
@@ -48,6 +48,19 @@ def fixture():
 
 
 class DurableTests(unittest.TestCase):
+    def test_direct_pair_checks_selected_path_not_neighbor_fallback_owner(self):
+        import json
+        r = SimpleNamespace(ip=Mock(), ping=Mock(return_value=True))
+        link = {'vdl-peer': {'handshake': 100, 'allowed': ['0.0.0.0/0', '::/0']}}
+        with patch('mutations.dynamic', return_value=link):
+            for selected, expected in (('vdl-peer', True), ('vl-old', False)):
+                routes = [{'protocol': 202, 'metric': 131008, 'dev': 'vl-old'},
+                          {'protocol': 203, 'metric': 65631, 'dev': selected}]
+                r.ip.return_value = json.dumps(routes)
+                self.assertEqual(direct_pair(r, 1, 2), expected)
+            r.ip.return_value = '[]'
+            self.assertFalse(direct_pair(r, 1, 2))
+
     def test_confirmed_accounting_and_coverage(self):
         topology, obs, checker, node, peer = fixture()
         checker.observe(topology, obs)
