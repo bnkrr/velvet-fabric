@@ -69,6 +69,17 @@ class DurableTests(unittest.TestCase):
         checker.observe(topology, obs)
         return topology, obs, checker, node, peer
 
+    def test_committed_durable_control_loss_keeps_routing_admission(self):
+        topology, obs, checker, node, peer = fixture()
+        item, name = obs[node], f'vdl-{peer}'
+        state = next(s for s in item['status']['runtime']['links'] if s['interface'] == name)
+        state.update(active=False, committed=True)
+        item['babel_sockets'] = f'[fe80::1%{name}]:6696'
+        checker.observe(topology, obs)
+        PendingLinks().observe(obs, 1)
+        self.assertNotIn(name, item['pending'])
+        self.assertIn(name, item['durable_inactive'])
+
     def test_offline_saved_listener_can_outlive_attempt(self):
         _, obs, _, node, peer = self.waiting()
         tracker = PendingLinks()

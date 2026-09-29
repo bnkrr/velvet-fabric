@@ -49,6 +49,61 @@ def observation_fixture(dynamic=True):
 
 
 class OracleTests(unittest.TestCase):
+    def departed(self):
+        topology, observations = observation_fixture()
+        gone = 5
+        keys = {link['public']: n for n, obs in observations.items() for link in obs['wg'].values()}
+        topology.active.remove(gone)
+        del observations[gone]
+        for n, obs in observations.items():
+            obs.update(known_peer_keys=keys, ifindices={}, materialized_ifindices=[])
+            obs['fib'] = [r for r in obs['fib'] if r['dst'] != prefix(gone)]
+            states = []
+            for index, (name, link) in enumerate(obs['wg'].items(), 1):
+                remote = keys[link['peers'][0]['public']]
+                if remote != gone or not link['peers'][0]['handshake']:
+                    continue
+                obs['ifindices'][name] = index
+                obs['materialized_ifindices'].append(index)
+                states.append({'interface': name, 'active': False, 'committed': True})
+                obs['fib'].append({'dst': prefix(gone), 'dev': name, 'protocol': 202, 'metric': 131008})
+                if name.startswith('vdl-'):
+                    obs['status']['runtime']['dynamic_links'] -= 1
+            obs['status']['runtime']['links'] = states
+            obs['status']['runtime']['established_links'] = len(topology.static_links(n))
+        return topology, observations, gone
+
+    def test_departed_member_can_keep_only_materialized_neighbor_fallback(self):
+        topology, obs, gone = self.departed()
+        self.assertEqual(len(audit(topology, obs)), 20)
+        Coverage('ipv4').verified(topology, obs)
+        for mutation in ('metric', 'protocol', 'destination', 'incarnation'):
+            broken = copy.deepcopy(obs)
+            owner = next(n for n, item in broken.items() if item['retained'])
+            item = broken[owner]
+            route = next(r for r in item['fib'] if r['dst'] == prefix(gone))
+            if mutation == 'metric': route['metric'] = 1
+            elif mutation == 'protocol': route['protocol'] = 203
+            elif mutation == 'destination': route['dst'] = 'fd78:e2ee::ffff/128'
+            else: item['materialized_ifindices'] = []
+            with self.subTest(mutation=mutation), self.assertRaises(NotConverged):
+                audit(topology, broken)
+
+    def test_live_destination_requires_better_path_than_retained_dead_link(self):
+        topology, obs = observation_fixture()
+        node = 2
+        public = next(n for n in topology.public if n != topology.boot[node])
+        item = obs[public]
+        name = f'vl-in-{node:02d}'
+        item['wg'][name]['peers'][0]['handshake'] = 100
+        item.update(ifindices={name: 100}, materialized_ifindices=[100])
+        item['status']['runtime']['links'] = [{'interface': name, 'active': False, 'committed': True}]
+        item['fib'].append({'dst': prefix(node), 'dev': name, 'protocol': 202, 'metric': 131008})
+        audit(topology, obs)
+        item['fib'] = [r for r in item['fib'] if r['dst'] != prefix(node) or r['dev'] == name]
+        with self.assertRaisesRegex(NotConverged, 'retained dead fallback is best'):
+            audit(topology, obs)
+
     def test_each_public_nat_pair_is_required(self):
         topology, observations = observation_fixture()
         for node in topology.active - topology.public:
@@ -199,11 +254,13 @@ class NATTests(unittest.TestCase):
 
 class ProcessIdentityTests(unittest.TestCase):
     def test_only_exact_supervised_babel_check_is_transient(self):
-        argv = ['/opt/babel-rs', 'check', '--config', '/run/velvet/node/babel-rs.toml']
+        argv = ['/opt/babel-rs', 'check', '--config', '/var/lib/velvet/node/babel-rs.toml']
         def accepts(parent=10, executable='/opt/babel-rs', command=None):
             return is_babel_check(parent, executable, argv if command is None else command,
-                                  10, '/opt/babel-rs', '/run/velvet/node/babel-rs.toml')
+                                  10, '/opt/babel-rs', '/var/lib/velvet/node/babel-rs.toml')
         self.assertTrue(accepts())
+        self.assertTrue(accepts(command=[*argv[:3], '/var/lib/velvet/node/.babel-check-candidate']))
+        self.assertFalse(accepts(command=[*argv[:3], '/tmp/.babel-check-candidate']))
         self.assertFalse(accepts(parent=1))  # orphan / unrelated parent
         self.assertFalse(accepts(executable='/bin/sleep'))  # forged argv
         self.assertFalse(accepts(command=[argv[0], 'run', '--config', argv[3]]))

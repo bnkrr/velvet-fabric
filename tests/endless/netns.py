@@ -31,6 +31,10 @@ class StopRequested(BaseException):
     pass
 
 
+class DurationReached(BaseException):
+    pass
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("daemon", nargs="?", type=Path)
@@ -39,6 +43,9 @@ def arguments():
     parser.add_argument("--min-nodes", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=0, help="0: until failure or interruption")
+    parser.add_argument("--duration-seconds", type=float, default=0,
+                        help="total wall-clock budget, 0: unlimited; expires with normal cleanup")
+    parser.add_argument("--wg-access", action="store_true", help="dual-stack external WG clients and Domain return traffic")
     parser.add_argument("--underlay", choices=("ipv4", "ipv6"), default="ipv4")
     parser.add_argument("--dynamic", choices=("active", "off"), default="active")
     parser.add_argument("--nat-policy", choices=("active", "passive"), default="active")
@@ -59,6 +66,7 @@ def arguments():
     parser.add_argument("--validate", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if (args.rounds < 0 or args.probe_pairs < 1 or args.rss_growth_mib < 1
+            or not math.isfinite(args.duration_seconds) or args.duration_seconds < 0
             or not 1 <= args.durable_stable_seconds <= 31536000
             or not math.isfinite(args.settle_timeout) or not math.isfinite(args.stable_seconds)
             or not 0 < args.stable_seconds < args.settle_timeout):
@@ -112,6 +120,11 @@ class Runner:
         self.round, self.probe_cursor = 0, 0
         self.counts = {"add": 0, "delete": 0, "abrupt": 0, "graceful": 0}
         self.started, self.deadline = time.monotonic(), None
+        duration = getattr(args, 'duration_seconds', 0)
+        self.run_until = time.time() + duration if duration else None
+        self.verified_round = None
+        from access import Access
+        self.access = Access(self) if getattr(args, 'wg_access', False) else None
         self.stop_signal = None
         self.latest = {}
         self.coverage = Coverage(args.underlay)
@@ -142,6 +155,8 @@ class Runner:
     def timeout(self, maximum=5):
         if self.stop_signal is not None:
             raise StopRequested(f"operator requested stop (signal {self.stop_signal})")
+        if self.run_until is not None and time.time() >= self.run_until:
+            raise DurationReached()
         if self.deadline is None:
             return maximum
         remaining = self.deadline - time.monotonic()
@@ -199,7 +214,7 @@ class Runner:
         for node in range(self.topology.size):
             self.keys[node] = self.run("wg", "genkey")
             self.pubs[node] = self.run("wg", "pubkey", input=self.keys[node] + "\n")
-            for root in ("/run/velvet", "/var/lib/velvet"):
+            for root in ("/run/velvet", "/run/velvet-babel", "/var/lib/velvet"):
                 path = Path(root) / self.uids[node]
                 path.mkdir(parents=True, exist_ok=False)
                 self.owned_dirs.add(path)
@@ -236,6 +251,9 @@ class Runner:
                 '192.0.2.0/24' if self.args.underlay == 'ipv4' else '2001:db8:ee::/64']}}
         spec['node'].update(self.automatic_ports(node))
         spec['dynamic_links']['durable'] = {'stable_seconds': getattr(self.args, 'durable_stable_seconds', 1800)}
+        if self.access:
+            from access import configure
+            configure(spec, node, self.topology.size)
         (self.runtime / f'{node}.json').write_text(json.dumps(spec))
 
     def automatic_ports(self, node):
@@ -303,6 +321,8 @@ class Runner:
 }""")
             self.start_nat(node)
         self.coverage.reset(node)
+        if self.access:
+            self.access.create(node)
         self.write_config(node)
         self.materialized_links[node] = MaterializedLinks(self.namespace(node))
         if node in self.isolated_static:
@@ -377,7 +397,9 @@ class Runner:
         proc.wait(timeout=self.timeout(15))
         if not abrupt and proc.returncode != 0:
             raise RuntimeError(f"node {node}: graceful shutdown exit {proc.returncode}")
-        # Parent-death SIGTERM must retire managed Babel even after SIGKILL.
+        # Whole-node removal explicitly stops the independent routing daemon.
+        for child in self.run("ip", "netns", "pids", self.namespace(node)).split():
+            os.kill(int(child), signal.SIGTERM)
         until = time.monotonic() + self.timeout(10)
         while self.run("ip", "netns", "pids", self.namespace(node)):
             if time.monotonic() >= until:
@@ -400,6 +422,8 @@ class Runner:
         del self.nodes[node]
         self.materialized_links.pop(node).close()
         self.pending_links.forget(node)
+        if self.access:
+            self.access.remove(node)
         root = f'ver{self.token}{node:x}'
         self.run('ip', 'link', 'del', root)
         self.root_links.discard(root)
@@ -439,6 +463,9 @@ class Runner:
             if self.capture is not None and self.capture.poll() is not None:
                 raise RuntimeError('packet capture exited unexpectedly; see capture.log')
             observations = self._observe()
+            if self.access:
+                for node, obs in observations.items():
+                    self.access.observe(node, obs)
             self.durable_audit.observe(self.topology, observations)
             self.pending_links.observe(observations, time.monotonic())
             return observations
@@ -449,6 +476,10 @@ class Runner:
 
     def _observe(self):
         self.latest = {}
+        # Drain every subscription even if the first node is not ready yet.
+        # Domain route churn must not overflow an unvisited node's event queue.
+        for observer in self.materialized_links.values():
+            observer.read()
         for node, info in sorted(self.nodes.items()):
             if info["proc"].poll() is not None:
                 raise RuntimeError(f"node {node}: unexpected velvetd exit {info['proc'].returncode}")
@@ -479,7 +510,7 @@ class Runner:
                 except (FileNotFoundError, ProcessLookupError):
                     raise NotConverged(f'node {node}: process exited during inspection')
                 if not is_babel_check(parent, executable, argv, info['proc'].pid,
-                                      str(self.args.babel.resolve()), f'/run/velvet/{self.uids[node]}/babel-rs.toml'):
+                                      str(self.args.babel.resolve()), f'/var/lib/velvet/{self.uids[node]}/babel-rs.toml'):
                     raise RuntimeError(f"node {node}: unexpected namespace process {pid}")
             if extra:
                 # Do not count a phase as stable until even valid short-lived
@@ -507,7 +538,8 @@ class Runner:
                 "ifindices": {link['ifname']: link['ifindex'] for link in json.loads(self.ip(node, '-j', 'link', 'show', 'type', 'wireguard'))},
                 "babel_sockets": self.ns(node, 'ss', '-H', '-uan', 'sport', '=', ':6696'),
                 "durable_records": self.durable_records(node), "automatic_ports": self.automatic_ports(node),
-                "materialized_ifindices": self.materialized_links[node].read()}
+                "materialized_ifindices": self.materialized_links[node].read(),
+                "known_peer_keys": {key: n for n, key in self.pubs.items()}}
         return self.latest
 
     def ping(self, source, target):
@@ -527,6 +559,8 @@ class Runner:
             pair = pairs[(self.probe_cursor + index) % len(pairs)]
             if not self.ping(*pair):
                 raise NotConverged(f"data-plane probe failed {pair}")
+            if self.access:
+                self.access.probe(*pair)
             self.coverage.ping(*pair)
             passed.add(pair)
         self.probe_cursor += count
@@ -561,7 +595,9 @@ class Runner:
                     self.save("coverage.json", self.coverage.state())
                     self.save("latest.json", {"round": self.round, "topology": self.topology.state(), "observations": self.latest})
                     self.record("verified", seconds=round(time.monotonic() - start, 3), active=sorted(self.nodes),
-                                pairs=len(pairs), operations=self.counts, public=sorted(self.topology.active & self.topology.public))
+                                pairs=len(pairs), operations=self.counts, public=sorted(self.topology.active & self.topology.public),
+                                access_probes=self.access.probes if self.access else 0)
+                    self.verified_round = self.round
                     self.deadline = None
                     return
                 reason = "checking stable window"
@@ -608,6 +644,7 @@ class Runner:
         self.record("complete", result="PASS", operations=self.counts)
 
     def snapshot_failure(self, error):
+        self.run_until = None
         self.deadline = None
         self.record("stopped", reason=str(error))
         self.save("coverage.json", self.coverage.state())
@@ -639,6 +676,7 @@ class Runner:
 
     def cleanup(self):
         self.deadline = None
+        self.run_until = None
         self.stop_signal = None
         errors = []
         for observer in self.materialized_links.values():
@@ -675,6 +713,8 @@ class Runner:
                 process.wait(timeout=3)
                 errors.append(f'node {node}: forced NAT fixture kill')
         namespaces = list(sorted(self.created)) + [f'r{n}' for n in sorted(self.routers)]
+        if self.access:
+            namespaces += [f'a{n}' for n in sorted(self.access.clients)]
         for node in namespaces:
             try:
                 # Restrict emergency process cleanup to namespaces owned by this run.
@@ -753,7 +793,7 @@ def main():
         runner.save("manifest.json", {"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "sha256": hashes, "kernel": os.uname().release, "python": os.sys.version, "pid": os.getpid(),
             "namespace_prefix": f"vfe-{runner.token}-", "bridge": runner.bridge, "uids": runner.uids, "topology": topology.state()})
-        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py", "materialization.py", "durable_model.py"):
+        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py", "materialization.py", "durable_model.py", "access.py"):
             shutil.copyfile(Path(__file__).with_name(name), artifacts / name)
 
         def stop(signum, _frame):
@@ -766,8 +806,18 @@ def main():
             signal.signal(signum, stop)
         code = 0
         try:
-            runner.record("start", artifacts=str(artifacts), seed=args.seed, underlay=args.underlay, dynamic=args.dynamic)
+            runner.record("start", artifacts=str(artifacts), seed=args.seed, underlay=args.underlay, dynamic=args.dynamic,
+                          duration_seconds=args.duration_seconds, stop_at_unix=runner.run_until, wg_access=args.wg_access)
             runner.execute()
+        except DurationReached:
+            runner.run_until = None
+            if runner.verified_round is None:
+                code = 1
+                runner.snapshot_failure(RuntimeError('duration expired before any verified round'))
+            else:
+                runner.save('coverage.json', runner.coverage.state())
+                runner.record('complete', result='PASS', reason='duration limit',
+                              last_verified_round=runner.verified_round, operations=runner.counts)
         except (Exception, StopRequested) as error:
             code = 130 if isinstance(error, StopRequested) else 1
             runner.stop_signal = None

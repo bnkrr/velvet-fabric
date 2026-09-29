@@ -61,11 +61,11 @@ def reload_mode(r, node, mode):
     try:
         while r.command(node)['config_generation'] <= generation:
             time.sleep(min(0.1, r.timeout(0.1)))
-        assert not Path(f'/proc/{old_babel}').exists(), 'reload left its previous Babel process alive'
+        assert Path(f'/proc/{old_babel}').exists(), 'reload stopped independent Babel'
         r.nodes[node]['resources'].pop('babel')
     finally:
         r.deadline = None
-    r.record('policy-applied', node=node, mode=mode, retired_babel_pid=old_babel)
+    r.record('policy-applied', node=node, mode=mode, babel_pid=old_babel)
 
 
 def proposals_from(r, node):
@@ -154,7 +154,11 @@ def blocked_pair(r, node, peer, control=False):
             for n, target in ((node, peer), (peer, node)):
                 routes = json.loads(r.ip(n, '-6', '-j', 'route', 'show', 'table', '20000',
                                         'exact', address(target) + '/128'))
-                if any(str(route.get('protocol')) == '202' for route in routes):
+                finite = [route for route in routes if route.get('type', 'unicast') == 'unicast']
+                if not finite:
+                    return False
+                best = min(finite, key=lambda route: route.get('metric', 0))
+                if str(best.get('protocol')) != '203' or best.get('dev') in before[n]:
                     return False
             return r.ping(node, peer) and r.ping(peer, node)
         wait_for(r, fallback, r.args.settle_timeout, 'fallback did not converge during fault')

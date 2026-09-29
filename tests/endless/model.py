@@ -201,6 +201,13 @@ def audit(topology, observations):
             if key in owners and owners[key] != node:
                 raise NotConverged('WireGuard public key shared by different nodes')
             owners[key] = node
+    # Stable fixture identities include absent members. A retained resource is
+    # allowed only after this exact kernel incarnation was observed committed.
+    for obs in observations.values():
+        for key, node in obs.get('known_peer_keys', {}).items():
+            if key in owners and owners[key] != node:
+                raise NotConverged('WireGuard key differs from provisioned identity')
+            owners[key] = node
     forwarding, pairs = {}, []
     known = {prefix(n): n for n in range(topology.size)}
     components = topology.components()
@@ -211,6 +218,8 @@ def audit(topology, observations):
             raise NotConverged(f'node {node}: configured static WG interfaces differ')
         interfaces, peers = {}, set()
         dynamic_count = 0
+        retained = {}
+        states = {x['interface']: x for x in observation['status']['runtime'].get('links', [])}
         for name, link in observation['wg'].items():
             if name in observation.get('pending', ()):
                 continue
@@ -218,13 +227,24 @@ def audit(topology, observations):
                 raise NotConverged(f'node {node}/{name}: expected one WG peer')
             peer = link['peers'][0]
             remote = owners.get(peer['public'])
+            state = states.get(name, {})
+            materialized = observation.get('ifindices', {}).get(name) in observation.get('materialized_ifindices', ())
+            reciprocal_present = remote in observations and any(
+                candidate.startswith('vdl-') and any(p['public'] == link['public'] for p in value['peers'])
+                for candidate, value in observations[remote]['wg'].items())
+            obsolete = name not in static if name in configured else not reciprocal_present
+            if (obsolete and materialized and state.get('committed') and not state.get('active')
+                    and remote is not None and remote != node
+                    and {'0.0.0.0/0', '::/0'} <= set(peer['allowed'])):
+                retained[name] = remote
+                continue
             if name in configured:
                 if name not in static:
                     continue  # Preprovisioned public receivers need no session.
                 if remote != static[name]:
                     raise NotConverged(f'node {node}/{name}: wrong static identity')
             elif name.startswith('vdl-'):
-                if not observation.get('durable_by_interface', {}).get(name, {}).get('confirmed'):
+                if state.get('active', True) and not observation.get('durable_by_interface', {}).get(name, {}).get('confirmed'):
                     dynamic_count += 1
                 if not topology.dynamic or remote not in topology.active:
                     raise NotConverged(f'node {node}/{name}: stale/unexpected dynamic WG interface')
@@ -252,6 +272,7 @@ def audit(topology, observations):
                 raise NotConverged(f'node {node}/{name}: uncommitted WG AllowedIPs')
             interfaces[name] = remote
             peers.add(remote)
+        observation['retained'] = sorted(retained)
         required = topology.required(node) - set(observation.get('durable_recovery_peers', ()))
         if not required <= peers:
             raise NotConverged(f'node {node}: missing required neighbors {sorted(required - peers)}')
@@ -265,6 +286,17 @@ def audit(topology, observations):
             if route.get('type', 'unicast') != 'unicast':
                 continue
             key = network(route['dst'])
+            is_fallback = (str(route.get('protocol')) == '202' and route.get('metric') == 131008
+                           and key in known and known[key] != node
+                           and route.get('dev') in retained
+                           and retained[route['dev']] == known[key]
+                           and not route.get('gateway') and not route.get('multipath'))
+            if is_fallback:
+                # The best path to a live destination must still beat this
+                # retained fallback; an absent destination need not lose it.
+                if known[key] in components[node]:
+                    routes.setdefault(key, []).append(route)
+                continue
             if key not in known or known[key] == node or known[key] not in components[node]:
                 raise NotConverged(f'node {node}: unexpected/stale unicast destination {key}')
             if route.get('dev') not in interfaces or route.get('multipath') or route.get('gateway'):
@@ -274,6 +306,8 @@ def audit(topology, observations):
             raise NotConverged(f'node {node}: FIB differs from model reachability')
         for key, options in routes.items():
             best = min(option.get('metric', 0) for option in options)
+            if any(option['dev'] not in interfaces for option in options if option.get('metric', 0) == best):
+                raise NotConverged(f'node {node}: retained dead fallback is best path to {key}')
             hops = {interfaces[option['dev']] for option in options if option.get('metric', 0) == best}
             if len(hops) != 1:
                 raise NotConverged(f'node {node}: ambiguous FIB next hop {key}')
@@ -301,7 +335,9 @@ def audit(topology, observations):
 def is_babel_check(parent, executable, argv, daemon, babel, config):
     """Only the supervisor's exact config validator is an expected transient."""
     return (parent == daemon and executable == os.path.realpath(babel)
-            and argv == [babel, 'check', '--config', config])
+            and len(argv) == 4 and argv[:3] == [babel, 'check', '--config']
+            and (argv[3] == config or (os.path.dirname(argv[3]) == os.path.dirname(config)
+                 and os.path.basename(argv[3]).startswith('.babel-check-'))))
 
 
 def process_fd_limit(role, nodes):

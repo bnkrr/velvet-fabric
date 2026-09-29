@@ -34,6 +34,7 @@ class Coverage:
             static = topology.static_links(source)
             direct = {owners[peer['public']]: name for name, link in links.items()
                       if name not in observations[source].get('pending', ())
+                      if name not in observations[source].get('retained', ())
                       if name in static or name.startswith('vdl-') for peer in link['peers']}
             for target in sorted(topology.components()[source] - {source}):
                 name = direct.get(target)

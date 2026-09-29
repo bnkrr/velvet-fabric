@@ -14,6 +14,9 @@ tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0 --underlay ipv6
 # Detach on the VM; progress stays in the run's rotating events.jsonl:
 tests/endless/run-on-vm.sh --detach --nodes 6 --rounds 0 --exercise durable
+# External WG Access clients; stop and clean up after eight hours:
+tests/endless/run-on-vm.sh --detach --nodes 6 --rounds 0 --exercise durable \
+  --wg-access --duration-seconds 28800
 # Bounded execution of the same loop:
 tests/endless/run-on-vm.sh --nodes 4 --rounds 6 --stable-seconds 3
 # Online changes, followed by one membership mutation (still finite):
@@ -30,12 +33,35 @@ runner is **not** included in normal E2E `all` or automatically launched by CI.
 CI runs its unprivileged verifier tests and the finite kernel materialization
 check. Root, Linux netns/WireGuard,
 Python 3.11+, iproute2, nftables, ping and sysctl are required on the test host.
+
+`--duration-seconds` adds a total wall-clock budget (default zero: unlimited),
+including setup and exercises. At expiry the runner stops starting/checking
+operations and performs normal cleanup; the current command may take up to its
+existing bounded timeout. Cleanup may finish a little after the deadline. VM
+sleep counts toward the wall-clock budget; after resume an expired run cleans
+up. Earlier verifier failures still fail immediately. A timed run succeeds only
+if at least one round was verified; its completion record names the last
+verified round, without claiming the interrupted membership change passed.
+
+`--wg-access` provisions an external client namespace and separate WireGuard
+keys/interface per member, recreated with that member during churn. Both IPv4
+and IPv6 clients traverse the real WG Access tunnel to remote node services;
+services also initiate probes back to clients. Velvet owns only the Domain and
+Fabric routing policies: the fixture adds no return selector or NAT workaround.
+Client prefixes are ordinary Fabric announcements; service prefixes are Domain
+announcements. The verifier checks managed destination selectors, live route
+sets, real return-table selection, WG identities/AllowedIPs and handshakes,
+exclusion of Access from Babel, and ordinary host routing isolation. Each
+verified member pair must also pass both Access directions in both families;
+`access_probes` counts successful Access pings. Client namespaces are included
+in removal and final cleanup, under the same run-owned prefix. This models
+external WG Access without changing Velvet Core into an Access provisioner.
 Run finite regressions serially on a small VM: namespace isolation does not
 isolate CPU or kernel work, and parallel suites can exhaust the 5s tool budget.
 
-The wrapper builds locally, including pinned **babel-rs v0.6.0** at
-`dbeede34abd8dff2422c39ab18a15949b0f38f11`, using a Git archive rather than sibling
-worktree edits. Only binaries/runtime files are copied into a unique asset
+The wrapper builds locally, including the Babel commit from
+`tests/babel-revision`, using a Git archive by default. Explicit paired development
+uses `VELVET_BABEL_SOURCE=working-tree`. Only binaries/runtime files are copied into a unique asset
 directory on the configured VM. Build and SSH settings are shared with the
 other suites; see [VM setup](../VM.md).
 
@@ -94,11 +120,11 @@ including when a returning member's previous public is still alive. The host
 model owns this selection; the test does not infer desired membership from WG
 or Babel's current observations.
 
-An expired provisioned Link must withdraw its materialized adjacency route
-and evidence while preserving its configured bootstrap WG interface and local addresses. Otherwise
-an old public's protocol-202 route would blackhole traffic after a member changes
-bootstrap. Static committed counts reflect current live adjacencies; unused
-public receiver interfaces intentionally do not count as established.
+A control-expired committed Link retains its WG interface, addresses, Babel
+admission and protocol-202 neighbor fallback at priority 131008. Finite Babel
+routes must beat obsolete fallbacks when a member changes bootstrap. Established
+counts describe live control sessions; retained interfaces are audited separately
+against fixture identities and observed kernel materialization.
 
 ## Verifier and convergence
 
@@ -139,15 +165,17 @@ The independent model requires:
   Such interfaces never satisfy required neighbors or committed counts.
 - A saved Durable receiver may remain while its peer is offline or the Link is
   recovering. Exemption from the 90-second Attempt limit requires an actual saved
-  agreement with the correct peer key and listening port. An inactive receiver,
-  including a previously materialized incarnation, must have no FIB route or Babel
-  socket. A status claim alone cannot grant this exemption. Healthy Static Links
+  agreement with the correct peer key and listening port. A receiver that has not committed must have no FIB route or Babel
+  socket. A committed receiver retains admission and its neighbor fallback
+  across control loss. A status claim alone cannot grant this exemption. Healthy Static Links
   must suppress duplicate automatic interfaces.
 - All modeled reachable destinations have active routes using live WG peers.
   Following each best FIB path must reach its owner without cycles. Public/public
   and public/NAT pairs use required direct Links; optional NAT/NAT paths may
   traverse public nodes.
-  Removed destinations must leave no unicast learned/materialized route behind.
+  Removed destinations must leave no learned unicast route behind. An exact
+  protocol-202 neighbor fallback may remain on a previously materialized Link;
+  it must never win selection for a reachable destination over a live path.
 - Remote overlay routes never leak into `main`; the local connected loopback and
   ordinary NAT-client underlay default route are allowed.
 - Real IPv6 loopback pings rotate over ordered reachable pairs; every pair must
@@ -166,9 +194,9 @@ NAT fallback can traverse the member being removed, so survivor forwarding may
 reconverge within the same finite phase deadline. Unlike the former all-public
 full-mesh fixture, this harness does not assume every survivor path is unaffected.
 Transient mismatches reset the stable window; a phase that never converges fails.
-A Dynamic Link recovery deadline is not the entire failure-detection deadline:
-the 30-second Link-local UDP liveness budget comes before the additional 30-second
-recovery window. TCP negotiation closes on completion and does not own established
+Control-session loss is detected after 30 seconds. Ordinary Dynamic Links
+retain committed resources for the production recovery timeout (default 30
+minutes from the last confirmation); Babel detects routing-neighbor loss separately. TCP negotiation closes on completion and does not own established
 Link liveness. Health/recovery/failure timers retain their production values.
 Only the promotion stability threshold is shortened by the explicit test setting
 below, so membership churn can exercise Durable behavior. This runner does not
@@ -207,8 +235,8 @@ They are explicit, deterministic fault cases, not yet randomized churn events.
 
 | Exercise | Injection and independent acceptance |
 | --- | --- |
-| `policy` | SIGHUP off → passive → original policy. Retire automatic interfaces within 75s and verify disk cleanup. During 36s, off must not initiate; each peer may make at most one proposal to learn a missed policy update, with no repeated proposals. Passive must not initiate. Required public links recover; only the target's managed Babel may be replaced by reload. |
-| `blackout` | Drop one direction of underlay UDP for one established non-bootstrap public/NAT pair for at least 40s. Require withdrawn direct routes and real bidirectional fallback before removing the fault, then recover direct connectivity. |
+| `policy` | SIGHUP off → passive → original policy. Retire automatic interfaces within 75s and verify disk cleanup. During 36s, off must not initiate; each peer may make at most one proposal to learn a missed policy update, with no repeated proposals. Passive must not initiate. Required public links recover; the target's independent Babel PID must survive reload. |
+| `blackout` | Drop one direction of underlay UDP for one established non-bootstrap public/NAT pair for at least 40s. Require the selected Babel path to avoid the blocked Link and real bidirectional fallback before removing the fault, then recover direct connectivity. |
 | `control-loss` | Block routed TCP/UDP VFP and remove the pair's automatic WG interfaces. Ordinary Dynamic must use fallback with actual control drops, then recover after unblocking. If already Durable, require direct recovery under the same agreement while routed control remains blocked. |
 | `durable` | Wait for bilateral confirmed storage, destroy both namespaces/WG/NAT instances, preserve disk state, then start with Static and routed VFP blocked. Require fresh handshakes, direct routes and payload. Next reconfigure the member's bootstrap to that peer: Static must suppress automatic resources while retaining the agreement; restore the original bootstrap and verify Durable resumes. |
 | `nat-reset` | Replace only the translator, clearing all mappings while member/Babel stay alive. The replacement must forward real traffic and all required direct paths recover. |
@@ -217,7 +245,7 @@ They are explicit, deterministic fault cases, not yet randomized churn events.
 Fault windows and recovery phases are separate. The recovery budget and production
 retry timers are unchanged. Packet counters prove the injected drop matched real
 traffic in the Dynamic fallback branch. Except for the two cold-restarted Durable
-members and the explicitly reloaded policy target's managed Babel, all
+members, all
 existing velvetd/Babel PIDs must remain unchanged. These cases do not claim broad
 partition, dual-stack switching, multi-layer NAT or all observer-failure coverage.
 

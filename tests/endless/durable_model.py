@@ -94,7 +94,7 @@ class DurableAudit:
                 raise NotConverged(f'node {node}: durable count disagrees with disk')
             if topology.modes[node] == 'off' and records:
                 raise NotConverged(f'node {node}: off retained durable records')
-            obs['durable_by_interface'], obs['durable_waiting'] = {}, []
+            obs['durable_by_interface'], obs['durable_waiting'], obs['durable_inactive'] = {}, [], []
             states = {link['interface']: link for link in runtime.get('links', [])}
             for name, link in obs['wg'].items():
                 if not name.startswith('vdl-'):
@@ -107,7 +107,9 @@ class DurableAudit:
                     raise NotConverged(f'node {node}/{name}: WG port differs from durable store')
                 obs['durable_by_interface'][name] = record
                 if name in states and not states[name]['active']:
-                    obs['durable_waiting'].append(name)
+                    obs['durable_inactive'].append(name)
+                    if not states[name].get('committed', False):
+                        obs['durable_waiting'].append(name)
             choice = obs.get('automatic_ports', {})
             for name, link in obs['wg'].items():
                 if not name.startswith('vdl-') or not link['port']:
@@ -128,7 +130,7 @@ class DurableAudit:
         waiting = {}
         for node, obs in observations.items():
             obs['durable_recovery_peers'] = []
-            for name in obs['durable_waiting']:
+            for name in obs['durable_inactive']:
                 record = obs['durable_by_interface'][name]
                 remote = owners[record['peer']['uuid']]
                 waiting[node, remote] = agreement(record)
