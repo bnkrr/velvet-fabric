@@ -83,6 +83,14 @@ jobs:
           "$PWD/.local/bin/velvetd"
           "$PWD/../babel-rs/target/release/babel-rs"
           "$PWD/.local/bin/velvetctl"
+      - name: Test cold rejoin with a retained ordinary Dynamic Link
+        working-directory: velvet-fabric
+        run: >-
+          sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/directed/suite.py
+          "$PWD/.local/bin/velvetd"
+          "$PWD/../babel-rs/target/release/babel-rs"
+          --case cold-rejoin --family both
+          --artifacts "$PWD/.local/experiments/ci-cold-rejoin"
       - name: Test public UDP discovery over IPv4, IPv6, NAT44 and NAT66
         working-directory: velvet-fabric
         run: >-

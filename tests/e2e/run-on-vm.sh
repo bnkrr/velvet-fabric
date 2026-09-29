@@ -5,10 +5,10 @@ cd "${repo_root}"
 selection=${1:-all}
 case ${selection} in
   --help|-h)
-    echo "usage: $0 [all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|resilience|resilience-dynamic|nat [CASE...]]"
+    echo "usage: $0 [all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|cold-rejoin|resilience|resilience-dynamic|nat [CASE...]]"
     echo 'VM/build configuration: tests/VM.md'
     exit 0 ;;
-  all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|resilience|resilience-dynamic) ;;
+  all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|cold-rejoin|resilience|resilience-dynamic) ;;
   nat)
     for nat_case in "${@:2}"; do
       case ${nat_case} in
@@ -32,7 +32,7 @@ case "$selection" in
     vm_exec sh -c 'test "$(id -u)" = 0 && test "$(cat /proc/1/comm)" = systemd' ;;
 esac
 vm_build with-ctl
-tar -cf "${build_dir}/tests.tar" tests/e2e/*.sh tests/e2e/*.py examples packaging/systemd
+tar -cf "${build_dir}/tests.tar" tests/e2e/*.sh tests/e2e/*.py tests/directed/*.py tests/endless/*.py examples packaging/systemd
 vm_upload velvetd velvetctl babel-rs tests.tar
 command=$(python3 - "${asset_root}" "${selection}" "${@:2}" <<'PY'
 import shlex, sys
@@ -45,6 +45,7 @@ commands = {
     'static-core': ['sh', root + '/tests/e2e/netns-wg-admin-core.sh', velvet],
     'dynamic': ['sh', root + '/tests/e2e/netns-dynamic.sh', velvet, babel, ctl],
     'examples': ['python3', root + '/tests/e2e/netns-examples.py', velvet, babel, ctl],
+    'cold-rejoin': ['python3', root + '/tests/directed/suite.py', velvet, babel, '--case', 'cold-rejoin', '--family', 'both', '--artifacts', root + '/cold-rejoin'],
     'resilience': ['python3', root + '/tests/e2e/netns-resilience.py', root],
     'resilience-dynamic': ['python3', root + '/tests/e2e/netns-resilience.py', root, 'dynamic'],
     'nat': ['python3', root + '/tests/e2e/netns-udp-nat.py', velvet, babel, *cases],

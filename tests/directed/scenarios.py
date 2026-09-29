@@ -63,6 +63,8 @@ def helper(r, node, kind, host, duration=60):
 
 
 def configure(r, node, config):
+    if r.kind == 'cold-rejoin':
+        config['dynamic_links']['durable'] = {'soft_limit': 0}
     if r.kind in ('dual-stack', 'dual-stack-failure', 'egress-switch'):
         config['dynamic_links']['allow_candidate_prefixes'] = ['192.0.2.0/24', '2001:db8:ee::/64']
         for peer in config['peers']:

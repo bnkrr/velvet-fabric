@@ -154,6 +154,27 @@ func (d *dynamicLinkEngine) prepareInbound(session *engine.Session, value messag
 		return nil
 	}
 
+	// A cold peer may have lost its WG receiver while we retain the old Link.
+	// Only its fresh, valid routed Proposal can replace a recovering ordinary
+	// Link. Control loss alone still preserves the committed data plane.
+	if current != nil && current.state == dynamicRecovering {
+		if value.OperationID == current.operationID || value.ProbeKey == [32]byte{} || value.WGPublicKey == [32]byte(d.runner.Desired.PrivateKey.PublicKey()) {
+			return nil
+		}
+		d.discardAttemptLocked(remoteID, current)
+		d.mu.Unlock()
+		d.removeInterface(current.plan, "fresh Proposal replaces recovering Link")
+		d.mu.Lock()
+		// Keep resourceMu throughout retirement so old cleanup cannot race a
+		// new generation. Failed kernel cleanup must finish before reuse.
+		d.runner.links.mu.Lock()
+		_, retained := d.runner.links.resources[current.plan.OwnerAlias]
+		d.runner.links.mu.Unlock()
+		if retained || d.stopped || d.ctx.Err() != nil || d.runner.durable.has(remoteID) || d.runner.hasDirectLink(remoteID) {
+			return nil
+		}
+		current = nil
+	}
 	var plan reconcile.LinkPlan
 	if current != nil {
 		// In simultaneous proposals the smaller UUID wins. The other side keeps

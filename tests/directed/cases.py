@@ -19,6 +19,7 @@ def catalog():
                  'observer-conflict', 'observer-ports',
                  'crash-observe', 'crash-handoff', 'crash-commit', 'stale-candidate'):
         cases[name] = dict(kind=name)
+    cases['cold-rejoin'] = dict(kind='cold-rejoin', profiles=[('adm', 'adf', 'sequential'), ('eim', 'eif', 'preserve')])
     for mapping, allocation in product(('eim', 'adm', 'apdm'), ('sequential', 'random')):
         for fault in ('expiry', 'contention', 'rebind'):
             cases[f'{fault}-{mapping}-{allocation}'] = dict(kind=fault,

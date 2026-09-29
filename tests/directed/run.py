@@ -190,8 +190,11 @@ def main():
         topology.profiles = {n: None for n in topology.active}
     if spec['kind'] == 'partition':
         topology.boot[3] = 1
+    if spec['kind'] == 'cold-rejoin':
+        topology.modes[2] = topology.modes[3] = 'passive'
     args = SimpleNamespace(**vars(cli), spec=spec, nodes=topology.size, min_nodes=3,
-        seed=1, rounds=1, dynamic='active', nat_policy='active', capture=True,
+        seed=1, rounds=1, duration_seconds=0, wg_access=spec['kind'] == 'cold-rejoin',
+        dynamic='active', nat_policy='active', capture=spec['kind'] != 'cold-rejoin',
         exercise=[], settle_timeout=180, stable_seconds=10, probe_pairs=16,
         rss_growth_mib=64, plan=False, validate=False)
     netns.arguments = lambda: (args, topology)

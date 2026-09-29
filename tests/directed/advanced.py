@@ -278,8 +278,43 @@ def family_change(r):
     data(r, label='after-migration')
 
 
+def cold_rejoin(r):
+    # The passive NAT survivor cannot initiate a replacement itself. The public
+    # peer loses its entire namespace; only the survivor keeps the old WG Link.
+    public, survivor = 1, 2
+    r.verify()
+    assert_direct(r, public, survivor)
+    names = direct_names(r, survivor, public)
+    assert len(names) == 1
+    name = next(iter(names))
+    old_index = r.latest[survivor]['ifindices'][name]
+    identities = {n: (i['proc'].pid, i['resources']['babel']['pid'])
+                  for n, i in r.nodes.items() if n != public}
+    assert not r.durable_records(survivor), 'ordinary Dynamic fixture promoted to Durable'
+    r.stop_node(public, abrupt=True)
+    r.topology.active.remove(public)
+    r.verify()
+    retained = next(x for x in r.command(survivor)['runtime']['links'] if x['interface'] == name)
+    assert retained['committed'] and not retained['active'] and retained['retention'] == 'dynamic'
+    assert r.latest[survivor]['ifindices'][name] == old_index, 'control loss removed the retained Link'
+    r.record('cold-rejoin-retained', node=survivor, peer=public, ifindex=old_index)
+    started = time.monotonic()
+    r.topology.active.add(public)
+    r.add_node(public)
+    r.verify()  # Unchanged 180s budget, every pair and dual-stack Access payload.
+    assert_direct(r, public, survivor)
+    new_index = r.latest[survivor]['ifindices'][name]
+    assert new_index != old_index, 'fresh Proposal did not replace old kernel generation'
+    assert identities == {n: (i['proc'].pid, i['resources']['babel']['pid'])
+                          for n, i in r.nodes.items() if n != public}, 'survivor daemon restarted'
+    r.record('cold-rejoin-verified', seconds=round(time.monotonic() - started, 3),
+             old_ifindex=old_index, new_ifindex=new_index, access_probes=r.access.probes)
+
+
 def execute(r):
-    if r.kind.startswith('observer'):
+    if r.kind == 'cold-rejoin':
+        cold_rejoin(r)
+    elif r.kind.startswith('observer'):
         observer(r)
     elif r.kind.startswith('crash') or r.kind == 'stale-candidate':
         stage_fault(r)

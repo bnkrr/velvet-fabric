@@ -158,6 +158,122 @@ func TestDynamicAcceptedAttemptCannotBeSuperseded(t *testing.T) {
 	}
 }
 
+// A cold peer has no old WG receiver. Its fresh routed Proposal must not wait
+// for the survivor's 30-minute ordinary Dynamic retention deadline.
+func TestDynamicRecoveringAcceptsFreshProposal(t *testing.T) {
+	backend := &runtimeBackend{}
+	d, session, proposal := dynamicFixture(t, backend)
+	old := d.prepareInbound(session, proposal)
+	old.state = dynamicRecovering
+	oldCtx, cancel := context.WithCancel(d.ctx)
+	old.cancel = cancel
+	d.runner.states[old.plan.InterfaceName] = materializedState{desired: old.plan, remote: old.remote, dynamic: true, committed: true, lastPong: time.Now().Add(-time.Minute)}
+	proposal.OperationID = [16]byte{3}
+	next := d.prepareInbound(session, proposal)
+	if next == nil {
+		t.Fatal("fresh Proposal blocked by retained recovering Link")
+	}
+	if oldCtx.Err() == nil || old.state != dynamicStopped || next.plan.OwnerAlias == old.plan.OwnerAlias {
+		t.Fatal("replacement did not retire the old generation")
+	}
+	if len(backend.removed) != 1 || backend.removed[0].OwnerAlias != old.plan.OwnerAlias || backend.prepared != 2 {
+		t.Fatal("old kernel generation was not removed before preparing a fresh Link")
+	}
+	if _, ok := d.runner.states[next.plan.InterfaceName]; ok {
+		t.Fatal("new attempt inherited committed state")
+	}
+	next.state = dynamicAttempting
+	nextCtx, nextCancel := context.WithCancel(d.ctx)
+	defer nextCancel()
+	next.cancel = nextCancel
+	result := engine.Result{RemoteUID: session.RemoteUID, RemoteLoopbackV6: session.RemoteLoopbackV6}
+	if err := d.commitLink(nextCtx, next, result); err != nil {
+		t.Fatal(err)
+	}
+	// Superseded callbacks must neither cancel nor withdraw the replacement.
+	d.expireConnectivity(old, oldCtx, old.deadlineEpoch)
+	d.failAttempt(old, "late old failure", dynamicRecovering, dynamicStopped)
+	if err := d.commitLink(oldCtx, old, result); err == nil {
+		t.Fatal("old commit was accepted")
+	}
+	d.runner.markLinkLost(old.plan)
+	if nextCtx.Err() != nil || !d.runner.hasDirectLink(next.remote) || len(backend.removed) != 1 {
+		t.Fatal("old callback damaged the replacement")
+	}
+}
+
+type recoveryCleanupBackend struct {
+	*runtimeBackend
+	fail bool
+}
+
+func (b *recoveryCleanupBackend) RemoveDynamic(ctx context.Context, plan reconcile.LinkPlan) error {
+	if b.fail {
+		return errors.New("injected kernel cleanup failure")
+	}
+	return b.runtimeBackend.RemoveDynamic(ctx, plan)
+}
+
+func TestDynamicRecoveryReplacementWaitsForKernelCleanup(t *testing.T) {
+	backend := &runtimeBackend{}
+	d, session, proposal := dynamicFixture(t, backend)
+	old := d.prepareInbound(session, proposal)
+	old.state = dynamicRecovering
+	d.runner.states[old.plan.InterfaceName] = materializedState{desired: old.plan, remote: old.remote, dynamic: true, committed: true}
+	cleanup := &recoveryCleanupBackend{runtimeBackend: backend, fail: true}
+	d.runner.Reconciler = reconcile.New(cleanup)
+	proposal.OperationID = [16]byte{3}
+	if d.prepareInbound(session, proposal) != nil || backend.prepared != 1 {
+		t.Fatal("replacement raced failed cleanup")
+	}
+	if resource := d.runner.links.resources[old.plan.OwnerAlias]; resource == nil || !resource.cleanup {
+		t.Fatal("failed cleanup lost kernel ownership")
+	}
+	cleanup.fail = false
+	d.runner.retryLinkCleanup(d.ctx)
+	if d.prepareInbound(session, proposal) == nil || len(backend.removed) != 1 || backend.prepared != 2 {
+		t.Fatal("replacement did not proceed after cleanup succeeded")
+	}
+}
+
+func TestDynamicRecoveryReplacementAdmission(t *testing.T) {
+	for _, scenario := range []string{"healthy", "attempting", "durable", "no-evidence", "policy-off", "bad-candidate", "bad-key", "bad-probe", "same-operation"} {
+		t.Run(scenario, func(t *testing.T) {
+			backend := &runtimeBackend{}
+			d, session, proposal := dynamicFixture(t, backend)
+			old := d.prepareInbound(session, proposal)
+			old.state = dynamicRecovering
+			state := materializedState{desired: old.plan, remote: old.remote, dynamic: true, committed: true}
+			proposal.OperationID = [16]byte{3}
+			switch scenario {
+			case "healthy":
+				old.state = dynamicUp
+				state.active = true
+			case "attempting":
+				old.state = dynamicAttempting
+			case "durable":
+				d.runner.durable = &durableManager{records: map[uuid.UUID]durableRecord{old.remote: {}}}
+			case "no-evidence":
+				d.evidence = nil
+			case "policy-off":
+				d.runner.Desired.DynamicLinks.Mode = spec.DynamicLinksOff
+			case "bad-candidate":
+				proposal.Endpoint = netip.MustParseAddrPort("198.51.100.2:54000")
+			case "bad-key":
+				proposal.WGPublicKey = [32]byte(d.runner.Desired.PrivateKey.PublicKey())
+			case "bad-probe":
+				proposal.ProbeKey = [32]byte{}
+			case "same-operation":
+				proposal.OperationID = old.operationID
+			}
+			d.runner.states[old.plan.InterfaceName] = state
+			if d.prepareInbound(session, proposal) != nil || d.attempts[old.remote] != old || len(backend.removed) != 0 || backend.prepared != 1 {
+				t.Fatal("rejected Proposal changed retained resources")
+			}
+		})
+	}
+}
+
 func TestDynamicOldDeadlineCannotCancelRecovery(t *testing.T) {
 	d, session, proposal := dynamicFixture(t, &runtimeBackend{})
 	attempt := d.prepareInbound(session, proposal)

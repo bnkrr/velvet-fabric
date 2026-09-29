@@ -339,3 +339,10 @@ suite checks the persisted long timeout and subsequent Link regrowth. They are
 included in `all` and CI. Use `netns` for an explicitly reduced run without
 systemd, or `resilience-all` for both resilience cases. FIB retention is a
 mandatory assertion; an old Babel binary fails before fixture setup.
+
+The standard `all` and `netns` suites also run the dual-family `cold-rejoin`
+regression: an ordinary Dynamic Link survives control loss, then admits a fresh
+Proposal after its peer loses and recreates its namespace. The survivor remains
+passive, its daemons stay running, and dual-stack WG Access traffic must recover
+within the normal 180-second phase budget. Run it alone with
+`tests/e2e/run-on-vm.sh cold-rejoin`.

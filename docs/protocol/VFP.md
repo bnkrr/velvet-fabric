@@ -1117,6 +1117,10 @@ RECOVERING while retaining the committed data plane and routing admission.
 The long recovery deadline remains anchored to the last confirmation. Fresh UDP confirmation after
 retained or renewed negotiation returns it to UP. On expiry remove the Dynamic
 Link. This is not a new routed Proposal and does not reset the retry budget.
+A fresh authenticated routed Proposal from the same peer may replace an ordinary
+Dynamic Link in RECOVERING after normal admission checks. Retire the old kernel
+generation before beginning the normal new Attempt; healthy Links, in-progress
+Attempts and Durable recovery keep their existing admission rules.
 
 Version 1 sends no retransmitted Proposal on one session and defines no
 cancel, success, failure, rollback, or generic error Message. A subsequent

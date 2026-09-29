@@ -153,6 +153,8 @@ else:
         self.assertEqual(commands.count('/netns-resilience.py'), 2)
         self.assertIn('dynamic', commands)
         self.assertIn('/netns-udp-nat.py', commands)
+        self.assertIn('/tests/directed/suite.py', commands)
+        self.assertIn('--case cold-rejoin --family both', commands)
         assets = next(self.remote.glob('assets-*'))
         for name in ('velvetd.service', 'velvet-babel@.service', 'velvet-recovery.service', 'velvet-recovery.timer'):
             self.assertTrue((assets / 'packaging/systemd' / name).is_file())
