@@ -25,6 +25,7 @@ from model import Topology, PendingLinks, NotConverged, address, audit, parse_wg
 from coverage_model import Coverage
 from materialization import MaterializedLinks
 from durable_model import DurableAudit
+from underlay import candidate_order, families, prefix as underlay_prefix, sampled_family
 
 
 class StopRequested(BaseException):
@@ -36,6 +37,7 @@ class DurationReached(BaseException):
 
 
 def arguments():
+    from endpoint_matrix import CASES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("daemon", nargs="?", type=Path)
     parser.add_argument("babel", nargs="?", type=Path)
@@ -46,7 +48,11 @@ def arguments():
     parser.add_argument("--duration-seconds", type=float, default=0,
                         help="total wall-clock budget, 0: unlimited; expires with normal cleanup")
     parser.add_argument("--wg-access", action="store_true", help="dual-stack external WG clients and Domain return traffic")
-    parser.add_argument("--underlay", choices=("ipv4", "ipv6"), default="ipv4")
+    parser.add_argument("--underlay", choices=("ipv4", "ipv6", "dual"), default="dual")
+    parser.add_argument("--endpoint-matrix", action="store_true",
+                        help="bounded bilateral endpoint/failover suite on four dual-stack public nodes")
+    parser.add_argument("--endpoint-case", action='append', default=[], choices=[c[0] for c in CASES],
+                        help="select endpoint-matrix cases (default: all)")
     parser.add_argument("--dynamic", choices=("active", "off"), default="active")
     parser.add_argument("--nat-policy", choices=("active", "passive"), default="active")
     parser.add_argument("--capture", action="store_true", help="bounded bridge UDP capture; requires tcpdump")
@@ -65,6 +71,12 @@ def arguments():
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--validate", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.endpoint_case and not args.endpoint_matrix:
+        parser.error('--endpoint-case requires --endpoint-matrix')
+    if args.endpoint_matrix:
+        if args.underlay != 'dual' or args.exercise or args.duration_seconds:
+            parser.error('--endpoint-matrix requires dual underlay, no exercises or duration limit')
+        args.nodes, args.min_nodes, args.dynamic = 4, 3, 'off'
     if (args.rounds < 0 or args.probe_pairs < 1 or args.rss_growth_mib < 1
             or not math.isfinite(args.duration_seconds) or args.duration_seconds < 0
             or not 1 <= args.durable_stable_seconds <= 31536000
@@ -75,6 +87,10 @@ def arguments():
         topology = Topology(args.nodes, args.min_nodes, args.seed, args.dynamic == "active")
     except ValueError as error:
         parser.error(str(error))
+    if args.endpoint_matrix:
+        topology.public = set(range(args.nodes))
+        topology.boot = {node: 0 if node else None for node in range(args.nodes)}
+        topology.profiles = {node: None for node in range(args.nodes)}
     if args.dynamic == 'off' and (args.exercise or args.nat_policy != 'active'):
         parser.error('--exercise and --nat-policy require active dynamic discovery')
     if 'durable' in args.exercise and args.nat_policy != 'active':
@@ -85,7 +101,7 @@ def arguments():
         for node in set(range(args.nodes)) - topology.public:
             topology.modes[node] = args.nat_policy
     if args.plan:
-        if not args.rounds:
+        if not args.rounds and not args.endpoint_matrix:
             parser.error("--plan requires positive --rounds")
     elif not args.validate:
         for path in (args.daemon, args.babel):
@@ -180,13 +196,24 @@ class Runner:
     def ip(self, node, *args, **kwargs):
         return self.run("ip", "-n", self.namespace(node), *args, **kwargs)
 
-    def wan(self, node):
+    def wan(self, node, family=None):
+        family = family or families(self.args.underlay)[0]
         host = node + 1 + 128 * (self.wan_epochs[node] % 2)
-        return f"192.0.2.{host}" if self.args.underlay == "ipv4" else f"2001:db8:ee::{host:x}"
+        return f"192.0.2.{host}" if family == 4 else f"2001:db8:ee::{host:x}"
 
-    def endpoint(self, node, port):
-        value = self.wan(node)
+    def endpoint(self, node, port, family=None):
+        value = self.wan(node, family)
         return f"[{value}]:{port}" if ":" in value else f"{value}:{port}"
+
+    def bootstrap_endpoints(self, node, bootstrap):
+        order = candidate_order(self.args.underlay, node, self.topology.births[node])
+        return [self.endpoint(bootstrap, 52000 + node, family) for family in order]
+
+    def receiver_endpoints(self, node, peer):
+        if self.args.underlay != 'dual' or peer not in self.topology.public:
+            return []
+        order = candidate_order('dual', node, self.topology.births[node])
+        return [self.endpoint(peer, 51000 + peer, family) for family in order]
 
     def command(self, node, name="status"):
         with socket.socket(socket.AF_UNIX) as sock:
@@ -235,12 +262,12 @@ class Runner:
                 if peer == node:
                     continue
                 peers.append({'name': f'in-{peer}', 'public_key': self.pubs[peer],
-                    'listen_port': 52000 + peer, 'endpoints': [],
+                    'listen_port': 52000 + peer, 'endpoints': self.receiver_endpoints(node, peer),
                     'interface_name': f'vl-in-{peer:02d}', 'persistent_keepalive_seconds': 1})
         bootstrap = self.topology.boot[node]
         if bootstrap is not None:
             peers.append({'name': 'bootstrap', 'public_key': self.pubs[bootstrap],
-                'listen_port': 51000 + node, 'endpoints': [self.endpoint(bootstrap, 52000 + node)],
+                'listen_port': 51000 + node, 'endpoints': self.bootstrap_endpoints(node, bootstrap),
                 'interface_name': f'vl-boot-{bootstrap:02d}', 'persistent_keepalive_seconds': 1})
         spec = {'api_version': 'velvet.io/v1alpha1', 'kind': 'NodeSpec',
             'fabric': {'psk': self.psk, 'loopback_prefix_v6': 'fd78:e2ee::/48', 'routing_table_id': 20000},
@@ -248,7 +275,7 @@ class Runner:
                      'private_key': self.keys[node], 'loopback_address_v6': address(node)},
             'peers': peers, 'babel': {'enabled': True, 'executable': str(self.args.babel.resolve())},
             'dynamic_links': {'mode': self.topology.modes[node], 'allow_candidate_prefixes': [
-                '192.0.2.0/24' if self.args.underlay == 'ipv4' else '2001:db8:ee::/64']}}
+                underlay_prefix(family) for family in families(self.args.underlay)]}}
         spec['node'].update(self.automatic_ports(node))
         spec['dynamic_links']['durable'] = {'stable_seconds': getattr(self.args, 'durable_stable_seconds', 1800)}
         if self.access:
@@ -277,8 +304,9 @@ class Runner:
         self.ip(node, 'link', 'set', 'lo', 'up')
         self.ns(node, 'sysctl', '-qw', 'net.ipv6.conf.default.accept_dad=0', 'net.ipv6.conf.default.autoconf=0')
 
-    def lan(self, node, host):
-        return f'10.88.{node}.{host}' if self.args.underlay == 'ipv4' else f'fd42:ee:{node:x}::{host}'
+    def lan(self, node, host, family=None):
+        family = family or families(self.args.underlay)[0]
+        return f'10.88.{node}.{host}' if family == 4 else f'fd42:ee:{node:x}::{host}'
 
     def add_node(self, node):
         self.created.add(node)
@@ -295,7 +323,8 @@ class Runner:
         self.run('ip', 'link', 'set', root, 'up')
         self.run('ip', 'link', 'set', other, 'netns', self.namespace(outer), 'name', 'wan')
         self.root_links.discard(other)
-        self.ip(outer, 'addr', 'add', self.wan(node) + ('/24' if self.args.underlay == 'ipv4' else '/64'), 'dev', 'wan')
+        for family in families(self.args.underlay):
+            self.ip(outer, 'addr', 'add', self.wan(node, family) + ('/24' if family == 4 else '/64'), 'dev', 'wan')
         self.ip(outer, 'link', 'set', 'wan', 'up')
         self.ns(node, 'sysctl', '-qw', 'net.ipv4.ip_local_port_range=31000 32000')
         if outer != node:
@@ -305,9 +334,11 @@ class Runner:
             for owner, device, host in ((node, left, 2), (outer, right, 1)):
                 self.run('ip', 'link', 'set', device, 'netns', self.namespace(owner), 'name', 'lan')
                 self.root_links.discard(device)
-                self.ip(owner, 'addr', 'add', self.lan(node, host) + ('/24' if self.args.underlay == 'ipv4' else '/64'), 'dev', 'lan')
+                for family in families(self.args.underlay):
+                    self.ip(owner, 'addr', 'add', self.lan(node, host, family) + ('/24' if family == 4 else '/64'), 'dev', 'lan')
                 self.ip(owner, 'link', 'set', 'lan', 'up')
-            self.ip(node, '-4' if self.args.underlay == 'ipv4' else '-6', 'route', 'add', 'default', 'via', self.lan(node, 1))
+            for family in families(self.args.underlay):
+                self.ip(node, f'-{family}', 'route', 'add', 'default', 'via', self.lan(node, 1, family))
             # AF_PACKET receives frames before this drop. The kernel must not
             # forward a second copy or return ICMP unreachable to the member.
             self.ns(outer, 'nft', '-f', '-', input="""table inet velvet_nat {
@@ -369,14 +400,17 @@ class Runner:
         thread = threading.Thread(target=drain, daemon=True)
         info["thread"] = thread
         thread.start()
-        self.record("node-start", node=node, pid=proc.pid, bootstrap=self.topology.boot[node], profile=self.topology.profiles[node])
+        config = json.loads((self.runtime / f'{node}.json').read_text())
+        self.record("node-start", node=node, pid=proc.pid, bootstrap=self.topology.boot[node], profile=self.topology.profiles[node],
+                    endpoint_hints={p['interface_name']: p['endpoints'] for p in config['peers']})
 
     def start_nat(self, node):
         mapping, filtering, allocation = self.topology.profiles[node]
         (self.runtime / f'nat-{node}.json').unlink(missing_ok=True)
         with (self.runtime / f'nat-{node}.log').open('w') as log:
             self.nat_processes[node] = sp.Popen(['ip', 'netns', 'exec', self.namespace(f'r{node}'), 'python3',
-                str(Path(__file__).with_name('nat.py')), '--wan', self.wan(node), '--mapping', mapping,
+                str(Path(__file__).with_name('nat.py')),
+                *[part for family in families(self.args.underlay) for part in ('--wan', self.wan(node, family))], '--mapping', mapping,
                 '--filter', filtering, '--allocation', allocation,
                 '--seed', str(self.args.seed + node + self.nat_epochs[node]),
                 '--status', str(self.runtime / f'nat-{node}.json'), *self.nat_options(node)], stdout=log, stderr=sp.STDOUT)
@@ -558,16 +592,26 @@ class Runner:
             raise RuntimeError(f"ping tool error: {result.stderr}")
         return result.returncode == 0
 
+    def endpoint_sample(self, source, target):
+        route = json.loads(self.ip(source, '-6', '-j', 'route', 'get', address(target), 'from', address(source)))[0]
+        device = route.get('dev')
+        wg = parse_wg(self.ns(source, 'wg', 'show', 'all', 'dump')).get(device)
+        if not wg or len(wg['peers']) != 1 or str(route.get('table')) != '20000':
+            raise NotConverged('payload probe has no selected Fabric WireGuard hop')
+        return {'dev': device, **wg['peers'][0]}
+
     def probes(self, pairs):
         count = min(self.args.probe_pairs, len(pairs))
         passed = set()
         for index in range(count):
             pair = pairs[(self.probe_cursor + index) % len(pairs)]
+            before = self.endpoint_sample(*pair) if self.args.underlay == 'dual' else None
             if not self.ping(*pair):
                 raise NotConverged(f"data-plane probe failed {pair}")
             if self.access:
                 self.access.probe(*pair)
-            self.coverage.ping(*pair)
+            family = sampled_family(before, self.endpoint_sample(*pair)) if before else None
+            self.coverage.ping(*pair, endpoint_family=family)
             passed.add(pair)
         self.probe_cursor += count
         absent = sorted(set(range(self.topology.size)) - self.topology.active)
@@ -593,6 +637,7 @@ class Runner:
                 if good_since is None:
                     good_since = time.monotonic()
                 if time.monotonic() - good_since >= self.args.stable_seconds and set(pairs) <= probed:
+                    self.coverage.require_families()
                     if self.args.nat_policy == 'passive':
                         for node in self.topology.active - self.topology.public:
                             if any(self.coverage.proposals[node, peer] for peer in self.topology.active - {node}):
@@ -602,6 +647,7 @@ class Runner:
                     self.save("latest.json", {"round": self.round, "topology": self.topology.state(), "observations": self.latest})
                     self.record("verified", seconds=round(time.monotonic() - start, 3), active=sorted(self.nodes),
                                 pairs=len(pairs), operations=self.counts, public=sorted(self.topology.active & self.topology.public),
+                                endpoint_probes=dict(self.coverage.endpoint_probes),
                                 access_probes=self.access.probes if self.access else 0)
                     self.verified_round = self.round
                     self.deadline = None
@@ -784,6 +830,11 @@ class Runner:
 def main():
     args, topology = arguments()
     if args.plan:
+        if args.endpoint_matrix:
+            from endpoint_matrix import CASES
+            print(json.dumps({'underlay': args.underlay, 'endpoint_cases': [c for c in CASES
+                              if not args.endpoint_case or c[0] in args.endpoint_case]}))
+            return 0
         print(json.dumps({"seed": args.seed, "nodes": args.nodes, "initial": topology.state(),
                           "exercise_prelude": args.exercise}))
         if 'nat-rebind' in args.exercise:
@@ -804,7 +855,13 @@ def main():
     artifacts = (args.artifacts or Path(".local/experiments/endless") / f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}").resolve()
     artifacts.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix="velvet-endless-") as directory:
-        runner = Runner(args, topology, Path(directory), artifacts)
+        runner_type = Runner
+        if args.endpoint_matrix:
+            from endpoint_matrix import EndpointMatrix
+            class EndpointRunner(EndpointMatrix, Runner):
+                pass
+            runner_type = EndpointRunner
+        runner = runner_type(args, topology, Path(directory), artifacts)
         hashes = {}
         for name, path in (("velvetd", args.daemon), ("babel", args.babel)):
             with path.open("rb") as binary:
@@ -812,7 +869,7 @@ def main():
         runner.save("manifest.json", {"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "sha256": hashes, "kernel": os.uname().release, "python": os.sys.version, "pid": os.getpid(),
             "namespace_prefix": f"vfe-{runner.token}-", "bridge": runner.bridge, "uids": runner.uids, "topology": topology.state()})
-        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py", "materialization.py", "durable_model.py", "access.py"):
+        for name in ("netns.py", "model.py", "nat.py", "coverage_model.py", "mutations.py", "materialization.py", "durable_model.py", "access.py", "underlay.py", "endpoint_matrix.py"):
             shutil.copyfile(Path(__file__).with_name(name), artifacts / name)
 
         def stop(signum, _frame):

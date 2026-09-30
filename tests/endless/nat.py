@@ -85,9 +85,13 @@ def admits(remote, destinations, filtering):
 class Translator:
     def __init__(self, wan, mapping, filtering, allocation, seed, interface='lan', idle_timeout=180,
                  other_wan=None, primary_destination=None):
-        self.wan, self.mapping, self.filtering, self.allocation = wan, mapping, filtering, allocation
+        addresses = [wan] if isinstance(wan, str) else wan
+        self.wans = {ipaddress.ip_address(address).version: address for address in addresses}
+        if len(self.wans) != len(addresses):
+            raise ValueError('supply at most one primary WAN address per family')
+        self.wan, self.mapping, self.filtering, self.allocation = addresses[0], mapping, filtering, allocation
         self.rng = random.Random(seed)
-        self.sequence = 40000
+        self.sequence = {family: 40000 for family in self.wans}
         self.entries = {}
         self.selector = selectors.DefaultSelector()
         self.lan = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
@@ -106,8 +110,9 @@ class Translator:
         elif self.allocation == 'offset':
             desired = 1024 + ((local[1] - 1024 + 10000) % (65536 - 1024))
         elif self.allocation == 'sequential':
-            desired = self.sequence
-            self.sequence = 40000 + (self.sequence - 40000 + 1) % 20000
+            family = ipaddress.ip_address(wan).version
+            desired = self.sequence[family]
+            self.sequence[family] = 40000 + (desired - 40000 + 1) % 20000
         else:
             desired = self.rng.randrange(40000, 60000)
         sock = socket.socket(socket.AF_INET6 if ':' in wan else socket.AF_INET, socket.SOCK_DGRAM)
@@ -131,8 +136,13 @@ class Translator:
         local, remote, payload, client_mac, router_mac = packet
         if ipaddress.ip_address(remote[0]).is_multicast or ipaddress.ip_address(remote[0]).is_link_local:
             return
+        family = ipaddress.ip_address(remote[0]).version
+        wan = self.wans.get(family)
+        if wan is None:
+            return
         key = mapping_key(local, remote, self.mapping)
-        wan = self.other_wan if self.other_wan and remote[0] != self.primary_destination else self.wan
+        if self.other_wan and family == ipaddress.ip_address(self.other_wan).version and remote[0] != self.primary_destination:
+            wan = self.other_wan
         if self.other_wan:
             key = (wan, key)  # Mapping state is independent per egress.
         entry = self.entries.get(key)
@@ -190,7 +200,7 @@ class Translator:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--wan', required=True)
+    parser.add_argument('--wan', required=True, action='append', help='repeat for dual-stack WAN addresses')
     parser.add_argument('--mapping', choices=MAPPINGS, required=True)
     parser.add_argument('--filter', choices=FILTERS, required=True)
     parser.add_argument('--allocation', choices=ALLOCATIONS, required=True)
@@ -204,7 +214,9 @@ def main():
         parser.error('idle timeout must be in (0, 3600] seconds')
     if bool(args.other_wan) != bool(args.primary_destination):
         parser.error('other WAN and primary destination must be supplied together')
-    if args.other_wan and any(ipaddress.ip_address(a).version != ipaddress.ip_address(args.wan).version
+    if len({ipaddress.ip_address(a).version for a in args.wan}) != len(args.wan):
+        parser.error('supply at most one primary WAN address per family')
+    if args.other_wan and any(ipaddress.ip_address(a).version != ipaddress.ip_address(args.wan[0]).version
                               for a in (args.other_wan, args.primary_destination)):
         parser.error('NAT egress addresses must share the address family')
     translator = Translator(args.wan, args.mapping, args.filter, args.allocation, args.seed,
@@ -225,6 +237,7 @@ def main():
                 temporary.write_text(json.dumps({'mapping': args.mapping, 'filter': args.filter,
                     'allocation': args.allocation, 'entries': len(translator.entries),
                     'wan_created': translator.wan_created,
+                    'wan_addresses': translator.wans,
                     'updated_monotonic': time.monotonic(), **translator.stats}))
                 temporary.replace(args.status)
                 last = time.monotonic()

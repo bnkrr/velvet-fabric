@@ -4,6 +4,7 @@ import json
 import subprocess as sp
 
 from model import NotConverged, parse_wg, prefix as loopback_prefix
+from underlay import families
 
 
 def client(node, family):
@@ -135,12 +136,13 @@ class Access:
             if f == 6:
                 domain_expected += [loopback_prefix(n) for n in reachable]
             check_routes(domain, domain_expected, f'node {node}/v{f} domain')
-            # Source and destination outside configured Domains stay on main.
-            destination = '192.0.2.254' if r.args.underlay == 'ipv4' else '2001:db8:ee::fe'
+            data['families'][f] = {'rules': rules, 'fabric': access_routes, 'domain': domain}
+        # Both underlay families must stay outside the Domain selectors.
+        for family in families(r.args.underlay):
+            destination = '192.0.2.254' if family == 4 else '2001:db8:ee::fe'
             host_route = json.loads(r.ip(node, '-j', 'route', 'get', destination))[0]
             if str(host_route.get('table', 'main')) != 'main' or host_route.get('dev') not in ('wan', 'lan'):
                 raise AssertionError('Access rules captured ordinary host traffic')
-            data['families'][f] = {'rules': rules, 'fabric': access_routes, 'domain': domain}
         obs['access'] = data
         known6 = {source_prefix(n, 6) for n in range(r.topology.size)}
         obs['fib'] = [x for x in obs['fib'] if x.get('dst') not in known6]

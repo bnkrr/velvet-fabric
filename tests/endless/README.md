@@ -8,17 +8,30 @@ Membership churn does not restart or reload surviving nodes to reset discovery
 state. Explicit online exercises below change only the selected fault/policy.
 
 Configure the test host and local build environment using [VM setup](../VM.md).
+The default underlay is dual stack: every public node, NAT router and member LAN
+has both IPv4 and IPv6 addresses. `--underlay ipv4` or `--underlay ipv6` retains
+the single-family regressions.
+
+Mixed-family dynamic discovery currently has a known gap: its initial candidate
+uses the first existing endpoint observation, and independently selected address
+families need not agree. The strict dual-stack membership run can fail its
+required-direct-Link assertion. This remains a failure, not a waived requirement;
+single-family endurance results do not certify mixed-family dynamic discovery.
 
 ```sh
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0 --underlay ipv6
 # Detach on the VM; progress stays in the run's rotating events.jsonl:
 tests/endless/run-on-vm.sh --detach --nodes 6 --rounds 0 --exercise durable
-# External WG Access clients; stop and clean up after eight hours:
+# Dual-stack underlay and external WG Access clients; stop after eight hours:
 tests/endless/run-on-vm.sh --detach --nodes 6 --rounds 0 --exercise durable \
-  --wg-access --duration-seconds 28800
+  --underlay dual --wg-access --duration-seconds 28800
 # Bounded execution of the same loop:
 tests/endless/run-on-vm.sh --nodes 4 --rounds 6 --stable-seconds 3
+# Bilateral endpoint inputs, packet loss, and real timeout-driven fallback:
+tests/endless/run-on-vm.sh --endpoint-matrix --wg-access
+# Reproduce one case without the rest of the matrix:
+tests/endless/run-on-vm.sh --endpoint-matrix --endpoint-case live4/6 --wg-access
 # Online changes, followed by one membership mutation (still finite):
 tests/endless/run-on-vm.sh --nodes 4 --rounds 1 --capture \
   --exercise policy --exercise blackout --exercise control-loss \
@@ -95,18 +108,29 @@ a free kernel port and thus need not preserve the original allocation pattern.
 
 This is a controlled packet-level NAT emulator, not a claim that Linux SNAT or
 every commercial router exhibits all these profiles. The existing deterministic
-kernel NAT44/NAT66 E2E suite remains complementary. IPv6 mode uses only IPv6
-underlay endpoints and translates private IPv6 addresses to public fixture IPv6
-addresses. Public addresses are documentation ranges on an isolated bridge,
+kernel NAT44/NAT66 E2E suite remains complementary. In dual mode one translator
+handles NAT44 and NAT66 simultaneously, with separate mappings and sequential
+port allocation per family. Single IPv6 mode uses only IPv6 endpoints. IPv6 NAT
+translates private fixture IPv6 addresses to public fixture IPv6 addresses;
+it does not translate between address families. Public addresses are documentation ranges on an isolated bridge,
 not Internet listeners. Fragmentation, IPv6 extension headers, TCP NAT,
 hairpinning, NAT64/NPTv6 and multi-layer NAT are outside this fixture's scope.
 
 ## Bootstrap provisioning
 
 Every public has preprovisioned per-slot WG receiver interfaces with known peer
-keys and empty endpoint lists. Only authenticated WG roaming learns an actual
-member endpoint. This does not create static Links to every public.
+keys. Receivers for NAT slots have empty endpoint lists: only authenticated WG
+roaming learns the actual translated address/port. In dual mode public/public
+receivers also get endpoint hints for the peer's known outbound listening port.
+Hints alone cannot establish a Link to a different bootstrap's cryptographic
+receiver. This does not create static Links to every public.
 A node's one outbound `vl-boot-PP` connects to the selected public's `vl-in-NN`.
+In dual mode each side independently rotates its hints by slot and birth:
+IPv4 only, IPv6 only, IPv4 then IPv6, IPv6 then IPv4. Thus mixed bilateral hints
+and both preference orders occur on dual-stack listeners. The peer's birth does
+not rewrite a surviving node's configuration. `node-start.endpoint_hints` records
+the input lists; kernel endpoints record the actual result, including WG roaming.
+Both candidate prefixes are permitted.
 Bootstrap interface names sort before the zero-padded inbound receiver names,
 so the runtime tries the selected public bootstrap as an observer first.
 Public nodes retain their inbound receivers when they themselves bootstrap
@@ -126,6 +150,35 @@ routes must beat obsolete fallbacks when a member changes bootstrap. Established
 counts describe live control sessions; retained interfaces are audited separately
 against fixture identities and observed kernel materialization.
 
+## Bilateral endpoint matrix
+
+`--endpoint-matrix` runs a finite suite on four public dual-stack nodes, independent
+of membership churn. Each case starts with fresh namespaces and WG sessions.
+Two spokes continuously carry IPv4 and IPv6 underlay traffic; the tested pair
+has only its one provisioned path. Optional `--wg-access` also checks both payload
+families in both directions. Select cases with repeatable `--endpoint-case`.
+
+The matrix covers passive/4, passive/6, 4/4, 6/6, 4/6, 6/4, opposite dual-list
+orders, an unavailable first IPv4 or IPv6 candidate, all candidates unavailable
+followed by recovery, and established IPv4-to-IPv6 and IPv6-to-IPv4 fallback.
+Both mixed single-candidate configurations are also faulted after roaming, to
+verify that the surviving configured address is retried without a second entry.
+Mixed hints need not remain asymmetric after authenticated WG roaming. Fault
+counters must prove dropped packets. All-down must have no handshake or successful
+payload; recovery must then pass the full FIB/identity/traffic audit.
+
+Live failover never reloads configuration or restarts either daemon. It allows
+300 seconds for the existing 180-second stale-handshake threshold, 15-second
+candidate rotation, and link/routing recovery. `endpoint-matrix.json` records
+the hints, final endpoints, traffic counter deltas, fault hits and recovery times.
+
+The final `dynamic-mixed-fallback` case gives two spokes disjoint observed
+candidate families and enables dynamic discovery between them. It requires
+terminal failed attempts plus verified bidirectional Babel transit through the
+hub. Its recorded outcome explicitly names the unsupported dynamic case. This
+checks that discovery failure preserves forwarding; it does not substitute for
+the normal membership run's required direct-Link assertion.
+
 ## Verifier and convergence
 
 Every audit reads every active member's kernel FIB, actual WG public/peer keys,
@@ -136,6 +189,17 @@ sets with runtime status and the other side's record when present. A saved recor
 is not proof of an active Link. Confirmed Durable records and active Dynamic Links
 are counted separately; coverage distinguishes `static`, `dynamic`, `durable`
 and `fallback` outcomes.
+The coverage matrix retains the configured `family` mode and adds the actual
+`endpoint_family` of the selected first WG hop, including routed fallback.
+In dual mode each successful payload probe samples the kernel route and WG peer
+before and after the loopback ping and optional dual-stack Access probes. Only
+an unchanged selected interface, peer and endpoint with a handshake and growth
+in both RX/TX counts increments `endpoint_probes.ipv4` or `.ipv6`. Path changes
+invalidate the sample. Both counters must be nonzero before any round can pass;
+merely configuring two addresses or observing two endpoints is insufficient.
+These counters describe the source's selected first hop, not every hop of a
+possibly mixed-family routed path. Later rounds may legitimately use only one
+family while nodes are absent; the counters are cumulative across the run.
 The independent model requires:
 
 - Correct, reciprocal provisioned Links for the selected bootstrap graph.
@@ -210,7 +274,9 @@ replace the separate real 30-minute controlled-failure E2E test.
 | `--min-nodes` | 3 | Require `3 <= min-nodes < nodes`; includes public slots |
 | `--seed` | 1 | Repeatable topology, bootstrap, profile and add/delete sequence |
 | `--rounds` | 0 | Membership rounds after exercises; zero is unlimited, startup is round 0 |
-| `--underlay` | ipv4 | IPv4 NAT/public or IPv6 NAT/public |
+| `--underlay` | dual | Simultaneous IPv4/IPv6 NAT/public; `ipv4` and `ipv6` retain single-family runs |
+| `--endpoint-matrix` | off | Finite four-public-node bilateral endpoint/fallback suite |
+| `--endpoint-case` | all | Repeatable case selector; requires `--endpoint-matrix` |
 | `--dynamic` | active | `active` or provisioned-graph-only `off` |
 | `--nat-policy` | active | Initial NAT policy, `active` or `passive`; publics stay active |
 | `--exercise` | none | Repeat option for distinct online exercises; each runs once before churn |
@@ -325,7 +391,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
 # Root-only, real route replacement between parallel Links, interface recreation,
 # and rejection of premature Babel routes (also part of hosted E2E CI):
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_materialization.py
-# Root-only, independent real UDP tests for all 36 profiles in each family:
+# Root-only, all 36 profiles with IPv4, IPv6, and one dual-stack translator:
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_nat.py
 # Retained namespace references and SIGTERM during partial setup:
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_lifecycle.py \
@@ -341,4 +407,6 @@ sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_commit.py \
 The real UDP check independently varies destination IP, destination port and
 local port, observes actual translated endpoints, tests unsolicited replies from
 different external endpoints, and relies on kernel UDP delivery to validate
-reply framing/checksums. It supplies no Velvet protocol messages.
+reply framing/checksums. The dual-stack cases use the same client ports in both
+families through one translator process, checking that the mappings remain
+independent. It supplies no Velvet protocol messages.

@@ -7,6 +7,7 @@ import time
 
 from model import NotConverged, address, parse_wg
 from durable_model import agreement, fixed
+from underlay import families
 
 
 def observe(r):
@@ -111,17 +112,19 @@ def blocked_pair(r, node, peer, control=False):
     before = {n: list(dynamic(r, n, t)) for n, t in ((node, peer), (peer, node))}
     assert all(before.values()), 'fault requires an established non-bootstrap Dynamic Link'
     saved = paired_agreement(r, node, peer)
-    family = 'ip' if r.args.underlay == 'ipv4' else 'ip6'
     if control:
         incoming = f'ip6 saddr {address(peer)} meta l4proto {{ tcp, udp }} th dport 58420'
         outgoing = f'ip6 daddr {address(peer)} meta l4proto {{ tcp, udp }} th dport 58420'
     else:
-        incoming = f'iifname "lan" {family} saddr {r.wan(peer)} meta l4proto udp'
+        incoming = '\n'.join(f'iifname "lan" {"ip" if family == 4 else "ip6"} saddr {r.wan(peer, family)} meta l4proto udp counter name dropped drop'
+                             for family in families(r.args.underlay))
         outgoing = None  # A one-way underlay blackhole; bootstrap remains usable.
+    if control:
+        incoming += ' counter name dropped drop'
     rules = f'''table inet coverage_fault {{
  counter dropped {{ }}
  chain input {{ type filter hook input priority -20; policy accept;
- {incoming} counter name dropped drop
+ {incoming}
  }}
 '''
     if outgoing:
@@ -174,7 +177,7 @@ def reset_nat(r, node, rebind=False):
     saved = {peer: r.durable_records(peer) for peer in r.topology.active}
     before = {peer: dynamic(r, peer, node) for peer in sorted(r.topology.active & r.topology.public)
               if peer != r.topology.boot[node]}
-    old_wan = r.wan(node)
+    old_wan = {family: r.wan(node, family) for family in families(r.args.underlay)}
     old_process = r.nat_processes[node]
     old_process.terminate()
     old_process.wait(timeout=5)
@@ -182,18 +185,19 @@ def reset_nat(r, node, rebind=False):
     r.nat_epochs[node] += 1
     if rebind:
         r.wan_epochs[node] += 1
-        width = '/24' if r.args.underlay == 'ipv4' else '/64'
-        r.ip(f'r{node}', 'addr', 'del', old_wan + width, 'dev', 'wan')
-        # Deleting an IPv4 primary can also remove its secondary addresses.
-        # Install the replacement afterwards while the translator is stopped.
-        r.ip(f'r{node}', 'addr', 'add', r.wan(node) + width, 'dev', 'wan')
+        for family, address in old_wan.items():
+            width = '/24' if family == 4 else '/64'
+            r.ip(f'r{node}', 'addr', 'del', address + width, 'dev', 'wan')
+            # Replace addresses while the translator is stopped.
+            r.ip(f'r{node}', 'addr', 'add', r.wan(node, family) + width, 'dev', 'wan')
         mapping, filtering, allocation = r.topology.profiles[node]
         r.topology.profiles[node] = (mapping, filtering, 'offset' if allocation == 'preserve' else 'preserve')
     r.nodes[node]['resources'].pop('nat', None)  # Explicit fixture-only replacement.
     r.coverage.reset(node)
     r.start_nat(node)
     r.record('nat-restarted', node=node, old_pid=old_process.pid, new_pid=r.nat_processes[node].pid,
-             epoch=r.nat_epochs[node], old_wan=old_wan, new_wan=r.wan(node), profile=r.topology.profiles[node])
+             epoch=r.nat_epochs[node], old_wan=old_wan,
+             new_wan={family: r.wan(node, family) for family in families(r.args.underlay)}, profile=r.topology.profiles[node])
     r.verify()
     status = json.loads((r.runtime / f'nat-{node}.json').read_text())
     assert status['created'] > 0 and status['in'] > 0, 'replacement NAT did not forward real traffic'
@@ -203,7 +207,8 @@ def reset_nat(r, node, rebind=False):
             assert current, 'rebound NAT lost required direct link'
             for value in current.values():
                 host, port = value['endpoint'].rsplit(':', 1)
-                assert ipaddress.ip_address(host.strip('[]')) == ipaddress.ip_address(r.wan(node)), 'stale WAN endpoint'
+                endpoint = ipaddress.ip_address(host.strip('[]'))
+                assert endpoint == ipaddress.ip_address(r.wan(node, endpoint.version)), 'stale WAN endpoint'
                 assert all(value['endpoint'] != old['endpoint'] for old in old_links.values()), 'endpoint did not change'
         r.record('endpoint-change-verified', node=node, wan=r.wan(node))
         for owner, records in saved.items():

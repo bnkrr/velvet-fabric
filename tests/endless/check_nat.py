@@ -37,11 +37,13 @@ def socket_in(namespace, address, port):
 
 
 def family_check(family, directory):
+    families = (family,) if isinstance(family, int) else family
     token = uuid.uuid4().hex[:8]
     names = {n: f'vfn-{token}-{n}' for n in ('c', 'r', 'o')}
     links, created, sockets = [], [], []
-    lan = ['10.88.1.1', '10.88.1.2'] if family == 4 else ['fd42:ee::1', 'fd42:ee::2']
-    wan = ['192.0.2.254', '192.0.2.1', '192.0.2.2'] if family == 4 else ['2001:db8:ee::ff', '2001:db8:ee::1', '2001:db8:ee::2']
+    lans = {4: ['10.88.1.1', '10.88.1.2'], 6: ['fd42:ee::1', 'fd42:ee::2']}
+    wans = {4: ['192.0.2.254', '192.0.2.1', '192.0.2.2'],
+            6: ['2001:db8:ee::ff', '2001:db8:ee::1', '2001:db8:ee::2']}
     def ip(node, *args): return run('ip', '-n', names[node], *args)
     try:
         for name in names.values():
@@ -49,29 +51,36 @@ def family_check(family, directory):
             created.append(name)
             run('ip', '-n', name, 'link', 'set', 'lo', 'up')
             run('ip', 'netns', 'exec', name, 'sysctl', '-qw', 'net.ipv6.conf.default.accept_dad=0', 'net.ipv6.conf.default.autoconf=0')
-        for index, (a, b, interface, aa, ba) in enumerate((('c', 'r', 'lan', lan[1], lan[0]), ('r', 'o', 'wan', wan[0], wan[1]))):
+        for index, (a, b, interface, ah, bh) in enumerate((('c', 'r', 'lan', 1, 0), ('r', 'o', 'wan', 0, 1))):
             left, right = f'vfl{token}{index}', f'vfr{token}{index}'
             run('ip', 'link', 'add', left, 'type', 'veth', 'peer', 'name', right)
             links.extend((left, right))
-            for node, dev, address in ((a, left, aa), (b, right, ba)):
+            for node, dev, host in ((a, left, ah), (b, right, bh)):
                 run('ip', 'link', 'set', dev, 'netns', names[node], 'name', interface)
-                ip(node, 'addr', 'add', address + ('/24' if family == 4 else '/64'), 'dev', interface)
+                for family in families:
+                    address = (lans if interface == 'lan' else wans)[family][host]
+                    ip(node, 'addr', 'add', address + ('/24' if family == 4 else '/64'), 'dev', interface)
                 ip(node, 'link', 'set', interface, 'up')
-        ip('o', 'addr', 'add', wan[2] + ('/24' if family == 4 else '/64'), 'dev', 'wan')
-        ip('c', f'-{family}', 'route', 'add', 'default', 'via', lan[0])
+        for family in families:
+            ip('o', 'addr', 'add', wans[family][2] + ('/24' if family == 4 else '/64'), 'dev', 'wan')
+            ip('c', f'-{family}', 'route', 'add', 'default', 'via', lans[family][0])
         rules = 'table inet fixture {\n chain pre {\n type filter hook prerouting priority -300; policy accept;\n iifname "lan" meta l4proto udp drop\n }\n}\n'
         result = sp.run(['ip', 'netns', 'exec', names['r'], 'nft', '-f', '-'], input=rules, text=True, capture_output=True)
         if result.returncode: raise RuntimeError(result.stderr)
-        client = socket_in(names['c'], lan[1], 31011)
-        client2 = socket_in(names['c'], lan[1], 31012)
-        observers = [socket_in(names['o'], addr, port) for addr, port in ((wan[1], 43001), (wan[1], 43002), (wan[2], 43001))]
-        sockets.extend((client, client2, *observers))
+        clients = {}
+        for family in families:
+            lan, wan = lans[family], wans[family]
+            client = socket_in(names['c'], lan[1], 31011)
+            client2 = socket_in(names['c'], lan[1], 31012)
+            observers = [socket_in(names['o'], addr, port) for addr, port in ((wan[1], 43001), (wan[1], 43002), (wan[2], 43001))]
+            sockets.extend((client, client2, *observers))
+            clients[family] = client, client2, observers
         results = []
         for mapping, filtering, allocation in itertools.product(('eim', 'adm', 'apdm'), ('eif', 'adf', 'apdf'), ('preserve', 'offset', 'sequential', 'random')):
             status = directory / 'status.json'
             status.unlink(missing_ok=True)
             process = sp.Popen(['ip', 'netns', 'exec', names['r'], 'python3', str(Path(__file__).with_name('nat.py')),
-                '--wan', wan[0], '--mapping', mapping, '--filter', filtering, '--allocation', allocation,
+                *[part for family in families for part in ('--wan', wans[family][0])], '--mapping', mapping, '--filter', filtering, '--allocation', allocation,
                 '--seed', '7', '--status', str(status)], stdout=sp.DEVNULL, stderr=sp.PIPE)
             try:
                 until = time.monotonic() + 5
@@ -79,37 +88,40 @@ def family_check(family, directory):
                     if process.poll() is not None or time.monotonic() > until:
                         raise RuntimeError('NAT process did not become ready')
                     time.sleep(0.02)
-                client.sendto(b'first', observers[0].getsockname()[:2])
-                payload, observed = observers[0].recvfrom(100)
-                assert payload == b'first' and observed[0] == wan[0]
-                observers[0].sendto(b'reply', observed)
-                assert client.recvfrom(100)[0] == b'reply'
-                for index in (1, 2):
-                    observers[index].sendto(b'filter', observed)
-                    allowed = filtering == 'eif' or (filtering == 'adf' and index == 1)
-                    try:
-                        data, source = client.recvfrom(100)
-                    except socket.timeout:
-                        assert not allowed, (family, mapping, filtering, allocation, 'valid reply filtered')
-                    else:
-                        assert allowed and data == b'filter' and source[:2] == observers[index].getsockname()[:2]
-                ports = [observed[1]]
-                for observer in observers[1:]:
-                    client.sendto(b'next', observer.getsockname()[:2])
-                    payload, source = observer.recvfrom(100)
-                    assert payload == b'next'
-                    ports.append(source[1])
-                assert len(set(ports)) == {'eim': 1, 'adm': 2, 'apdm': 3}[mapping], (mapping, ports)
-                if mapping == 'adm': assert ports[0] == ports[1]
-                if allocation == 'preserve': assert ports[0] == 31011
-                elif allocation == 'offset': assert ports[0] == 41011
-                elif allocation == 'sequential':
-                    assert sorted(set(ports)) == list(range(40000, 40000 + len(set(ports))))
-                else: assert all(40000 <= port < 60000 for port in ports)
-                client2.sendto(b'other-local', observers[0].getsockname()[:2])
-                payload, source = observers[0].recvfrom(100)
-                assert payload == b'other-local' and source[1] not in ports
-                results.append({'family': family, 'mapping': mapping, 'filter': filtering, 'allocation': allocation, 'ports': ports})
+                for family in families:
+                    client, client2, observers = clients[family]
+                    wan = wans[family]
+                    client.sendto(b'first', observers[0].getsockname()[:2])
+                    payload, observed = observers[0].recvfrom(100)
+                    assert payload == b'first' and observed[0] == wan[0]
+                    observers[0].sendto(b'reply', observed)
+                    assert client.recvfrom(100)[0] == b'reply'
+                    for index in (1, 2):
+                        observers[index].sendto(b'filter', observed)
+                        allowed = filtering == 'eif' or (filtering == 'adf' and index == 1)
+                        try:
+                            data, source = client.recvfrom(100)
+                        except socket.timeout:
+                            assert not allowed, (family, mapping, filtering, allocation, 'valid reply filtered')
+                        else:
+                            assert allowed and data == b'filter' and source[:2] == observers[index].getsockname()[:2]
+                    ports = [observed[1]]
+                    for observer in observers[1:]:
+                        client.sendto(b'next', observer.getsockname()[:2])
+                        payload, source = observer.recvfrom(100)
+                        assert payload == b'next'
+                        ports.append(source[1])
+                    assert len(set(ports)) == {'eim': 1, 'adm': 2, 'apdm': 3}[mapping], (mapping, ports)
+                    if mapping == 'adm': assert ports[0] == ports[1]
+                    if allocation == 'preserve': assert ports[0] == 31011
+                    elif allocation == 'offset': assert ports[0] == 41011
+                    elif allocation == 'sequential':
+                        assert sorted(set(ports)) == list(range(40000, 40000 + len(set(ports))))
+                    else: assert all(40000 <= port < 60000 for port in ports)
+                    client2.sendto(b'other-local', observers[0].getsockname()[:2])
+                    payload, source = observers[0].recvfrom(100)
+                    assert payload == b'other-local' and source[1] not in ports
+                    results.append({'underlay': 'dual' if len(families) == 2 else f'ipv{family}', 'family': family, 'mapping': mapping, 'filter': filtering, 'allocation': allocation, 'ports': ports})
             finally:
                 process.terminate()
                 process.wait(timeout=3)
@@ -128,9 +140,9 @@ def family_check(family, directory):
 def main():
     if os.geteuid() != 0: raise SystemExit('root required')
     with tempfile.TemporaryDirectory(prefix='velvet-nat-check-') as directory:
-        results = family_check(4, Path(directory)) + family_check(6, Path(directory))
+        results = [row for families in (4, 6, (4, 6)) for row in family_check(families, Path(directory))]
         print(json.dumps(results))
-        print(f'PASS: {len(results)} real UDP mapping/filter/allocation profiles, including IPv4 and IPv6 reply checksums')
+        print(f'PASS: {len(results)} real UDP mapping/filter/allocation profiles, including single/dual-stack translators and reply checksums')
 
 
 if __name__ == '__main__': main()
