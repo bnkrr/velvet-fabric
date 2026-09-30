@@ -111,7 +111,9 @@ func (b *Backend) endpointChoice(desired reconcile.LinkPlan, current *wgtypes.De
 		attempt.lastHandshake = peer.LastHandshakeTime
 		attempt.since = now
 	}
-	if len(desired.Endpoints) > 1 && now.Sub(attempt.since) >= 15*time.Second && endpointStale(attempt.lastHandshake, now, desired.Keepalive) {
+	// Even a sole configured endpoint must be retried after stale roaming.
+	// Otherwise an authenticated move outside the list can strand this Link.
+	if now.Sub(attempt.since) >= 15*time.Second && endpointStale(attempt.lastHandshake, now, desired.Keepalive) {
 		attempt.index = (attempt.index + 1) % len(desired.Endpoints)
 		attempt.since = now
 		changeEndpoint = true

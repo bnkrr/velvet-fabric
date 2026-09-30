@@ -66,6 +66,37 @@ func TestEndpointRotationAndFreshHandshake(t *testing.T) {
 	}
 }
 
+func TestSingleEndpointRecoversAfterRoaming(t *testing.T) {
+	for _, configured := range []string{"192.0.2.1:5000", "[2001:db8::1]:5000"} {
+		t.Run(configured, func(t *testing.T) {
+			backend := New()
+			key := wgtypes.Key{1}
+			plan := reconcile.LinkPlan{InterfaceName: "vl-a-b", PeerPublicKey: key, Endpoints: []string{configured}}
+			roamed := "[2001:db8::2]:5000"
+			if configured[0] == '[' {
+				roamed = "192.0.2.2:5000"
+			}
+			endpoint, err := net.ResolveUDPAddr("udp", roamed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			device := &wgtypes.Device{Peers: []wgtypes.Peer{{PublicKey: key, Endpoint: endpoint, LastHandshakeTime: time.Now()}}}
+			if _, change := backend.endpointChoice(plan, device); change {
+				t.Fatal("fresh authenticated roaming must survive adoption")
+			}
+			stale := time.Now().Add(-4 * time.Minute)
+			device.Peers[0].LastHandshakeTime = stale
+			backend.attempts[plan.InterfaceName] = endpointAttempt{since: stale, lastHandshake: stale}
+			if index, change := backend.endpointChoice(plan, device); index != 0 || !change {
+				t.Fatalf("stale roaming did not retry the sole configured endpoint: index=%d change=%v", index, change)
+			}
+			if _, change := backend.endpointChoice(plan, device); change {
+				t.Fatal("repeated observation bypassed the candidate retry interval")
+			}
+		})
+	}
+}
+
 func TestManagedLinkRoutePrefixUsesConfiguredPools(t *testing.T) {
 	desired := &reconcile.DesiredState{
 		LinkPoolV4:     netip.MustParsePrefix("10.240.0.0/16"),

@@ -231,7 +231,9 @@ the actual WireGuard per-Link PSK. Explicit optional values replace only their
 matching defaults. `fabric.vfp_port` and `node.loopback_address_v6` are optional
 overrides. Endpoint candidates are tried in order; a candidate without a fresh
 WireGuard handshake is rotated after a bounded interval, while a successful
-handshake retains the working endpoint.
+handshake retains the working endpoint, including authenticated roaming outside
+the configured list. After that endpoint becomes stale, even a single configured
+candidate is retried; an empty list still waits for an authenticated inbound peer.
 
 Link-bound VFP/TCP is a short negotiation: OPEN/NODE_STATE and Link-address
 agreement, then close. Closing or resetting TCP does not withdraw an established
