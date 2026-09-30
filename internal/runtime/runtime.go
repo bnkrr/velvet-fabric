@@ -259,7 +259,7 @@ func (r *Runner) maintainMaterialized(ctx context.Context) bool {
 	r.dynamic.resourceMu.Lock()
 	defer r.dynamic.resourceMu.Unlock()
 	for _, state := range r.materializedStates() {
-		if err := r.Reconciler.Materialize(ctx, r.Desired, state.desired, state.local, state.peers); err != nil {
+		if err := r.materializeLink(ctx, state.desired, state.local, state.peers); err != nil {
 			healthy = false
 			r.log(Event{Event: "velvet-reconcile", Status: "failed", Peer: state.desired.PeerName, Interface: state.desired.InterfaceName, Error: err.Error()})
 		}

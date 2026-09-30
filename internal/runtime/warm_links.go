@@ -207,7 +207,7 @@ func (r *Runner) adoptWarmLinks() error {
 			return err
 		}
 		peers := []netip.Addr{receipt.Result.RemoteLoopbackV6}
-		if err := r.Reconciler.Materialize(d.ctx, r.Desired, plan, local, peers); err != nil {
+		if err := r.materializeLink(d.ctx, plan, local, peers); err != nil {
 			return err
 		}
 		r.mu.Lock()

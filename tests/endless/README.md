@@ -426,10 +426,12 @@ tests/endless/run-on-vm.sh --plan --nodes 16 --min-nodes 8 --rounds 10
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
 # Root-only, background drain of 20,000 real route events, interface recreation,
 # premature Babel rejection, and idempotent IPv4/IPv6 Fabric route maintenance
-# with repair of external deletion/mutation (also part of hosted E2E CI):
+# with repair of external deletion/mutation and stable parallel-Link fallback
+# ownership (also part of hosted E2E CI):
 go test -c -o /tmp/velvet-linux.test ./internal/linux
+go test -c -o /tmp/velvet-runtime.test ./internal/runtime
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_materialization.py \
-  --linux-test /tmp/velvet-linux.test
+  --linux-test /tmp/velvet-linux.test --runtime-test /tmp/velvet-runtime.test
 # Root-only, all 36 profiles with IPv4, IPv6, and one dual-stack translator:
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_nat.py
 # Retained namespace references and SIGTERM during partial setup:

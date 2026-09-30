@@ -106,13 +106,17 @@ def main():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--linux-test', type=Path, help='compiled internal/linux test binary for real route-maintenance checks')
+    parser.add_argument('--runtime-test', type=Path, help='compiled internal/runtime test binary for parallel fallback checks')
     args = parser.parse_args()
-    if args.linux_test:
+    for binary, test in ((args.linux_test, 'TestKernelRouteMaintenance'),
+                         (args.runtime_test, 'TestKernelParallelFallbacks')):
+        if binary is None:
+            continue
         namespace = 'vfk-' + uuid.uuid4().hex[:10]
         subprocess.run(['ip', 'netns', 'add', namespace], check=True, timeout=5)
         try:
             subprocess.run(['ip', 'netns', 'exec', namespace, 'env', 'VELVET_KERNEL_ROUTE_TEST=1',
-                            str(args.linux_test.resolve()), '-test.run', '^TestKernelRouteMaintenance$', '-test.v'],
+                            str(binary.resolve()), '-test.run', '^' + test + '$', '-test.v'],
                            check=True, timeout=30)
         finally:
             subprocess.run(['ip', 'netns', 'del', namespace], check=True, timeout=5)

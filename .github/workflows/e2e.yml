@@ -58,7 +58,8 @@ jobs:
         working-directory: velvet-fabric
         run: |
           go test -c -o .local/bin/linux.test ./internal/linux
-          sudo python3 tests/endless/check_materialization.py --linux-test .local/bin/linux.test
+          go test -c -o .local/bin/runtime.test ./internal/runtime
+          sudo python3 tests/endless/check_materialization.py --linux-test .local/bin/linux.test --runtime-test .local/bin/runtime.test
       - name: Test static Link establishment
         working-directory: velvet-fabric
         run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"

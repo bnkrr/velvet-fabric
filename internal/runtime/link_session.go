@@ -65,7 +65,7 @@ func (r *Runner) commitLink(ctx context.Context, desired reconcile.LinkPlan, dyn
 	if err := r.Reconciler.KeepLinkAlive(ctx, desired); err != nil {
 		return err
 	}
-	if err := r.Reconciler.Materialize(ctx, r.Desired, desired, localAddresses, peerLoopbacks); err != nil {
+	if err := r.materializeLink(ctx, desired, localAddresses, peerLoopbacks); err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -150,7 +150,7 @@ func (r *Runner) withdrawLinkAdjacency(ctx context.Context, plan reconcile.LinkP
 		return nil
 	}
 	r.forgetWarmLink(plan)
-	if err := r.Reconciler.Materialize(ctx, r.Desired, plan, state.local, nil); err != nil {
+	if err := r.materializeLink(ctx, plan, state.local, nil); err != nil {
 		return err // Retain bookkeeping so runLink retries the withdrawal.
 	}
 	r.mu.Lock()

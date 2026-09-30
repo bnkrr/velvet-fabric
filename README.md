@@ -365,6 +365,10 @@ routes, then automatic neighbor loopback fallback routes (priority 131008),
 then Babel unreachable routes (131070). Link subnet routes keep their existing
 priority. This lets Babel route around a broken direct Link without requiring
 Fabric to delete the neighbor fallback.
+Parallel committed Links to the same neighbor share one fallback output, chosen
+by interface name. Each Link retains its own subnet routes. Removing the chosen
+Link or revoking its adjacency lets another committed Link take over; control
+session loss alone preserves the choice.
 
 Full crash recovery requires a Babel build with FIB recovery support; older
 v0.6.0 releases lack it. The accompanying Babel implementation defaults to clear

@@ -285,7 +285,7 @@ func (r *Runner) manageLink(parent context.Context, plan reconcile.LinkPlan, con
 				}
 				addresses, _ := link.EndpointAddresses(value.Proposal, r.Desired.UUID, value.RemoteUID.UUID)
 				r.links.resourceMu.Lock()
-				err = r.Reconciler.Materialize(ctx, r.Desired, plan, addresses, nil)
+				err = r.materializeLink(ctx, plan, addresses, nil)
 				if err == nil {
 					r.mu.Lock()
 					r.states[plan.InterfaceName] = materializedState{desired: plan, local: addresses, remote: value.RemoteUID.UUID, dynamic: control.automatic}
