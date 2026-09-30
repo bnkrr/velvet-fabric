@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Root-only real kernel regression for parallel Link route replacement."""
+import argparse
 import json
 import os
+from pathlib import Path
 import subprocess
+import time
 import uuid
 
 from materialization import MaterializedLinks
@@ -12,8 +15,8 @@ from model import NotConverged, PendingLinks
 def main():
     namespace = 'vfm-' + uuid.uuid4().hex[:10]
 
-    def run(*args):
-        return subprocess.check_output(args, text=True, timeout=5)
+    def run(*args, **kwargs):
+        return subprocess.check_output(args, text=True, timeout=10, **kwargs)
 
     def ip(*args):
         return run('ip', '-n', namespace, *args)
@@ -50,6 +53,26 @@ def main():
         replace('vdl-test', 203)
         tracker.observe(observations(), 92)  # Previously committed, no tentative timeout.
 
+        # Main-thread sampling pauses while a real route burst is generated.
+        # The independent collector must continue consuming, including unrelated
+        # Babel notifications, without losing earlier materialization evidence.
+        before = observer.statistics()['routes_by_protocol'].get('new:203', 0)
+        burst = ''.join('route replace fd78:e2ee::99/128 dev vl-bootstrap table 20000 proto 203\n'
+                        for _ in range(20000))
+        run('ip', '-n', namespace, '-6', '-batch', '-', input=burst)
+        until = time.monotonic() + 5
+        while observer.statistics()['routes_by_protocol'].get('new:203', 0) < before + 20000:
+            stats = observer.statistics()
+            assert stats['error'] is None, stats
+            assert time.monotonic() < until, stats
+            time.sleep(0.01)
+        stats = observer.statistics()
+        assert stats['collector_alive'] and stats['error'] is None, stats
+        assert stats['receive_buffer_bytes'] >= 2 * stats['requested_buffer_bytes'], stats
+        print('PASS: background collector consumed 20000 kernel events without sampling:', json.dumps(stats))
+        # Remove the burst-only route before checking tentative FIB admission.
+        ip('-6', 'route', 'del', 'fd78:e2ee::99/128', 'table', '20000')
+
         # Recreating the name must not inherit its old materialization. Babel
         # export alone still cannot authorize the new interface incarnation.
         ip('link', 'del', 'vdl-test')
@@ -75,9 +98,22 @@ def main():
     finally:
         if observer is not None:
             observer.close()
+            assert not observer.statistics()['collector_alive'], 'collector thread leaked'
         run('ip', 'netns', 'del', namespace)
     assert namespace not in run('ip', 'netns', 'list').split(), 'namespace leaked'
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--linux-test', type=Path, help='compiled internal/linux test binary for real route-maintenance checks')
+    args = parser.parse_args()
+    if args.linux_test:
+        namespace = 'vfk-' + uuid.uuid4().hex[:10]
+        subprocess.run(['ip', 'netns', 'add', namespace], check=True, timeout=5)
+        try:
+            subprocess.run(['ip', 'netns', 'exec', namespace, 'env', 'VELVET_KERNEL_ROUTE_TEST=1',
+                            str(args.linux_test.resolve()), '-test.run', '^TestKernelRouteMaintenance$', '-test.v'],
+                           check=True, timeout=30)
+        finally:
+            subprocess.run(['ip', 'netns', 'del', namespace], check=True, timeout=5)
     main()

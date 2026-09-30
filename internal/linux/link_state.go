@@ -90,12 +90,19 @@ func (b *Backend) Materialize(ctx context.Context, state *reconcile.DesiredState
 		return err
 	}
 	wanted := materializedLinkRoutes(state, device.Attrs().Index, local, peerLoopbacks)
+	current, err := routesByProtocol(LinkProtocol)
+	if err != nil {
+		return err
+	}
 	for i := range wanted {
+		if installedRoutePresent(wanted[i], current) {
+			continue
+		}
 		if err := netlink.RouteReplace(&wanted[i]); err != nil {
 			return fmt.Errorf("install Link route %s: %w", routeDestination(wanted[i]), err)
 		}
 	}
-	current, err := routesByProtocol(LinkProtocol)
+	current, err = routesByProtocol(LinkProtocol)
 	if err != nil {
 		return err
 	}

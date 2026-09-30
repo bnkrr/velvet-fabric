@@ -333,3 +333,34 @@ func TestLinkRouteMatchingUsesKernelDefaultMetric(t *testing.T) {
 		}
 	}
 }
+
+func TestInstalledRouteRequiresKernelMetricAndForwardingShape(t *testing.T) {
+	for _, prefix := range []string{"192.0.2.0/24", "2001:db8::/64"} {
+		wanted := netlink.Route{Dst: prefixIPNet(netip.MustParsePrefix(prefix)), Table: 20000,
+			Protocol: StaticProtocol, Type: unix.RTN_UNICAST, Scope: netlink.SCOPE_LINK, LinkIndex: 10}
+		current := wanted
+		if current.Dst.IP.To4() == nil {
+			current.Priority = 1024
+			current.Scope = netlink.SCOPE_UNIVERSE
+		}
+		if !installedRoutePresent(wanted, []netlink.Route{current}) {
+			t.Fatalf("normalized kernel route should not be replaced: %+v", current)
+		}
+		for name, mutate := range map[string]func(*netlink.Route){
+			"metric":    func(r *netlink.Route) { r.Priority++ },
+			"protocol":  func(r *netlink.Route) { r.Protocol = 203 },
+			"interface": func(r *netlink.Route) { r.LinkIndex++ },
+			"scope":     func(r *netlink.Route) { r.Scope = netlink.SCOPE_HOST },
+			"gateway":   func(r *netlink.Route) { r.Gw = net.ParseIP("192.0.2.1") },
+			"multipath": func(r *netlink.Route) { r.MultiPath = []*netlink.NexthopInfo{{LinkIndex: 10}} },
+		} {
+			t.Run(prefix+"/"+name, func(t *testing.T) {
+				broken := current
+				mutate(&broken)
+				if installedRoutePresent(wanted, []netlink.Route{broken}) {
+					t.Fatal("changed or foreign route must not suppress repair")
+				}
+			})
+		}
+	}
+}

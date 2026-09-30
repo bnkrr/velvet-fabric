@@ -56,7 +56,9 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o .local/bin/velvetctl ./cmd/velvetctl
       - name: Test independent materialization observer
         working-directory: velvet-fabric
-        run: sudo python3 tests/endless/check_materialization.py
+        run: |
+          go test -c -o .local/bin/linux.test ./internal/linux
+          sudo python3 tests/endless/check_materialization.py --linux-test .local/bin/linux.test
       - name: Test static Link establishment
         working-directory: velvet-fabric
         run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"

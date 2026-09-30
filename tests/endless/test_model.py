@@ -385,6 +385,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_partial_observations_survive_a_later_read_failure(self):
         runner = Runner.__new__(Runner)
+        runner.materialized_links = {}
         runner.capture, runner.round, runner.phase, runner.started = None, 12, 'control-loss', 0
         runner.latest, runner.snapshots = {}, Mock()
         def partial():
@@ -402,6 +403,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_dead_capture_cannot_pass_as_evidence(self):
         runner = Runner.__new__(Runner)
+        runner.materialized_links = {}
         runner.capture = Mock()
         runner.capture.poll.return_value = 1
         runner.round, runner.phase, runner.started = 0, 'membership', 0

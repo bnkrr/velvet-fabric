@@ -241,7 +241,14 @@ The independent model requires:
   a protocol-202 adjacency in table 20000 records materialization for that kernel
   ifindex. Replacing the same peer route onto a parallel static or dynamic Link
   does not erase this record; interface deletion does. Lost/truncated events fail
-  verification. A dynamic incarnation never materialized must carry no FIB route
+  verification. A background reader continuously consumes each socket while
+  status queries and payload probes run. Snapshots synchronize with that reader;
+  any loss remains a fatal error on subsequent reads. The root fixture requests
+  a 1 MiB receive buffer and checks the effective kernel value (2 MiB including
+  accounting), using a per-socket override if the system limit clamps it. It does
+  not change host sysctls. Batches yield between reads instead of treating 4,096
+  queued messages as loss. Shutdown joins the reader before closing its socket.
+  A dynamic incarnation never materialized must carry no FIB route
   and have no Babel UDP socket. This evidence is independent of daemon up claims;
   a tentative incarnation lasting over 90 seconds fails (30s UDP + 30s final
   validation + 10s deferred cleanup + 5s cleanup, with 15s sampling allowance).
@@ -377,6 +384,14 @@ Artifacts use umask 077:
   routes, Babel sockets and actual ifindices, including partial reads before a
   later node fails. Each sample and daemon log carries host-monotonic elapsed
   time and round; events also identify the current exercise phase.
+- Kernel observer statistics in snapshots, verified events and observer shutdown
+  events: effective receive buffer, bytes/messages, link/route event counts,
+  route additions/deletions by protocol, peak count in a one-second bucket and
+  maximum drain interval. Counts live only as long as that node incarnation;
+  route counters have at most 512 protocol/kind keys. Failure snapshots retain
+  these diagnostics and the exception traceback even if node inspection never
+  started. The route subscription observes IPv6; payload/FIB audits cover both
+  payload families.
 - Optional `underlay.pcap*` (3 × about 10 MB, 256-byte snapshot length). Capture
   startup and continued process liveness are checked; `capture.log` retains
   tcpdump's final packet/drop statistics. This captures underlay UDP only.
@@ -409,9 +424,12 @@ recorded nodes, NAT routers, veths, bridge, processes and UUID directories.
 tests/endless/run-on-vm.sh --plan --nodes 16 --min-nodes 8 --rounds 10
 # Negative controls and model/NAT framing unit tests:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
-# Root-only, real route replacement between parallel Links, interface recreation,
-# and rejection of premature Babel routes (also part of hosted E2E CI):
-sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_materialization.py
+# Root-only, background drain of 20,000 real route events, interface recreation,
+# premature Babel rejection, and idempotent IPv4/IPv6 Fabric route maintenance
+# with repair of external deletion/mutation (also part of hosted E2E CI):
+go test -c -o /tmp/velvet-linux.test ./internal/linux
+sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_materialization.py \
+  --linux-test /tmp/velvet-linux.test
 # Root-only, all 36 profiles with IPv4, IPv6, and one dual-stack translator:
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_nat.py
 # Retained namespace references and SIGTERM during partial setup:

@@ -18,6 +18,7 @@ import subprocess as sp
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 
 from model import process_fd_limit
@@ -364,6 +365,7 @@ class Runner:
             self.access.create(node)
         self.write_config(node)
         self.materialized_links[node] = MaterializedLinks(self.namespace(node))
+        self.record('kernel-observer-start', node=node, **self.materialized_links[node].statistics())
         if node in self.isolated_static:
             self.ns(node, 'nft', '-f', '-', input='''table inet durable_isolation {
  chain input { type filter hook input priority -30; policy accept;
@@ -463,7 +465,9 @@ class Runner:
                 raise RuntimeError(f'node {node}: NAT fixture shutdown failed')
             del self.nat_processes[node]
         del self.nodes[node]
-        self.materialized_links.pop(node).close()
+        observer = self.materialized_links.pop(node)
+        observer.close()
+        self.record('kernel-observer-stop', node=node, **observer.statistics())
         self.pending_links.forget(node)
         if self.access:
             self.access.remove(node)
@@ -515,12 +519,15 @@ class Runner:
         finally:
             self.snapshots.info(json.dumps({'round': self.round, 'phase': self.phase,
                 'elapsed': round(time.monotonic() - self.started, 6),
+                'kernel_observers': self.observer_statistics(),
                 'observations': self.latest}))
+
+    def observer_statistics(self):
+        return {node: observer.statistics() for node, observer in self.materialized_links.items()}
 
     def _observe(self):
         self.latest = {}
-        # Drain every subscription even if the first node is not ready yet.
-        # Domain route churn must not overflow an unvisited node's event queue.
+        # Synchronize with the continuous collectors even if a node is not ready.
         for observer in self.materialized_links.values():
             observer.read()
         for node, info in sorted(self.nodes.items()):
@@ -663,6 +670,7 @@ class Runner:
                     self.save("latest.json", {"round": self.round, "topology": self.topology.state(), "observations": self.latest})
                     self.record("verified", seconds=round(time.monotonic() - start, 3), active=sorted(self.nodes),
                                 components=self.topology.state()['components'],
+                                kernel_observers=self.observer_statistics(),
                                 pairs=len(pairs), operations=self.counts, public=sorted(self.topology.active & self.topology.public),
                                 endpoint_probes=dict(self.coverage.endpoint_probes),
                                 access_probes=self.access.probes if self.access else 0)
@@ -718,6 +726,8 @@ class Runner:
         self.record("stopped", reason=str(error))
         self.save("coverage.json", self.coverage.state())
         self.save("failure.json", {"round": self.round, "phase": self.phase, "error": str(error),
+                                  "traceback": ''.join(traceback.format_exception(error)),
+                                  "kernel_observers": self.observer_statistics(),
                                   "last_verifier_mismatch": self.last_mismatch, "topology": self.topology.state(),
                                   "observations": self.latest, "operations": self.counts})
         self.deadline = time.monotonic() + 30
@@ -748,8 +758,12 @@ class Runner:
         self.run_until = None
         self.stop_signal = None
         errors = []
-        for observer in self.materialized_links.values():
-            observer.close()
+        for node, observer in self.materialized_links.items():
+            try:
+                observer.close()
+                self.record('kernel-observer-stop', node=node, **observer.statistics())
+            except Exception as error:
+                errors.append(f'node {node}: {error}')
         self.materialized_links.clear()
         if self.capture is not None:
             if self.capture.poll() is None:

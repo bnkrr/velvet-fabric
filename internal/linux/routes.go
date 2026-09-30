@@ -68,13 +68,38 @@ func deleteStaleStaticRoutes(wanted []managedRoute) error {
 }
 
 func replaceStaticRoutes(wanted []managedRoute) error {
+	current, err := routesByProtocol(StaticProtocol)
+	if err != nil {
+		return err
+	}
 	for i := range wanted {
 		route := &wanted[i].route
+		if installedRoutePresent(*route, current) {
+			continue
+		}
 		if err := netlink.RouteReplace(route); err != nil {
 			return fmt.Errorf("replace route %s in table %d: %w", routeDestination(*route), route.Table, err)
 		}
 	}
 	return nil
+}
+
+// Compare actual kernel state on every maintenance pass so external deletion or
+// mutation is repaired, without emitting RTM_NEWROUTE for unchanged routes.
+func installedRoutePresent(wanted netlink.Route, current []netlink.Route) bool {
+	scope := wanted.Scope
+	if wanted.Dst != nil && wanted.Dst.IP.To4() == nil {
+		// Linux reports IPv6 route scope as universe, including device routes
+		// submitted with link scope. Gateway and interface still define the hop.
+		scope = netlink.SCOPE_UNIVERSE
+	}
+	for _, route := range current {
+		if anyRouteMatches(route, []netlink.Route{wanted}) && route.Scope == scope &&
+			ipEqual(route.Gw, wanted.Gw) && len(route.MultiPath) == 0 && route.Tos == wanted.Tos {
+			return true
+		}
+	}
+	return false
 }
 
 func desiredNetlinkRoutes(desired *reconcile.DesiredState) ([]managedRoute, error) {
