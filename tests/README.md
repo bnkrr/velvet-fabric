@@ -262,14 +262,18 @@ tests/directed/run-on-vm.sh --case partition --case data-mtu --family both
 
 The [endless netns harness](endless/README.md) mixes public nodes with per-node
 NAT mapping/filter/allocation profiles. Every added member chooses one current
-public as bootstrap; public nodes also churn, with at least one remaining.
-An independent WG/FIB and real-packet verifier requires every eligible public/NAT
-pair to connect directly; difficult NAT/NAT pairs may use verified routed fallback.
+public as bootstrap; public nodes also churn, preserving a discovery listener
+per family. Dual underlay uses separate IPv4/IPv6 discovery groups connected by
+Static transit nodes. An independent WG/FIB and real-packet verifier requires
+eligible same-family public/NAT pairs to connect directly; NAT/NAT pairs may use
+verified routed fallback. Cross-family groups use the configured transit graph;
+common-family coordination for disjoint dynamic candidates is outside this test.
 Coverage records actual profiles, directions and outcomes, with bounded intermediate
 WG/FIB evidence. Optional online exercises cover policy changes, one-way underlay
 loss, routed control loss, mapping reset and WAN endpoint changes. Deletion cleanup
 and same-identity rejoin remain part of membership churn.
-The NAT emulator itself has an independent 72-case real-UDP IPv4/IPv6 check.
+The NAT emulator has an independent 144-case real-UDP check across IPv4, IPv6,
+and dual-stack translators.
 `--rounds 0` is unlimited; a positive count uses the same path for bounded
 validation. It is opt-in and separate from privileged E2E `all`.
 

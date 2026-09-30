@@ -41,7 +41,7 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("daemon", nargs="?", type=Path)
     parser.add_argument("babel", nargs="?", type=Path)
-    parser.add_argument("--nodes", type=int, default=6)
+    parser.add_argument("--nodes", type=int, help="default: 8 for mixed dynamic underlay, otherwise 6")
     parser.add_argument("--min-nodes", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=0, help="0: until failure or interruption")
@@ -77,6 +77,8 @@ def arguments():
         if args.underlay != 'dual' or args.exercise or args.duration_seconds:
             parser.error('--endpoint-matrix requires dual underlay, no exercises or duration limit')
         args.nodes, args.min_nodes, args.dynamic = 4, 3, 'off'
+    if args.nodes is None:
+        args.nodes = 8 if args.underlay == 'dual' and args.dynamic == 'active' else 6
     if (args.rounds < 0 or args.probe_pairs < 1 or args.rss_growth_mib < 1
             or not math.isfinite(args.duration_seconds) or args.duration_seconds < 0
             or not 1 <= args.durable_stable_seconds <= 31536000
@@ -84,7 +86,7 @@ def arguments():
             or not 0 < args.stable_seconds < args.settle_timeout):
         parser.error("invalid duration/round/probe/resource bounds")
     try:
-        topology = Topology(args.nodes, args.min_nodes, args.seed, args.dynamic == "active")
+        topology = Topology(args.nodes, args.min_nodes, args.seed, args.dynamic == "active", args.underlay)
     except ValueError as error:
         parser.error(str(error))
     if args.endpoint_matrix:
@@ -206,13 +208,17 @@ class Runner:
         return f"[{value}]:{port}" if ":" in value else f"{value}:{port}"
 
     def bootstrap_endpoints(self, node, bootstrap):
-        order = candidate_order(self.args.underlay, node, self.topology.births[node])
+        family = self.topology.static_family(node, bootstrap)
+        order = (family,) if family else candidate_order(self.args.underlay, node, self.topology.births[node])
         return [self.endpoint(bootstrap, 52000 + node, family) for family in order]
 
     def receiver_endpoints(self, node, peer):
         if self.args.underlay != 'dual' or peer not in self.topology.public:
             return []
-        order = candidate_order('dual', node, self.topology.births[node])
+        if self.topology.mixed and peer not in self.topology.bootstrap_candidates(node, [peer]):
+            return []
+        family = self.topology.static_family(node, peer)
+        order = (family,) if family else candidate_order('dual', node, self.topology.births[node])
         return [self.endpoint(peer, 51000 + peer, family) for family in order]
 
     def command(self, node, name="status"):
@@ -275,7 +281,9 @@ class Runner:
                      'private_key': self.keys[node], 'loopback_address_v6': address(node)},
             'peers': peers, 'babel': {'enabled': True, 'executable': str(self.args.babel.resolve())},
             'dynamic_links': {'mode': self.topology.modes[node], 'allow_candidate_prefixes': [
-                underlay_prefix(family) for family in families(self.args.underlay)]}}
+                underlay_prefix(family) for family in
+                ((self.topology.discovery_family[node],) if self.topology.mixed and node not in self.topology.transit
+                 else families(self.args.underlay))]}}
         spec['node'].update(self.automatic_ports(node))
         spec['dynamic_links']['durable'] = {'stable_seconds': getattr(self.args, 'durable_stable_seconds', 1800)}
         if self.access:
@@ -402,6 +410,7 @@ class Runner:
         thread.start()
         config = json.loads((self.runtime / f'{node}.json').read_text())
         self.record("node-start", node=node, pid=proc.pid, bootstrap=self.topology.boot[node], profile=self.topology.profiles[node],
+                    discovery_family=self.topology.discovery_family[node],
                     endpoint_hints={p['interface_name']: p['endpoints'] for p in config['peers']})
 
     def start_nat(self, node):
@@ -610,7 +619,10 @@ class Runner:
                 raise NotConverged(f"data-plane probe failed {pair}")
             if self.access:
                 self.access.probe(*pair)
-            family = sampled_family(before, self.endpoint_sample(*pair)) if before else None
+            try:
+                family = sampled_family(before, self.endpoint_sample(*pair)) if before else None
+            except NotConverged as error:
+                raise NotConverged(f'payload probe {pair}: {error}') from error
             self.coverage.ping(*pair, endpoint_family=family)
             passed.add(pair)
         self.probe_cursor += count
@@ -619,6 +631,10 @@ class Runner:
             source = sorted(self.topology.active)[self.round % len(self.topology.active)]
             if self.ping(source, absent[self.round % len(absent)]):
                 raise NotConverged("deleted node still answers")
+        components = self.topology.components()
+        separated = [(a, b) for a in sorted(self.topology.active) for b in sorted(self.topology.active - components[a])]
+        if separated and self.ping(*separated[self.round % len(separated)]):
+            raise NotConverged('traffic crossed a model partition')
         return passed
 
     def verify(self, survivors=()):
@@ -646,6 +662,7 @@ class Runner:
                     self.save("coverage.json", self.coverage.state())
                     self.save("latest.json", {"round": self.round, "topology": self.topology.state(), "observations": self.latest})
                     self.record("verified", seconds=round(time.monotonic() - start, 3), active=sorted(self.nodes),
+                                components=self.topology.state()['components'],
                                 pairs=len(pairs), operations=self.counts, public=sorted(self.topology.active & self.topology.public),
                                 endpoint_probes=dict(self.coverage.endpoint_probes),
                                 access_probes=self.access.probes if self.access else 0)
@@ -830,7 +847,7 @@ class Runner:
 def main():
     args, topology = arguments()
     if args.plan:
-        if args.endpoint_matrix:
+        if getattr(args, 'endpoint_matrix', False):
             from endpoint_matrix import CASES
             print(json.dumps({'underlay': args.underlay, 'endpoint_cases': [c for c in CASES
                               if not args.endpoint_case or c[0] in args.endpoint_case]}))
@@ -856,7 +873,7 @@ def main():
     artifacts.mkdir(parents=True, exist_ok=False)
     with tempfile.TemporaryDirectory(prefix="velvet-endless-") as directory:
         runner_type = Runner
-        if args.endpoint_matrix:
+        if getattr(args, 'endpoint_matrix', False):
             from endpoint_matrix import EndpointMatrix
             class EndpointRunner(EndpointMatrix, Runner):
                 pass

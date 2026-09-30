@@ -17,8 +17,8 @@ from cases import catalog, pair_requirements
 
 
 class DirectedTopology(Topology):
-    def __init__(self, profiles):
-        super().__init__(len(profiles) + 2, 3, 1)
+    def __init__(self, profiles, underlay='ipv4'):
+        super().__init__(len(profiles) + 2, 3, 1, underlay=underlay)
         self.public = {0, 1}
         self.boot = {n: 0 if n else None for n in self.active}
         self.profiles = {0: None, 1: None, **dict(enumerate(profiles, 2))}
@@ -178,7 +178,7 @@ def main():
             profiles = [('eim', 'apdf', 'offset')] * 2 + [('eim', 'eif', 'preserve')]
         if spec['kind'] == 'observer-loss':
             profiles = [('apdm', 'apdf', 'sequential')] * 2 + [('eim', 'eif', 'preserve')]
-    topology = DirectedTopology(profiles)
+    topology = DirectedTopology(profiles, cli.underlay)
     if spec['kind'].startswith('observer') and spec['kind'] != 'observer-concurrency':
         # Only node 2 initiates. With node 4 off and node 0 already static,
         # node 2's measured evidence from observer 1 belongs to target 3 (the

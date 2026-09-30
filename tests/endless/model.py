@@ -73,13 +73,22 @@ def network(value):
 
 class Topology:
     """Per-node underlay profiles and one chosen outbound bootstrap per birth."""
-    def __init__(self, nodes, min_nodes, seed, dynamic=True):
+    def __init__(self, nodes, min_nodes, seed, dynamic=True, underlay='ipv4'):
         if not 3 <= min_nodes < nodes <= 16:
             raise ValueError("require 3 <= min-nodes < nodes <= 16")
         self.size, self.minimum, self.dynamic = nodes, min_nodes, dynamic
+        self.mixed = dynamic and underlay == 'dual'
+        if self.mixed and nodes < 8:
+            raise ValueError('mixed dynamic underlay requires at least 8 slots: 2 transit, 4 public, 2 NAT')
+        self.transit = {0, 1} if self.mixed else set()
+        self.discovery_family = dict.fromkeys(range(nodes), {'ipv4': 4, 'ipv6': 6, 'dual': None}[underlay])
+        if self.mixed:
+            self.discovery_family.update({node: 4 if node % 2 == 0 else 6
+                                          for node in range(nodes) if node not in self.transit})
         self.modes = {node: 'active' if dynamic else 'off' for node in range(nodes)}
+        self.modes.update({node: 'off' for node in self.transit})
         self.rng = random.Random(seed)
-        self.public = set(range(max(2, nodes // 4)))
+        self.public = set(range(6 if self.mixed else max(2, nodes // 4)))
         self.active = set(range(nodes))
         self.boot = {}
         self.profiles = {}
@@ -88,7 +97,8 @@ class Topology:
                         for m in ('eim', 'adm', 'apdm') for f in ('eif', 'adf', 'apdf')]
         available = []
         for node in range(nodes):
-            self.boot[node] = self.rng.choice(available) if available else None
+            candidates = self.bootstrap_candidates(node, available)
+            self.boot[node] = self.rng.choice(candidates) if candidates else None
             if node in self.public:
                 available.append(node)
                 self.profiles[node] = None
@@ -109,6 +119,13 @@ class Topology:
             candidates = self.active.copy()
             if len(self.active & self.public) == 1:
                 candidates -= self.public
+            if self.mixed:
+                # Preserve one public listener per family, while allowing every
+                # slot (including both transit nodes) to leave and return.
+                for family in (4, 6):
+                    public = {n for n in self.active & self.public if self.discovery_family[n] == family}
+                    if len(public) == 1:
+                        candidates -= public
         else:
             candidates = set(range(self.size)) - self.active
         node = self.rng.choice(sorted(candidates))
@@ -117,7 +134,7 @@ class Topology:
             self.active.remove(node)
             event['abrupt'] = bool(self.rng.getrandbits(1))
         else:
-            self.boot[node] = self.rng.choice(sorted(self.active & self.public))
+            self.boot[node] = self.rng.choice(self.bootstrap_candidates(node, self.active & self.public))
             self.active.add(node)
             self.births[node] += 1
             if node not in self.public:
@@ -125,6 +142,20 @@ class Topology:
                 self.profiles[node] = self.catalog[index]
             event.update(bootstrap=self.boot[node], profile=self.profiles[node])
         return event
+
+    def bootstrap_candidates(self, node, available):
+        return sorted(peer for peer in available if not self.mixed or node in self.transit
+                      or peer in self.transit or self.discovery_family[node] == self.discovery_family[peer])
+
+    def dynamic_pair(self, left, right):
+        return (self.dynamic and self.want_pair(left, right) and
+                (not self.mixed or self.discovery_family[left] is not None and
+                 self.discovery_family[left] == self.discovery_family[right]))
+
+    def static_family(self, left, right):
+        if not self.mixed:
+            return None
+        return self.discovery_family[left] or self.discovery_family[right]
 
     def configured(self, node):
         result = {f'vl-in-{peer:02d}': peer for peer in range(self.size) if peer != node} if node in self.public else {}
@@ -144,7 +175,7 @@ class Topology:
         result = set(self.static_links(node).values())
         if self.dynamic:
             result |= {peer for peer in self.active - {node}
-                       if (node in self.public or peer in self.public) and self.want_pair(node, peer)}
+                       if (node in self.public or peer in self.public) and self.dynamic_pair(node, peer)}
         return result
 
     def want_pair(self, left, right):
@@ -152,7 +183,7 @@ class Topology:
         return (a == 'active' and b != 'off') or (b == 'active' and a != 'off')
 
     def components(self):
-        if self.dynamic:
+        if self.dynamic and not self.mixed:
             # One live public bootstrap suffices for membership. Extra NAT
             # links are best-effort, but every member must remain reachable.
             return {node: self.active.copy() for node in self.active}
@@ -170,7 +201,9 @@ class Topology:
 
     def state(self):
         return {'active': sorted(self.active), 'dynamic': self.dynamic, 'public': sorted(self.public),
-                'bootstrap': self.boot, 'profiles': self.profiles, 'births': self.births, 'modes': self.modes}
+                'bootstrap': self.boot, 'profiles': self.profiles, 'births': self.births, 'modes': self.modes,
+                'mixed': self.mixed, 'transit': sorted(self.transit), 'discovery_family': self.discovery_family,
+                'components': [sorted(c) for c in sorted(set(map(frozenset, self.components().values())), key=lambda c: min(c))]}
 
 
 def parse_wg(dump):
@@ -253,10 +286,17 @@ def audit(topology, observations):
                     raise NotConverged(f'node {node}/{name}: stale/unexpected dynamic WG interface')
                 if topology.modes[node] == 'off' or topology.modes[remote] == 'off':
                     raise NotConverged(f'node {node}/{name}: automatic Link bypassed off')
+                if topology.mixed and topology.discovery_family[node] != topology.discovery_family[remote]:
+                    raise NotConverged(f'node {node}/{name}: automatic Link crossed discovery families')
             else:
                 raise NotConverged(f'node {node}: unexpected WG interface {name}')
             if remote == node or not peer['handshake']:
                 raise NotConverged(f'node {node}/{name}: self or unhandshaken WG link')
+            family = topology.static_family(node, remote)
+            if family is not None:
+                endpoint = peer.get('endpoint', '').rsplit(':', 1)[0].strip('[]')
+                if not endpoint or ipaddress.ip_address(endpoint).version != family:
+                    raise NotConverged(f'node {node}/{name}: WG endpoint escaped fixture family IPv{family}')
             if name.startswith('vdl-'):
                 reverse = lambda candidate: candidate.startswith('vdl-')
             else:

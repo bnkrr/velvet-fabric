@@ -60,7 +60,7 @@ class EndpointMatrix:
 
     def routed_fallback(self):
         # This bounded case checks the existing protocol limitation explicitly;
-        # the normal mixed membership oracle still requires public direct Links.
+        # The membership oracle separately requires same-family public direct Links.
         wait_for(self, lambda: all(self.failed_attempts[n] for n in (1, 2)), 90,
                  'mixed-family dynamic discovery did not reach a terminal result')
         self.verify()

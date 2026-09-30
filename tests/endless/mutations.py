@@ -176,7 +176,7 @@ def blocked_pair(r, node, peer, control=False):
 def reset_nat(r, node, rebind=False):
     saved = {peer: r.durable_records(peer) for peer in r.topology.active}
     before = {peer: dynamic(r, peer, node) for peer in sorted(r.topology.active & r.topology.public)
-              if peer != r.topology.boot[node]}
+              if peer != r.topology.boot[node] and r.topology.dynamic_pair(node, peer)}
     old_wan = {family: r.wan(node, family) for family in families(r.args.underlay)}
     old_process = r.nat_processes[node]
     old_process.terminate()
@@ -240,7 +240,8 @@ def exercise(r, name):
     if not candidates:
         raise ValueError('online mutations require a NAT member')
     node = candidates[0]
-    peer = next(n for n in sorted(r.topology.active & r.topology.public) if n != r.topology.boot[node])
+    peer = next(n for n in sorted(r.topology.active & r.topology.public)
+                if n != r.topology.boot[node] and r.topology.dynamic_pair(node, n))
     identities = {n: (info['proc'].pid, info['resources']['babel']['pid']) for n, info in r.nodes.items()}
     r.record('exercise-start', exercise=name, node=node, peer=peer)
     if name == 'policy':

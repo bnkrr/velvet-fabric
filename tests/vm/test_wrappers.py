@@ -78,7 +78,7 @@ else:
         for suite in ('e2e', 'directed', 'endless'):
             result = self.run_wrapper(suite, '--help', env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
-        result = self.run_wrapper('endless', '--plan', '--nodes', '4', '--rounds', '1', env=env)
+        result = self.run_wrapper('endless', '--plan', '--nodes', '8', '--rounds', '1', env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.log.exists())
 
@@ -118,7 +118,7 @@ else:
 
     def test_all_wrappers_preserve_build_settings_and_quote_paths(self):
         for suite, args in (('e2e', ['static']), ('directed', ['--case', 'data-mtu', '--family', 'ipv6']),
-                            ('endless', ['--nodes', '4', '--rounds', '1'])):
+                            ('endless', ['--nodes', '8', '--rounds', '1'])):
             with self.subTest(suite=suite):
                 self.log.unlink(missing_ok=True)
                 result = self.run_wrapper(suite, *args)

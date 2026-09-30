@@ -14,8 +14,8 @@ from netns import Runner
 from check_commit import CommitRunner
 
 
-def observation_fixture(dynamic=True):
-    topology = Topology(6, 3, 1, dynamic)
+def observation_fixture(dynamic=True, topology=None):
+    topology = topology or Topology(6, 3, 1, dynamic)
     observations = {}
     for node in topology.active:
         wg = {}
@@ -26,7 +26,7 @@ def observation_fixture(dynamic=True):
                  'allowed': ['0.0.0.0/0', '::/0']}]}
         peers = set(static.values())
         optional = (topology.active - {node} if node in topology.public else topology.active & topology.public) if dynamic else set()
-        neighbors = topology.required(node) | optional
+        neighbors = topology.required(node) | {peer for peer in optional if topology.dynamic_pair(node, peer)}
         for remote in neighbors - peers:
             wg[f'vdl-{remote}'] = {'public': f'dynamic-{node}-{remote}', 'port': 31000 + remote, 'peers': [
                 {'public': f'dynamic-{remote}-{node}', 'handshake': 100, 'allowed': ['0.0.0.0/0', '::/0']}]}
@@ -35,6 +35,13 @@ def observation_fixture(dynamic=True):
                 'established_links': len(static), 'dynamic_links': len(neighbors - peers),
                 'babel': {'state': 'running'}}}}
     for node in topology.active:
+        if topology.mixed:
+            owners = {link['public']: n for n, obs in observations.items() for link in obs['wg'].values()}
+            for link in observations[node]['wg'].values():
+                peer = link['peers'][0]
+                remote = owners.get(peer['public'])
+                family = topology.static_family(node, remote) if remote is not None else 4
+                peer['endpoint'] = '[2001:db8::1]:52000' if family == 6 else '192.0.2.1:52000'
         first = {remote: name for name, remote in topology.static_links(node).items()}
         first.update({remote: f'vdl-{remote}' for remote in topology.required(node) - set(first)})
         for remote in topology.components()[node] - {node}:

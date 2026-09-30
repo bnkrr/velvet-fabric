@@ -31,6 +31,8 @@ def sampled_family(before, after):
         raise NotConverged('underlay path changed during payload probe')
     if not before['handshake'] or not after['handshake']:
         raise NotConverged('underlay payload path has no WireGuard handshake')
-    if any(after[key] <= before[key] for key in ('rx', 'tx')):
-        raise NotConverged('underlay payload path did not exchange WireGuard bytes')
+    # Babel may route the reply through a different interface. This sample
+    # attributes the outgoing direction; every ordered pair is probed separately.
+    if after['tx'] <= before['tx'] or after['rx'] < before['rx']:
+        raise NotConverged('underlay payload path did not send WireGuard bytes or counters reset')
     return endpoint_family(after['endpoint'])

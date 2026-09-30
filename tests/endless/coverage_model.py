@@ -51,6 +51,9 @@ class Coverage:
                 outcome = 'static' if name in static else 'durable' if durable else 'dynamic' if name else 'fallback'
                 recovering = target in observations[source].get('durable_recovery_peers', ())
                 requirement = 'durable-recovery' if recovering else 'direct' if target in topology.required(source) else 'reachable'
+                if topology.mixed and requirement == 'reachable' and source not in topology.transit and target not in topology.transit:
+                    if topology.discovery_family[source] != topology.discovery_family[target]:
+                        requirement = 'relay'
                 routes = [route for route in observations[source]['fib']
                           if network(route['dst']) == prefix(target) and route.get('type', 'unicast') == 'unicast']
                 route = min(routes, key=lambda route: route.get('metric', 0))
@@ -62,6 +65,8 @@ class Coverage:
                 self.pairs[source, target] = {'source': source, 'target': target,
                     'source_profile': profile(topology, source), 'target_profile': profile(topology, target),
                     'requirement': requirement, 'outcome': outcome,
+                    'source_discovery_family': topology.discovery_family[source],
+                    'target_discovery_family': topology.discovery_family[target],
                     'endpoint_family': actual_family,
                     'successful_pings': self.probes[source, target],
                     'local_proposals': self.proposals[source, target],

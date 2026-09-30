@@ -3,7 +3,8 @@
 Real velvetd and managed Babel processes run in isolated Linux namespaces.
 Every node is either public or behind a controlled UDP NAT. Each newly added
 node selects **one currently present public node** as its outbound bootstrap.
-Public nodes also participate in deletion/re-add; at least one remains present.
+Public nodes also participate in deletion/re-add; at least one discovery listener
+per tested address family remains present.
 Membership churn does not restart or reload surviving nodes to reset discovery
 state. Explicit online exercises below change only the selected fault/policy.
 
@@ -12,28 +13,30 @@ The default underlay is dual stack: every public node, NAT router and member LAN
 has both IPv4 and IPv6 addresses. `--underlay ipv4` or `--underlay ipv6` retains
 the single-family regressions.
 
-Mixed-family dynamic discovery currently has a known gap: its initial candidate
-uses the first existing endpoint observation, and independently selected address
-families need not agree. The strict dual-stack membership run can fail its
-required-direct-Link assertion. This remains a failure, not a waived requirement;
-single-family endurance results do not certify mixed-family dynamic discovery.
+Dynamic discovery tests same-family candidate pairs. In dual mode, separate IPv4
+and IPv6 discovery groups share a dual-stack underlay and connect through two
+Static-only transit slots. Same-family public/public and public/NAT direct Links
+remain required. Cross-family groups use Babel transit when the configured
+bootstrap graph connects them. Choosing a common discovery family from disjoint
+initial candidates is outside this endurance test; the endpoint matrix separately
+checks forwarding during such a failed attempt.
 
 ```sh
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0
 tests/endless/run-on-vm.sh --nodes 16 --min-nodes 8 --rounds 0 --underlay ipv6
 # Detach on the VM; progress stays in the run's rotating events.jsonl:
-tests/endless/run-on-vm.sh --detach --nodes 6 --rounds 0 --exercise durable
+tests/endless/run-on-vm.sh --detach --nodes 8 --rounds 0 --exercise durable
 # Dual-stack underlay and external WG Access clients; stop after eight hours:
-tests/endless/run-on-vm.sh --detach --nodes 6 --rounds 0 --exercise durable \
+tests/endless/run-on-vm.sh --detach --nodes 10 --min-nodes 6 --rounds 0 --exercise durable \
   --underlay dual --wg-access --duration-seconds 28800
 # Bounded execution of the same loop:
-tests/endless/run-on-vm.sh --nodes 4 --rounds 6 --stable-seconds 3
+tests/endless/run-on-vm.sh --nodes 8 --rounds 6 --stable-seconds 3
 # Bilateral endpoint inputs, packet loss, and real timeout-driven fallback:
 tests/endless/run-on-vm.sh --endpoint-matrix --wg-access
 # Reproduce one case without the rest of the matrix:
 tests/endless/run-on-vm.sh --endpoint-matrix --endpoint-case live4/6 --wg-access
 # Online changes, followed by one membership mutation (still finite):
-tests/endless/run-on-vm.sh --nodes 4 --rounds 1 --capture \
+tests/endless/run-on-vm.sh --nodes 8 --rounds 1 --capture \
   --exercise policy --exercise blackout --exercise control-loss \
   --exercise nat-reset --exercise nat-rebind
 # Public nodes must initiate toward passive NAT members, including NAT66:
@@ -80,9 +83,15 @@ other suites; see [VM setup](../VM.md).
 
 ## Per-node underlay model
 
-There are `max(2, nodes // 4)` public slots: four in a 16-slot pool. Remaining
-slots each have their own LAN, router namespace and protocol-agnostic NAT
-process. NAT attributes are independent:
+Dual dynamic mode requires at least eight slots and defaults to eight: public
+slots 0–1 provide Static transit with dynamic mode `off`; public slots 2/4 use
+IPv4 discovery, and 3/5 use IPv6. NAT slots 6 onward alternate the two families.
+Every namespace still has both underlay families. The assigned discovery family
+stays fixed across births, including saved Durable recovery. Single-family and
+Static-only modes default to six slots, with `max(2, nodes // 4)` public slots.
+Each NAT slot has its own LAN, router namespace and protocol-agnostic translator.
+Use at least ten slots to include same-family NAT/NAT pairs in both groups.
+NAT attributes are independent:
 
 | Axis | Values |
 | --- | --- |
@@ -93,7 +102,12 @@ process. NAT attributes are independent:
 The 36 combinations are spread across initial NAT slots and rotated when a NAT
 slot is added again. A finite pool cannot contain all 36 at once; the manifest
 and per-birth events record actual coverage. A slot retains its public/NAT role,
-but no public slot is protected from deletion except the last present public.
+and all slots can leave/rejoin. Churn preserves the last public discovery
+listener in each family (the last public in single-family mode). Transit slots
+can both disappear; the expected connected components then follow the remaining
+configured Static graph and required same-family Dynamic Links. Full routes and
+payload checks apply within each component, and a rotating cross-component
+probe must fail. Expected components never come from daemon or route observations.
 Identity/key/loopback remain stable across re-add; NAT mapping state is recreated.
 
 The NAT fixture receives real LAN Ethernet/UDP packets via AF_PACKET, allocates
@@ -125,12 +139,14 @@ receivers also get endpoint hints for the peer's known outbound listening port.
 Hints alone cannot establish a Link to a different bootstrap's cryptographic
 receiver. This does not create static Links to every public.
 A node's one outbound `vl-boot-PP` connects to the selected public's `vl-in-NN`.
-In dual mode each side independently rotates its hints by slot and birth:
-IPv4 only, IPv6 only, IPv4 then IPv6, IPv6 then IPv4. Thus mixed bilateral hints
-and both preference orders occur on dual-stack listeners. The peer's birth does
-not rewrite a surviving node's configuration. `node-start.endpoint_hints` records
-the input lists; kernel endpoints record the actual result, including WG roaming.
-Both candidate prefixes are permitted.
+Between transit slots (and in Static-only dual mode), each side independently
+rotates hints by slot and birth: IPv4 only, IPv6 only, IPv4 then IPv6, IPv6 then
+IPv4. Links involving a discovery-group member use that group's family, and
+its allowed discovery prefix is restricted accordingly. A member chooses a
+bootstrap from its own group or a transit slot; a transit slot can choose any
+public. Kernel endpoint audits enforce those fixture inputs. The peer's birth
+does not rewrite a surviving node's configuration. `node-start.endpoint_hints`
+records input lists separately from actual WG selection and roaming.
 Bootstrap interface names sort before the zero-padded inbound receiver names,
 so the runtime tries the selected public bootstrap as an observer first.
 Public nodes retain their inbound receivers when they themselves bootstrap
@@ -140,8 +156,8 @@ so parallel provisioned Links between two publics are possible and valid.
 Initial public slots start first, forming a connected provisioned graph by
 selecting an already introduced public. Other nodes then choose among them.
 On every later add the selection is made from the current live public set,
-including when a returning member's previous public is still alive. The host
-model owns this selection; the test does not infer desired membership from WG
+subject to the family constraints above, even when its previous public is still
+alive. The host model owns this selection; the test does not infer desired membership from WG
 or Babel's current observations.
 
 A control-expired committed Link retains its WG interface, addresses, Babel
@@ -176,8 +192,8 @@ The final `dynamic-mixed-fallback` case gives two spokes disjoint observed
 candidate families and enables dynamic discovery between them. It requires
 terminal failed attempts plus verified bidirectional Babel transit through the
 hub. Its recorded outcome explicitly names the unsupported dynamic case. This
-checks that discovery failure preserves forwarding; it does not substitute for
-the normal membership run's required direct-Link assertion.
+checks that discovery failure preserves forwarding. The membership run separately
+requires all eligible same-family direct Links.
 
 ## Verifier and convergence
 
@@ -193,9 +209,11 @@ The coverage matrix retains the configured `family` mode and adds the actual
 `endpoint_family` of the selected first WG hop, including routed fallback.
 In dual mode each successful payload probe samples the kernel route and WG peer
 before and after the loopback ping and optional dual-stack Access probes. Only
-an unchanged selected interface, peer and endpoint with a handshake and growth
-in both RX/TX counts increments `endpoint_probes.ipv4` or `.ipv6`. Path changes
-invalidate the sample. Both counters must be nonzero before any round can pass;
+an unchanged selected interface, peer and endpoint with a handshake and increased
+TX counts increments `endpoint_probes.ipv4` or `.ipv6`. RX may stay unchanged
+when Babel chooses another return path; reverse ordered probes independently
+check the other direction. Path changes or counter resets invalidate the sample.
+Both counters must be nonzero before any round can pass;
 merely configuring two addresses or observing two endpoints is insufficient.
 These counters describe the source's selected first hop, not every hop of a
 possibly mixed-family routed path. Later rounds may legitimately use only one
@@ -204,8 +222,9 @@ The independent model requires:
 
 - Correct, reciprocal provisioned Links for the selected bootstrap graph.
 - With Dynamic Links enabled, every public/public and public/NAT pair with
-  `A.want(B) && B.accept(A)` or the reverse must have a direct Link. All fixture
-  profiles can send to a public listener; other successful NAT pairs cannot
+  `A.want(B) && B.accept(A)` or the reverse must have a direct Link within each
+  discovery family. Cross-family reachability requires a configured transit path.
+  All fixture profiles can send to a public listener; other successful NAT pairs cannot
   hide one missing pair. Static bootstrap Links remain required in every mode.
   Matching saved receivers on both live peers may use verified routed fallback
   during Durable's controlled recovery window. The host tracks this per agreement
@@ -349,6 +368,8 @@ Artifacts use umask 077:
 - Atomically replaced `latest.json` with current topology and complete audit.
 - `coverage.json`: cumulative verified samples by family/profile/policy/requirement/
   outcome, latest ordered node pairs, actual ping and local/remote proposal counts.
+  Cross-family transit requirements are labeled `relay`; pairs also record their
+  assigned discovery families. Verified events record expected components.
   Pair counts reset on birth or NAT replacement; sampled outcome does not invent
   an initiator when no proposal was observed. A finite run reports only the
   profiles actually verified, not all 36 merely because they exist in the catalog.
@@ -396,12 +417,12 @@ sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_nat.py
 # Retained namespace references and SIGTERM during partial setup:
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_lifecycle.py \
   /absolute/path/to/velvetd /absolute/path/to/babel-rs \
-  --nodes 4 --artifacts /absolute/path/to/new-run
+  --nodes 4 --underlay ipv4 --artifacts /absolute/path/to/new-run
 # Actual WG handoff with final VFP deliberately blocked: Babel must exclude
 # the tentative Link throughout, then forwarding must retain the routed path.
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_commit.py \
   /absolute/path/to/velvetd /absolute/path/to/babel-rs \
-  --nodes 4 --artifacts /absolute/path/to/new-commit-run
+  --nodes 4 --underlay ipv4 --artifacts /absolute/path/to/new-commit-run
 ```
 
 The real UDP check independently varies destination IP, destination port and

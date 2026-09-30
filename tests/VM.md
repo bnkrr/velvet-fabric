@@ -16,7 +16,7 @@ export VELVET_VM_REMOTE_ROOT=/srv/velvet-tests
 export VELVET_BABEL_REPO=/path/to/babel-rs
 tests/e2e/run-on-vm.sh all
 tests/directed/run-on-vm.sh --case data-mtu --family both
-tests/endless/run-on-vm.sh --nodes 4 --rounds 6
+tests/endless/run-on-vm.sh --nodes 8 --rounds 6
 ```
 
 Replace the example host and paths with your own. All three variables are
