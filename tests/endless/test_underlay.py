@@ -54,6 +54,7 @@ class UnderlayTests(unittest.TestCase):
 
     def test_mixed_components_follow_inputs_when_transit_disappears(self):
         topology = Topology(8, 3, 1, underlay='dual')
+        topology.plan_verified()
         topology.active -= topology.transit
         self.assertEqual(topology.components()[6], {2, 4, 6})
         self.assertEqual(topology.components()[7], {3, 5, 7})

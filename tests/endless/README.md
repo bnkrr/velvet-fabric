@@ -16,7 +16,8 @@ the single-family regressions.
 Dynamic discovery tests same-family candidate pairs. In dual mode, separate IPv4
 and IPv6 discovery groups share a dual-stack underlay and connect through two
 Static-only transit slots. Same-family public/public and public/NAT direct Links
-remain required. Cross-family groups use Babel transit when the configured
+remain required within an already routed component. Cross-family groups use
+Babel transit when the configured
 bootstrap graph connects them. Choosing a common discovery family from disjoint
 initial candidates is outside this endurance test; the endpoint matrix separately
 checks forwarding during such a failed attempt.
@@ -104,10 +105,20 @@ slot is added again. A finite pool cannot contain all 36 at once; the manifest
 and per-birth events record actual coverage. A slot retains its public/NAT role,
 and all slots can leave/rejoin. Churn preserves the last public discovery
 listener in each family (the last public in single-family mode). Transit slots
-can both disappear; the expected connected components then follow the remaining
-configured Static graph and required same-family Dynamic Links. Full routes and
-payload checks apply within each component, and a rotating cross-component
-probe must fail. Expected components never come from daemon or route observations.
+can both disappear; expected components follow configured Static Links and
+previously verified automatic Links whose endpoints have survived. New Dynamic
+negotiation requires an existing routed path: sharing a discovery family alone
+does not join partitions. Removing/recreating a node or setting its mode to
+`off` retires its automatic edges; losing an intermediate bootstrap does not.
+Full routes and payload checks apply within each component, and a rotating cross-component
+probe must fail. Current route tables and advertised neighbor counts never
+define expected components. Bilateral automatic recovery (including Durable)
+can expand them only with active, committed, materialized WG interfaces on both
+ends, reciprocal keys, handshakes and complete AllowedIPs. A saved record alone
+cannot join partitions. Missing observations cannot shrink expectations; unused
+edges are retired only after the full route and payload audit succeeds.
+Control-session loss alone does not discard previously verified forwarding.
+`--plan` assumes required Links pass; it does not predict optional NAT/NAT Links.
 Identity/key/loopback remain stable across re-add; NAT mapping state is recreated.
 
 The NAT fixture receives real LAN Ethernet/UDP packets via AF_PACKET, allocates
@@ -223,7 +234,8 @@ The independent model requires:
 - Correct, reciprocal provisioned Links for the selected bootstrap graph.
 - With Dynamic Links enabled, every public/public and public/NAT pair with
   `A.want(B) && B.accept(A)` or the reverse must have a direct Link within each
-  discovery family. Cross-family reachability requires a configured transit path.
+  discovery family and already routed component. Cross-family reachability
+  requires a configured transit path.
   All fixture profiles can send to a public listener; other successful NAT pairs cannot
   hide one missing pair. Static bootstrap Links remain required in every mode.
   Matching saved receivers on both live peers may use verified routed fallback
@@ -443,6 +455,12 @@ sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_lifecycle.py \
 sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_commit.py \
   /absolute/path/to/velvetd /absolute/path/to/babel-rs \
   --nodes 4 --underlay ipv4 --artifacts /absolute/path/to/new-commit-run
+# Cold partitions, a new NAT member, a real bootstrap bridge, then its removal:
+# the ordinary oracle must pass every phase, including dual-stack Access.
+sudo env PYTHONDONTWRITEBYTECODE=1 python3 tests/endless/check_partition.py \
+  /absolute/path/to/velvetd /absolute/path/to/babel-rs \
+  --nodes 10 --min-nodes 6 --underlay dual --wg-access \
+  --artifacts /absolute/path/to/new-partition-run
 ```
 
 The real UDP check independently varies destination IP, destination port and

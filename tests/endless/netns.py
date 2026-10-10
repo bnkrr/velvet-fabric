@@ -433,6 +433,7 @@ class Runner:
         return set()
 
     def stop_node(self, node, abrupt=False):
+        self.topology.forget(node)
         info = self.nodes[node]
         proc = info["proc"]
         if proc.poll() is not None:
@@ -510,11 +511,12 @@ class Runner:
             if self.capture is not None and self.capture.poll() is not None:
                 raise RuntimeError('packet capture exited unexpectedly; see capture.log')
             observations = self._observe()
+            self.durable_audit.observe(self.topology, observations)
+            self.pending_links.observe(observations, time.monotonic())
+            self.topology.observe_automatic(observations)
             if self.access:
                 for node, obs in observations.items():
                     self.access.observe(node, obs)
-            self.durable_audit.observe(self.topology, observations)
-            self.pending_links.observe(observations, time.monotonic())
             return observations
         finally:
             self.snapshots.info(json.dumps({'round': self.round, 'phase': self.phase,
@@ -666,6 +668,7 @@ class Runner:
                             if any(self.coverage.proposals[node, peer] for peer in self.topology.active - {node}):
                                 raise AssertionError(f'passive NAT node {node} initiated a proposal')
                     self.coverage.verified(self.topology, self.latest)
+                    self.topology.verified(self.latest)
                     self.save("coverage.json", self.coverage.state())
                     self.save("latest.json", {"round": self.round, "topology": self.topology.state(), "observations": self.latest})
                     self.record("verified", seconds=round(time.monotonic() - start, 3), active=sorted(self.nodes),
@@ -873,6 +876,7 @@ def main():
             mapping, filtering, allocation = topology.profiles[node]
             topology.profiles[node] = (mapping, filtering, 'offset' if allocation == 'preserve' else 'preserve')
         for round_number in range(1, args.rounds + 1):
+            topology.plan_verified()
             print(json.dumps({"round": len(args.exercise) + round_number, "event": topology.next_event(), "state": topology.state()}))
         return 0
     if args.validate:

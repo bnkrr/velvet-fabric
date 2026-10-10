@@ -93,6 +93,9 @@ class Topology:
         self.boot = {}
         self.profiles = {}
         self.births = {node: 0 for node in range(nodes)}
+        # Edges earned by a successful audit or bilateral kernel evidence.
+        # Absence from a later observation must not silently shrink reachability.
+        self.automatic = {}
         self.catalog = [(m, f, a) for a in ('preserve', 'offset', 'sequential', 'random')
                         for m in ('eim', 'adm', 'apdm') for f in ('eif', 'adf', 'apdf')]
         available = []
@@ -129,6 +132,7 @@ class Topology:
         else:
             candidates = set(range(self.size)) - self.active
         node = self.rng.choice(sorted(candidates))
+        self.forget(node)
         event = {'operation': operation, 'node': node}
         if operation == 'delete':
             self.active.remove(node)
@@ -174,20 +178,83 @@ class Topology:
     def required(self, node):
         result = set(self.static_links(node).values())
         if self.dynamic:
-            result |= {peer for peer in self.active - {node}
+            result |= {peer for peer in self.components()[node] - {node}
                        if (node in self.public or peer in self.public) and self.dynamic_pair(node, peer)}
         return result
+
+    def forget(self, node):
+        self.automatic = {edge: births for edge, births in self.automatic.items() if node not in edge}
+
+    def live_history(self):
+        return {edge: births for edge, births in self.automatic.items()
+                if self.dynamic and set(edge) <= self.active
+                and births == tuple(self.births[n] for n in edge)
+                and all(self.modes[n] != 'off' for n in edge)
+                and (not self.mixed or self.discovery_family[edge[0]] is not None
+                     and self.discovery_family[edge[0]] == self.discovery_family[edge[1]])
+                and edge[1] not in self.static_links(edge[0]).values()}
+
+    def automatic_evidence(self, observations, verified=False):
+        """Only reciprocal, materialized, active WG links can expand expectations.
+
+        In particular a saved Durable agreement or one stale WG handshake is
+        insufficient. The full audit and payload probes still have to pass.
+        No route or advertised neighbor count supplies an edge here.
+        """
+        components = self.components() if verified else None
+        receivers = {}
+        for node, obs in observations.items():
+            if node not in self.active or self.modes[node] == 'off':
+                continue
+            states = {link['interface']: link for link in obs['status']['runtime'].get('links', [])}
+            for name, link in obs['wg'].items():
+                state = states.get(name, {})
+                if (not name.startswith('vdl-') or name in obs.get('pending', ())
+                        or name in obs.get('retained', ())
+                        or (not verified and not state.get('active')) or not state.get('committed')
+                        or obs.get('ifindices', {}).get(name) not in obs.get('materialized_ifindices', ())
+                        or len(link['peers']) != 1):
+                    continue
+                peer = link['peers'][0]
+                if peer['handshake'] and {'0.0.0.0/0', '::/0'} <= set(peer['allowed']):
+                    receivers[node, link['public'], peer['public']] = True
+        edges = {}
+        for node, public, peer in receivers:
+            for remote, reverse_public, reverse_peer in receivers:
+                if (node < remote and public == reverse_peer and peer == reverse_public
+                        and (not self.mixed or self.discovery_family[node] is not None
+                             and self.discovery_family[node] == self.discovery_family[remote])
+                        and remote not in self.static_links(node).values()
+                        and (not verified or remote in components[node])):
+                    edges[node, remote] = self.births[node], self.births[remote]
+        return edges if self.dynamic else {}
+
+    def observe_automatic(self, observations):
+        self.automatic = self.live_history() | self.automatic_evidence(observations)
+
+    def verified(self, observations):
+        # Safe to retire unused edges only after the complete route/traffic
+        # audit passed; a disappearing link cannot make its own failure pass.
+        # Control-session loss alone does not discard a Link whose ordinary
+        # audit and forwarding checks passed. It cannot expand a partition.
+        self.automatic = self.automatic_evidence(observations, verified=True)
+
+    def plan_verified(self):
+        """--plan assumes required links pass; optional NAT/NAT is not predicted."""
+        self.automatic = self.live_history() | {
+            (node, peer): (self.births[node], self.births[peer])
+            for node in sorted(self.active) for peer in self.required(node)
+            if node < peer and peer not in self.static_links(node).values()}
 
     def want_pair(self, left, right):
         a, b = self.modes[left], self.modes[right]
         return (a == 'active' and b != 'off') or (b == 'active' and a != 'off')
 
     def components(self):
-        if self.dynamic and not self.mixed:
-            # One live public bootstrap suffices for membership. Extra NAT
-            # links are best-effort, but every member must remain reachable.
-            return {node: self.active.copy() for node in self.active}
-        graph = {node: self.required(node) for node in self.active}
+        graph = {node: set(self.static_links(node).values()) for node in self.active}
+        for left, right in self.live_history():
+            graph[left].add(right)
+            graph[right].add(left)
         components = {}
         for node in self.active:
             seen, pending = set(), [node]
@@ -203,6 +270,7 @@ class Topology:
         return {'active': sorted(self.active), 'dynamic': self.dynamic, 'public': sorted(self.public),
                 'bootstrap': self.boot, 'profiles': self.profiles, 'births': self.births, 'modes': self.modes,
                 'mixed': self.mixed, 'transit': sorted(self.transit), 'discovery_family': self.discovery_family,
+                'automatic_links': sorted(self.live_history()),
                 'components': [sorted(c) for c in sorted(set(map(frozenset, self.components().values())), key=lambda c: min(c))]}
 
 

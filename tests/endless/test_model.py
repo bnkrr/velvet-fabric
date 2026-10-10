@@ -26,7 +26,8 @@ def observation_fixture(dynamic=True, topology=None):
                  'allowed': ['0.0.0.0/0', '::/0']}]}
         peers = set(static.values())
         optional = (topology.active - {node} if node in topology.public else topology.active & topology.public) if dynamic else set()
-        neighbors = topology.required(node) | {peer for peer in optional if topology.dynamic_pair(node, peer)}
+        neighbors = topology.required(node) | {peer for peer in optional
+                    if peer in topology.components()[node] and topology.dynamic_pair(node, peer)}
         for remote in neighbors - peers:
             wg[f'vdl-{remote}'] = {'public': f'dynamic-{node}-{remote}', 'port': 31000 + remote, 'peers': [
                 {'public': f'dynamic-{remote}-{node}', 'handshake': 100, 'allowed': ['0.0.0.0/0', '::/0']}]}
