@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -13,6 +14,43 @@ import (
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/engine"
 	"github.com/velvet-fabric/velvet-fabric/internal/vfp/probe"
 )
+
+func TestPortPoolExcludesVFP(t *testing.T) {
+	const vfp = 42000
+	for _, mode := range []string{"fixed", "range", "system"} {
+		t.Run(mode, func(t *testing.T) {
+			p := &portPool{vfpPort: vfp}
+			choice := spec.PortChoice{}
+			switch mode {
+			case "fixed":
+				choice.Port = vfp
+			case "range":
+				choice.Range = spec.PortRange{First: vfp, Last: vfp + 1}
+			}
+			calls := 0
+			lease, err := p.bind(choice, vfp, func(port int) (int, error) {
+				calls++
+				if port == vfp {
+					t.Fatal("attempted explicit bind of the VFP port")
+				}
+				if port == 0 && calls == 1 {
+					return vfp, nil // The kernel can select it before VFP starts.
+				}
+				return vfp + 1, nil
+			})
+			if mode == "fixed" {
+				if err == nil || !strings.Contains(err.Error(), "reserved for VFP") || calls != 0 || len(p.leases) != 0 {
+					t.Fatalf("fixed VFP port: lease=%v err=%v calls=%d", lease, err, calls)
+				}
+			} else {
+				if err != nil || lease.port != vfp+1 || len(p.leases) != 1 {
+					t.Fatalf("VFP exclusion: lease=%v err=%v", lease, err)
+				}
+				lease.release()
+			}
+		})
+	}
+}
 
 func TestReserveProbeOccupiedPort(t *testing.T) {
 	occupied, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6zero})

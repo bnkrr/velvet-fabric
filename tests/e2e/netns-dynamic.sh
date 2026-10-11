@@ -366,29 +366,30 @@ grep -q '"event":"velvet-dynamic-attempt","status":"accepted"' "${runtime}/xc.lo
 
 # A complete eight-node mesh has seven Babel interfaces at every node: its
 # original static neighbors plus all complementary Dynamic Links. Interface
-# glob reconciliation is asynchronous with respect to VFP Link commit.
+# glob reconciliation and cleanup of declined Proposals are asynchronous with
+# respect to VFP Link commit. Require the final kernel set within the same bound.
 wait_babel_mesh() {
   node=$1; attempt=0
   while :; do
     ip netns exec "$(namespace "${node}")" "${velvetctl}" status --config "${runtime}/${node}.json" >"${runtime}/${node}.dynamic-status"
-    grep -q '"attached_interfaces":7' "${runtime}/${node}.dynamic-status" && return
+    interfaces=$(ip netns exec "$(namespace "${node}")" wg show interfaces)
+    set -- ${interfaces}
+    dynamic_count=0
+    for interface in "$@"; do
+      case ${interface} in vdl-*) dynamic_count=$((dynamic_count + 1));; esac
+    done
+    if grep -q '"attached_interfaces":7' "${runtime}/${node}.dynamic-status" &&
+       grep -q "\"dynamic_links\":$(expected_dynamic_links "${node}")" "${runtime}/${node}.dynamic-status" &&
+       test "$#" -eq 7 && test "${dynamic_count}" -eq "$(expected_dynamic_links "${node}")"; then
+      return
+    fi
     attempt=$((attempt + 1))
-    test "${attempt}" -lt 60 || { echo "${node}: babel-rs did not attach all seven mesh interfaces" >&2; exit 1; }
+    test "${attempt}" -lt 60 || { echo "${node}: mesh did not settle to seven Babel/kernel interfaces: ${interfaces}" >&2; exit 1; }
     sleep 1
   done
 }
 for node in ${nodes}; do
   wait_babel_mesh "${node}"
-  interfaces=$(ip netns exec "$(namespace "${node}")" wg show interfaces)
-  set -- ${interfaces}
-  dynamic_count=0
-  for interface in "$@"; do
-    case ${interface} in vdl-*) dynamic_count=$((dynamic_count + 1));; esac
-  done
-  test "$#" -eq 7 && test "${dynamic_count}" -eq "$(expected_dynamic_links "${node}")" || {
-    echo "${node}: unexpected kernel mesh interfaces: ${interfaces}" >&2
-    exit 1
-  }
 done
 
 # The Dynamic Link contributes an adjacent loopback route, and Babel exports

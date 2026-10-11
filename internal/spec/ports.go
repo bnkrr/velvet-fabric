@@ -39,6 +39,13 @@ func ChoosePorts(port *int, span *PortRange) PortChoice {
 	return PortChoice{}
 }
 
+func (p PortChoice) validateVFPPort(vfpPort int) error {
+	if p.Port == vfpPort || (p.Range.First == vfpPort && p.Range.Last == vfpPort) {
+		return errors.New("WireGuard port choice must leave a port other than fabric.vfp_port")
+	}
+	return nil
+}
+
 func (s *NodeSpec) PeerPorts(peer Peer) PortChoice {
 	if peer.ListenPort != nil || peer.PortRange != nil {
 		return ChoosePorts(peer.ListenPort, peer.PortRange)

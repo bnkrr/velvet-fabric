@@ -19,6 +19,8 @@ import (
 type portPool struct {
 	mu     sync.Mutex
 	leases map[int]*portLease
+	// Set before any allocation, including adoption of retained interfaces.
+	vfpPort int
 }
 type portLease struct {
 	pool *portPool
@@ -67,6 +69,10 @@ func (p *portPool) bind(choice spec.PortChoice, sticky int, bind func(int) (int,
 	}
 	var last error
 	for _, port := range candidates {
+		if port != 0 && port == p.vfpPort {
+			last = fmt.Errorf("UDP port %d is reserved for VFP", port)
+			continue
+		}
 		if p.leases[port] != nil {
 			continue
 		}
@@ -77,6 +83,10 @@ func (p *portPool) bind(choice spec.PortChoice, sticky int, bind func(int) (int,
 		}
 		if (port != 0 && actual != port) || actual < 1 || actual > 65535 {
 			return nil, errors.New("invalid allocated UDP port")
+		}
+		if actual == p.vfpPort {
+			last = fmt.Errorf("UDP port %d is reserved for VFP", actual)
+			continue
 		}
 		if p.leases[actual] != nil {
 			last = errors.New("allocated port reserved by another Link")

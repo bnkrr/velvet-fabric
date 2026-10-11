@@ -63,6 +63,11 @@ jobs:
       - name: Test static Link establishment
         working-directory: velvet-fabric
         run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd"
+      - name: Test Discovery socket scope and WG port handoff
+        working-directory: velvet-fabric
+        run: |
+          go test -c -o .local/bin/discovery.test ./internal/vfp/discovery
+          sudo unshare --net env VELVET_KERNEL_DISCOVERY_TEST=1 .local/bin/discovery.test -test.run '^TestKernelDiscovery' -test.v -test.timeout 30s
       - name: Test distinct control and WireGuard ports
         working-directory: velvet-fabric
         run: sudo sh tests/e2e/netns-static.sh "$PWD/.local/bin/velvetd" ports

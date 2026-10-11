@@ -1,6 +1,40 @@
 package spec
 
-import "testing"
+import (
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestWireGuardPortsExcludeVFP(t *testing.T) {
+	for _, vfp := range []int{DefaultVFPPort, 42000} {
+		for _, mode := range []string{"node-fixed", "peer-fixed", "node-only-range", "peer-only-range", "range-includes", "system"} {
+			t.Run(mode+"/"+strconv.Itoa(vfp), func(t *testing.T) {
+				s := validSpec(t)
+				s.Fabric.VFPPort = &vfp
+				s.Node.ListenPort = nil
+				s.Peers[0].ListenPort = nil
+				switch mode {
+				case "node-fixed":
+					s.Node.ListenPort = &vfp
+				case "peer-fixed":
+					s.Peers[0].ListenPort = &vfp
+				case "node-only-range":
+					s.Node.PortRange = &PortRange{First: vfp, Last: vfp}
+				case "peer-only-range":
+					s.Peers[0].PortRange = &PortRange{First: vfp, Last: vfp}
+				case "range-includes":
+					s.Node.PortRange = &PortRange{First: vfp - 1, Last: vfp + 1}
+				}
+				err := s.Validate()
+				valid := mode == "range-includes" || mode == "system"
+				if valid && err != nil || !valid && (err == nil || !strings.Contains(err.Error(), "fabric.vfp_port")) {
+					t.Fatalf("valid=%v: %v", valid, err)
+				}
+			})
+		}
+	}
+}
 
 func TestPortModesAndReceiveOnlyStatic(t *testing.T) {
 	s := validSpec(t)

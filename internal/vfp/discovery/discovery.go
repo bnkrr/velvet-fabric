@@ -62,8 +62,7 @@ type Socket struct {
 	interfaceName  string
 	receiver       *net.UDPConn
 	receivePacket  *ipv6.PacketConn
-	sender         *net.UDPConn
-	sendPacket     *ipv6.PacketConn
+	local          net.IP
 	destination    *net.UDPAddr
 }
 
@@ -98,27 +97,18 @@ func Listen(interfaceName string, local netip.Addr, port int) (*Socket, error) {
 		_ = receiver.Close()
 		return nil, fmt.Errorf("enable discovery interface metadata: %w", err)
 	}
-	sender, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IP(local.AsSlice()), Zone: zone})
-	if err != nil {
-		_ = receiver.Close()
-		return nil, fmt.Errorf("bind discovery sender: %w", err)
-	}
-	sendPacket := ipv6.NewPacketConn(sender)
-	if err := sendPacket.SetMulticastInterface(ifi); err != nil {
-		_ = sender.Close()
-		_ = receiver.Close()
-		return nil, fmt.Errorf("select discovery multicast interface: %w", err)
-	}
-	if err := sendPacket.SetMulticastHopLimit(1); err != nil {
-		_ = sender.Close()
+	if err := receivePacket.SetMulticastHopLimit(1); err != nil {
 		_ = receiver.Close()
 		return nil, fmt.Errorf("set discovery hop limit: %w", err)
 	}
-	_ = sendPacket.SetMulticastLoopback(false)
+	if err := receivePacket.SetMulticastLoopback(false); err != nil {
+		_ = receiver.Close()
+		return nil, fmt.Errorf("disable discovery multicast loopback: %w", err)
+	}
 	return &Socket{
 		interfaceIndex: ifi.Index, interfaceName: interfaceName,
 		receiver: receiver, receivePacket: receivePacket,
-		sender: sender, sendPacket: sendPacket, destination: destination,
+		local: net.IP(local.AsSlice()), destination: destination,
 	}, nil
 }
 
@@ -140,13 +130,22 @@ func bindToDevice(interfaceName string, reuseAddress bool) func(string, string, 
 }
 
 func (s *Socket) Close() error {
-	_ = s.sender.Close()
 	return s.receiver.Close()
+}
+
+// Use the existing VFP binding for both directions. An ephemeral sender could
+// steal a reserved WG port between closing a probe and the kernel WG bind.
+// Pin the source and interface because the multicast receiver binds [::].
+func (s *Socket) write(packet []byte, destination *net.UDPAddr) error {
+	_, err := s.receivePacket.WriteTo(packet, &ipv6.ControlMessage{
+		Src: s.local, IfIndex: s.interfaceIndex, HopLimit: 1,
+	}, destination)
+	return err
 }
 
 func (s *Socket) SendHello() error {
 	packet, _ := Encode(Hello)
-	if _, err := s.sender.WriteToUDP(packet[:], s.destination); err != nil {
+	if err := s.write(packet, s.destination); err != nil {
 		return fmt.Errorf("send discovery Hello: %w", err)
 	}
 	return nil
@@ -155,7 +154,7 @@ func (s *Socket) SendHello() error {
 func (s *Socket) SendAck(remote netip.Addr) error {
 	packet, _ := Encode(HelloAck)
 	destination := &net.UDPAddr{IP: net.IP(remote.AsSlice()), Port: s.destination.Port, Zone: strconv.Itoa(s.interfaceIndex)}
-	if _, err := s.sender.WriteToUDP(packet[:], destination); err != nil {
+	if err := s.write(packet, destination); err != nil {
 		return fmt.Errorf("send discovery Hello ACK: %w", err)
 	}
 	return nil
@@ -167,8 +166,7 @@ func (s *Socket) Send(remote netip.Addr, m message.Message) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.sender.WriteToUDP(packet, &net.UDPAddr{IP: net.IP(remote.AsSlice()), Port: s.destination.Port, Zone: strconv.Itoa(s.interfaceIndex)})
-	return err
+	return s.write(packet, &net.UDPAddr{IP: net.IP(remote.AsSlice()), Port: s.destination.Port, Zone: strconv.Itoa(s.interfaceIndex)})
 }
 
 // Read validates both the receiving interface and the link-local scope. Public

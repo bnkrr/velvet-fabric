@@ -72,6 +72,7 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 	compiled := *r.Desired
 	compiled.Links = append([]reconcile.LinkPlan(nil), r.Desired.Links...)
 	r.Desired = &compiled
+	r.ports.vfpPort = r.Desired.VFPPort
 	if r.Desired.Babel == nil {
 		root := r.PolicyStateDir
 		if root == "" {

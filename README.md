@@ -204,6 +204,10 @@ level; `node` supplies the default for automatic Links and Peers, and an
 explicit Peer choice overrides it, including an explicit zero. Fixed Peer
 ports can lie outside the node range. WG, primary probes, auxiliary probes and
 observers share reservations; range exhaustion never falls back outside it.
+The effective VFP UDP port is excluded from WG allocation; a fixed choice or
+single-port range equal to it is invalid. Link-local discovery and liveness
+send from their existing VFP listener, with the Link's source address and
+interface, rather than allocating another ephemeral UDP port.
 The main probe keeps its reservation during the handoff to WG. Existing ports
 are preferred during a runtime; Durable records retain their actual nonzero
 port across restarts. `velvetctl resolve` shows zero for ports allocated later.

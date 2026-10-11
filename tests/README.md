@@ -297,6 +297,18 @@ response timer and cleanup checks while requiring future retry eligibility.
 
 ## Unified Link and Durable acceptance
 
+The privileged CI Discovery socket regression leaves only one ephemeral UDP
+port free between a temporary reservation and a real WG bind. Discovery must
+not consume it. A two-Link namespace fixture also checks fixed source ports,
+explicit link-local source/interface selection, Hello/ACK and Ping/Pong,
+multicast loop suppression and coexistence with the loopback policy socket.
+Build locally and run the binary in a disposable VM namespace:
+
+```sh
+go test -c -o discovery.test ./internal/vfp/discovery
+sudo unshare --net env VELVET_KERNEL_DISCOVERY_TEST=1 ./discovery.test -test.run '^TestKernelDiscovery' -test.v -test.timeout 30s
+```
+
 The shared health loop admits Static, Dynamic and Durable Links to Babel only
 following WG/VFP establishment and local installation. Unit tests exercise
 resource generations, cleanup failure retaining a port lease, stale callbacks,

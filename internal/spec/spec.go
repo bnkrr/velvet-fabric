@@ -309,6 +309,9 @@ func (s *NodeSpec) Validate() error {
 	if err := ValidatePorts(s.Node.ListenPort, s.Node.PortRange); err != nil {
 		problems = append(problems, "node: "+err.Error())
 	}
+	if err := ChoosePorts(s.Node.ListenPort, s.Node.PortRange).validateVFPPort(s.Fabric.EffectiveVFPPort()); err != nil {
+		problems = append(problems, "node: "+err.Error())
+	}
 	if s.DynamicLinks != nil && s.DynamicLinks.Durable != nil {
 		if err := s.DynamicLinks.Durable.Validate(); err != nil {
 			problems = append(problems, err.Error())
@@ -348,6 +351,9 @@ func (s *NodeSpec) Validate() error {
 			problems = append(problems, where+": "+err.Error())
 		}
 		choice := s.PeerPorts(peer)
+		if err := choice.validateVFPPort(s.Fabric.EffectiveVFPPort()); err != nil {
+			problems = append(problems, where+": "+err.Error())
+		}
 		if choice.Port > 0 {
 			if other, ok := ports[choice.Port]; ok {
 				problems = append(problems, fmt.Sprintf("%s.listen_port is already used by peer %q", where, other))
