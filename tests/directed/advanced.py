@@ -219,8 +219,14 @@ def family_change(r):
         old_pids = {n: r.nodes[n]['proc'].pid for n in r.topology.active}
         for n in r.topology.active:
             old_babel = r.nodes[n]['resources']['babel']['pid']
+            path = r.runtime / f'{n}.json'
+            previous = json.loads(path.read_text())
             generation = r.command(n)['config_generation']
             r.write_config(n)
+            # A receiver without bootstrap hints has the same dual-stack
+            # config. Equivalent reloads correctly leave generation unchanged.
+            if json.loads(path.read_text()) == previous:
+                continue
             r.nodes[n]['proc'].send_signal(signal.SIGHUP)
             until = time.monotonic() + 15
             while r.command(n)['config_generation'] <= generation:
