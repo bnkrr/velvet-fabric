@@ -36,14 +36,14 @@ go test ./internal/vfp/message -run '^$' -fuzz '^FuzzMessageDecode$' -fuzztime 5
 go test ./internal/vfp/probe -run '^$' -fuzz '^FuzzPublicProbeEnvelope$' -fuzztime 5s
 ```
 
-CI runs `go test -race ./...`. Simulation needs no privileges, Babel binary or
+CI runs `go test -race ./...` and the three bounded fuzz checks above.
+Simulation needs no privileges, Babel binary or
 files under `.local/`. Public UDP transport tests need permission to open
 ordinary IPv4 and IPv6 loopback UDP sockets. Silence, correct source observation,
 replay rejection and port release are exercised for both families. Envelope
 tests reject a mismatched source/destination family without consuming the
 valid packet sequence. Fuzzing includes valid IPv4/IPv6 seeds with stable test
-credentials across workers. Fuzzing is an additional bounded check, not part
-of the default CI race command.
+credentials across workers. Fuzzing runs separately from the race command.
 
 `internal/inference/survey.go` stores ordered `(local, remote, seen)` samples
 and produces candidate batches and finite measurement plans. Infer performs no
@@ -196,7 +196,8 @@ simultaneous handshake collisions with both Proposal directions. Failed cases al
 timeline of WG state, interface addresses, UDP sockets and daemon events;
 private and preshared keys are hashed before retention.
 
-The privileged CI suite and VM helper include all 37 cases:
+The privileged CI suite and VM helper include these 37 cases and the four
+Durable scenarios described below (41 cases in total):
 
 ```sh
 tests/e2e/run-on-vm.sh all
@@ -210,7 +211,7 @@ routing, ownership, multi-Plan forwarding, Babel convergence and reload.
 
 ## Validation limits
 
-The 37-case netns suite uses specific Linux topologies, not every mapping/filter pair
+The netns suite uses specific Linux topologies, not every mapping/filter pair
 in the simulator. Mapping expiry, hairpinning, nested NAT, arbitrary route
 changes, background mapping contention and long-duration stability are not
 established by this suite. IPv6 coverage uses one chosen underlay family per
