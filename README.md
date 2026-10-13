@@ -86,6 +86,9 @@ encrypted envelope; unauthorized datagrams receive no response.
 
 ## Quick start
 
+For prebuilt archives and systemd installation, see the
+[binary installation guide](packaging/README.md) and [migration notes](CHANGELOG.md).
+
 For an offline, multi-node configuration form, open
 [`web/config.html`](web/config.html) directly in a browser. It supports the full
 NodeSpec, static and Babel routing examples, local key generation, validation
@@ -374,13 +377,13 @@ by interface name. Each Link retains its own subnet routes. Removing the chosen
 Link or revoking its adjacency lets another committed Link take over; control
 session loss alone preserves the choice.
 
-Full crash recovery requires a Babel build with FIB recovery support; older
-v0.6.0 releases lack it. The accompanying Babel implementation defaults to clear
+Fabric 0.6.0 targets Babel 0.7.0, including its FIB recovery support; older
+Babel 0.6.0 releases lack it. Babel defaults to clear
 on normal exit and a 240-second startup recovery window after a crash. It adopts
 old owned IPv4/IPv6 routes until fresh routes confirm them or their original
 deadline expires; repeated crashes do not renew the deadline. Optional retain
 exit is implemented in Babel but Fabric leaves the default clear policy enabled.
-Build the updated Babel checkout alongside Fabric for this behavior. Remote
+Install the compatible Babel release separately, or build the pinned revision. Remote
 Babel timers still apply; this is not a guarantee of uninterrupted forwarding.
 
 `babel-rs` uses UDP/6696 and `ff02::1:6` on every managed WireGuard interface.

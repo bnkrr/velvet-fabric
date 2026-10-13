@@ -159,7 +159,6 @@ func main() {
 		statusMu.RUnlock()
 		if active != nil {
 			value.Runtime = active.runner.Status()
-
 		}
 		return value
 	}

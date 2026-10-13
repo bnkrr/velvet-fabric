@@ -18,7 +18,8 @@ publishing its GitHub Release happens afterward.
    commit and an unused tag, followed by validation of that tag.
 4. Build archives from a clean export of that exact commit, using the release
    version and `-trimpath -buildvcs=false`. Include both binaries, documentation,
-   packaging examples, `VERSION` and `BUILDINFO.json`; record the commit,
+   packaging examples, the offline configuration editor, `CHANGELOG.md`,
+   `VERSION` and `BUILDINFO.json`; record the commit,
    toolchain, architecture and compatible Babel version. Normalize archive
    ownership and exclude local paths, credentials and deployment identifiers.
 5. Check archive contents and SHA256 checksums. Smoke-test the actual amd64
