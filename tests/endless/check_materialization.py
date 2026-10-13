@@ -70,6 +70,18 @@ def main():
         assert stats['collector_alive'] and stats['error'] is None, stats
         assert stats['receive_buffer_bytes'] >= 2 * stats['requested_buffer_bytes'], stats
         print('PASS: background collector consumed 20000 kernel events without sampling:', json.dumps(stats))
+
+        # Bound the capacity requirement independently of CPU scheduling: hold
+        # the consumer while the entire burst arrives, then require every event.
+        # Payload length alone underestimates kernel skb accounting substantially.
+        before = stats['routes_by_protocol'].get('new:203', 0)
+        with observer.lock:
+            run('ip', '-n', namespace, '-6', '-batch', '-', input=burst)
+        observer.read()
+        stats = observer.statistics()
+        assert stats['routes_by_protocol'].get('new:203', 0) == before + 20000, stats
+        assert stats['collector_alive'] and stats['error'] is None, stats
+        print('PASS: complete 20000-event burst survives a paused consumer:', json.dumps(stats))
         # Remove the burst-only route before checking tentative FIB admission.
         ip('-6', 'route', 'del', 'fd78:e2ee::99/128', 'table', '20000')
 

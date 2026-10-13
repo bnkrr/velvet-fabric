@@ -29,6 +29,11 @@ class MaterializationTests(unittest.TestCase):
         observer.socket = Mock()
         observer.socket.recvmsg.side_effect = [*(
             (data, [], 0, (0, 0)) for data in datagrams), BlockingIOError()]
+        def receive_into(buffers):
+            data, ancillary, flags, sender = observer.socket.recvmsg()
+            buffers[0][:len(data)] = data
+            return len(data), ancillary, flags, sender
+        observer.socket.recvmsg_into.side_effect = receive_into
         return observer
 
     def test_parallel_route_replacement_before_first_snapshot(self):

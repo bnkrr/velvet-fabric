@@ -64,8 +64,12 @@ class MaterializedLinks:
         self.stop = threading.Event()
         self.thread = None
         self.error = None
-        self.requested_buffer = 1024 * 1024
+        # Netlink queues account for skb overhead, not just payload bytes.
+        # Allow the finite 20k-event regression burst even when the consumer is
+        # briefly descheduled. This is a per-socket limit, allocated on demand.
+        self.requested_buffer = 16 * 1024 * 1024
         self.receive_buffer = 0
+        self.datagram_buffer = bytearray(1024 * 1024)
         self.counts = Counter()
         self.routes = Counter()  # Message kind × u8 protocol: at most 512 keys.
         self.started = self.last_drain = time.monotonic()
@@ -140,7 +144,7 @@ class MaterializedLinks:
         self.last_drain = now
         for _ in range(4096):
             try:
-                data, _, flags, sender = self.socket.recvmsg(1024 * 1024)
+                size, _, flags, sender = self.socket.recvmsg_into([self.datagram_buffer])
             except BlockingIOError:
                 return True
             # ENOBUFS, truncation, malformed messages and overrun are fatal:
@@ -148,8 +152,8 @@ class MaterializedLinks:
             if flags & socket.MSG_TRUNC or sender[0] != 0:
                 raise RuntimeError('invalid kernel materialization observation')
             self.counts['datagrams'] += 1
-            self.counts['bytes'] += len(data)
-            self.consume(data)
+            self.counts['bytes'] += size
+            self.consume(memoryview(self.datagram_buffer)[:size])
         # Yield the lock between batches in the background collector so close
         # and snapshots cannot starve. A full batch is not evidence of loss.
         self.counts['full_batches'] += 1

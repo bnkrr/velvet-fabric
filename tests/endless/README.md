@@ -256,9 +256,12 @@ The independent model requires:
   verification. A background reader continuously consumes each socket while
   status queries and payload probes run. Snapshots synchronize with that reader;
   any loss remains a fatal error on subsequent reads. The root fixture requests
-  a 1 MiB receive buffer and checks the effective kernel value (2 MiB including
-  accounting), using a per-socket override if the system limit clamps it. It does
-  not change host sysctls. Batches yield between reads instead of treating 4,096
+  a 16 MiB receive limit and checks the effective kernel value (32 MiB including
+  accounting), using a per-socket override if the system limit clamps it. This
+  accommodates the 20,000-event burst with its kernel skb overhead; queue memory
+  is allocated on demand. A reusable datagram buffer avoids allocating 1 MiB
+  for every small notification. It does not change host sysctls. Batches yield
+  between reads instead of treating 4,096
   queued messages as loss. Shutdown joins the reader before closing its socket.
   A dynamic incarnation never materialized must carry no FIB route
   and have no Babel UDP socket. This evidence is independent of daemon up claims;
@@ -436,7 +439,7 @@ recorded nodes, NAT routers, veths, bridge, processes and UUID directories.
 tests/endless/run-on-vm.sh --plan --nodes 16 --min-nodes 8 --rounds 10
 # Negative controls and model/NAT framing unit tests:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
-# Root-only, background drain of 20,000 real route events, interface recreation,
+# Root-only, 20,000-event bursts with both running and paused readers, interface recreation,
 # premature Babel rejection, and idempotent IPv4/IPv6 Fabric route maintenance
 # with repair of external deletion/mutation and stable parallel-Link fallback
 # ownership (also part of hosted E2E CI):
