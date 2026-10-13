@@ -10,6 +10,8 @@
   independent timer that retires this instance's resources after prolonged
   local recovery failure. Pair this release with Babel 0.7.0 for bounded FIB
   recovery; `tests/babel-revision` records the exact tested source.
+- Preserve monotonic time in runtime watchdog progress checks so system clock
+  corrections do not change the stall deadline.
 - Place automatic neighbor-loopback fallbacks below usable Babel routes and
   above Babel unreachable entries. Keep explicit static-route precedence and
   stabilize fallback ownership across parallel Links. Avoid rewriting unchanged

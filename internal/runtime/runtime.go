@@ -26,7 +26,7 @@ type Event struct {
 }
 
 type Runner struct {
-	progress       atomic.Int64
+	progress       atomic.Pointer[time.Time]
 	links          linkManager
 	ports          portPool
 	durable        *durableManager
@@ -129,7 +129,7 @@ func (r *Runner) Run(ctx context.Context, once bool) error {
 		r.dynamic.stop()
 	}()
 	workers.Go(func() { r.durable.run(ctx) })
-	r.progress.Store(time.Now().UnixNano())
+	r.markProgress(time.Now())
 	r.signalReady(nil)
 
 	established := make(chan struct{}, len(r.Desired.Links))
@@ -248,7 +248,7 @@ func (r *Runner) maintain(ctx context.Context) {
 				continue
 			}
 			if r.maintainMaterialized(ctx) {
-				r.progress.Store(time.Now().UnixNano())
+				r.markProgress(time.Now())
 			}
 		}
 	}
@@ -306,7 +306,13 @@ func (r *Runner) InheritDynamic(previous *Runner) {
 }
 
 // Progress is advanced by completed maintenance, not by the notification ticker.
+func (r *Runner) markProgress(now time.Time) {
+	// Keep the monotonic reading: wall-clock corrections must not change the
+	// watchdog's elapsed time since successful maintenance.
+	r.progress.Store(&now)
+}
+
 func (r *Runner) Progressing(now time.Time) bool {
 	last := r.progress.Load()
-	return last != 0 && now.Sub(time.Unix(0, last)) < max(3*r.Interval, 15*time.Second)
+	return last != nil && now.Sub(*last) < max(3*r.Interval, 15*time.Second)
 }
