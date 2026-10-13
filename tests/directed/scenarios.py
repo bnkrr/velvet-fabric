@@ -35,12 +35,15 @@ def hits(r, node, name):
     return sum(e.get('counter', {}).get('packets', 0) for e in data['nftables'])
 
 
-def delete_table(r, node, name):
+def delete_table(r, node, name, family='inet'):
     # Teardown remains bounded but must run after a phase deadline/cancellation.
     previous = r.deadline, r.stop_signal
     r.deadline, r.stop_signal = None, None
     try:
-        r.ns(node, 'nft', 'delete', 'table', 'inet', name)
+        if node is None:
+            r.run('nft', 'delete', 'table', family, name)
+        else:
+            r.ns(node, 'nft', 'delete', 'table', family, name)
     finally:
         r.deadline, r.stop_signal = previous
 
@@ -224,9 +227,11 @@ def partition(r):
         assert dropped, 'partition rules never matched'
         r.record('partition-verified', dropped=dropped)
     finally:
-        r.run('nft', 'delete', 'table', 'bridge', name)
-        r.root_tables.discard(('bridge', name))
-        r.topology.groups = None
+        try:
+            delete_table(r, None, name, 'bridge')
+            r.root_tables.discard(('bridge', name))
+        finally:
+            r.topology.groups = None
     r.verify()
     assert identities == {n: (i['proc'].pid, i['resources']['babel']['pid']) for n, i in r.nodes.items()}, 'partition recovery restarted a daemon'
     data(r, label='merged')

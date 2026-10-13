@@ -336,7 +336,10 @@ def audit(topology, observations):
                 candidate.startswith('vdl-') and candidate not in observations[remote].get('pending', ())
                 and any(p['public'] == link['public'] for p in value['peers'])
                 for candidate, value in observations[remote]['wg'].items())
-            obsolete = name not in static if name in configured else not reciprocal_present
+            # A partition can leave both committed WG interfaces intact while
+            # neither control session nor the Babel adjacency remains usable.
+            obsolete = (name not in static if name in configured else
+                        remote not in components[node] or not reciprocal_present)
             if (obsolete and materialized and state.get('committed') and not state.get('active')
                     and remote is not None and remote != node
                     and {'0.0.0.0/0', '::/0'} <= set(peer['allowed'])):
