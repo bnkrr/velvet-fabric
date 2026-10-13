@@ -23,11 +23,11 @@ diagnose() {
   for node in ${nodes}; do
     ns=$(namespace "${node}")
     test ! -f "${runtime}/${node}.log" || cat "${runtime}/${node}.log" >&2
-    ip -n "${ns}" -details link show 2>/dev/null >&2 || true
-    ip -n "${ns}" -details route show table all 2>/dev/null >&2 || true
-    ip -n "${ns}" -6 -details route show table all 2>/dev/null >&2 || true
-    ip -n "${ns}" -details rule show 2>/dev/null >&2 || true
-    ip -n "${ns}" -6 -details rule show 2>/dev/null >&2 || true
+    ip -n "${ns}" -details link show >&2 2>/dev/null || true
+    ip -n "${ns}" -details route show table all >&2 2>/dev/null || true
+    ip -n "${ns}" -6 -details route show table all >&2 2>/dev/null || true
+    ip -n "${ns}" -details rule show >&2 2>/dev/null || true
+    ip -n "${ns}" -6 -details rule show >&2 2>/dev/null || true
   done
 }
 

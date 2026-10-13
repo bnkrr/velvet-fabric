@@ -4,7 +4,7 @@ set -eu
 velvetd=${1:?usage: netns-core-crud.sh /path/to/velvetd}
 test -x "${velvetd}" || { echo "velvetd is not executable: ${velvetd}" >&2; exit 2; }
 test "$(id -u)" -eq 0 || { echo "netns E2E must run as root" >&2; exit 2; }
-for command in ip wg ping awk grep mktemp tr wc cut kill; do command -v "${command}" >/dev/null || { echo "missing command: ${command}" >&2; exit 2; }; done
+for command in ip wg ping awk grep mktemp tr wc cut kill python3; do command -v "${command}" >/dev/null || { echo "missing command: ${command}" >&2; exit 2; }; done
 
 suffix=$$
 ns_a="vc-a-${suffix}"
@@ -18,11 +18,11 @@ pid_c=
 
 diagnose_namespace() {
   namespace=$1
-  ip -n "${namespace}" -details link show 2>/dev/null >&2 || true
-  ip -n "${namespace}" -details route show table all 2>/dev/null >&2 || true
-  ip -n "${namespace}" -6 -details route show table all 2>/dev/null >&2 || true
-  ip -n "${namespace}" -details rule show 2>/dev/null >&2 || true
-  ip -n "${namespace}" -6 -details rule show 2>/dev/null >&2 || true
+  ip -n "${namespace}" -details link show >&2 2>/dev/null || true
+  ip -n "${namespace}" -details route show table all >&2 2>/dev/null || true
+  ip -n "${namespace}" -6 -details route show table all >&2 2>/dev/null || true
+  ip -n "${namespace}" -details rule show >&2 2>/dev/null || true
+  ip -n "${namespace}" -6 -details rule show >&2 2>/dev/null || true
 }
 
 cleanup() {
@@ -63,15 +63,40 @@ PYCLEAN
 trap cleanup EXIT INT TERM
 
 wait_cluster() {
-  attempt=0
-  while kill -0 "${pid_a}" 2>/dev/null || kill -0 "${pid_b}" 2>/dev/null || kill -0 "${pid_c}" 2>/dev/null; do
-    attempt=$((attempt + 1))
-    if test "${attempt}" -ge 40; then
-      echo "velvetd cluster did not establish every Link" >&2
-      return 1
-    fi
-    sleep 1
-  done
+  # --once exits on local completion, which can close a control session before
+  # its peer finishes. Keep all nodes running until the whole fixture is ready.
+  python3 - "${a_config}" "${runtime}/b.json" "${runtime}/c.json" <<'PYREADY'
+import json, socket, sys, time
+from pathlib import Path
+configs = [json.loads(Path(path).read_text()) for path in sys.argv[1:]]
+deadline = time.monotonic() + 40
+last = None
+while time.monotonic() < deadline:
+    ready = True
+    for config in configs:
+        uid = config['node']['uid']['uuid']
+        try:
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.settimeout(0.5)
+                sock.connect(f'/run/velvet/{uid}/velvetd.ctl')
+                with sock.makefile('rwb') as stream:
+                    json.loads(stream.readline())
+                    stream.write(b'{"api_version":1,"id":1,"command":"status","params":{}}\n')
+                    stream.flush()
+                    response = json.loads(stream.readline())
+            status = response['result']
+            assert response['ok'] and status['ready'], response
+            actual = status['runtime']['established_links']
+            assert actual == len(config['peers']), (uid, actual)
+        except (OSError, ValueError, KeyError, AssertionError) as error:
+            ready, last = False, str(error)
+    if ready:
+        break
+    time.sleep(0.25)
+else:
+    raise SystemExit(f'velvetd cluster did not establish every Link: {last}')
+PYREADY
+  kill "${pid_a}" "${pid_b}" "${pid_c}"
   wait "${pid_a}"
   wait "${pid_b}"
   wait "${pid_c}"
@@ -83,13 +108,14 @@ wait_cluster() {
 start_cluster() {
   a_config=$1
   run_name=$2
-  ip netns exec "${ns_a}" "${velvetd}" --config "${a_config}" --once >"${runtime}/a-${run_name}.log" 2>&1 &
+  ip netns exec "${ns_a}" "${velvetd}" --config "${a_config}" >"${runtime}/a-${run_name}.log" 2>&1 &
   pid_a=$!
-  ip netns exec "${ns_b}" "${velvetd}" --config "${runtime}/b.json" --once >"${runtime}/b-${run_name}.log" 2>&1 &
+  ip netns exec "${ns_b}" "${velvetd}" --config "${runtime}/b.json" >"${runtime}/b-${run_name}.log" 2>&1 &
   pid_b=$!
-  ip netns exec "${ns_c}" "${velvetd}" --config "${runtime}/c.json" --once >"${runtime}/c-${run_name}.log" 2>&1 &
+  ip netns exec "${ns_c}" "${velvetd}" --config "${runtime}/c.json" >"${runtime}/c-${run_name}.log" 2>&1 &
   pid_c=$!
   wait_cluster
+  echo "velvet Core CRUD cluster ${run_name}: ready and stopped"
 }
 
 umask 077

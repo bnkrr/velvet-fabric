@@ -18,12 +18,12 @@ cleanup() {
 	if test "${status}" -ne 0; then
 		test ! -f "${runtime}/a.log" || cat "${runtime}/a.log" >&2
 		test ! -f "${runtime}/b.log" || cat "${runtime}/b.log" >&2
-		ip -n "${ns_a}" -details link show 2>/dev/null >&2 || true
-		ip -n "${ns_b}" -details link show 2>/dev/null >&2 || true
-		ip -n "${ns_a}" -6 -details route show table all 2>/dev/null >&2 || true
-		ip -n "${ns_b}" -6 -details route show table all 2>/dev/null >&2 || true
-		ip -n "${ns_a}" -6 -details rule show 2>/dev/null >&2 || true
-		ip -n "${ns_b}" -6 -details rule show 2>/dev/null >&2 || true
+		ip -n "${ns_a}" -details link show >&2 2>/dev/null || true
+		ip -n "${ns_b}" -details link show >&2 2>/dev/null || true
+		ip -n "${ns_a}" -6 -details route show table all >&2 2>/dev/null || true
+		ip -n "${ns_b}" -6 -details route show table all >&2 2>/dev/null || true
+		ip -n "${ns_a}" -6 -details rule show >&2 2>/dev/null || true
+		ip -n "${ns_b}" -6 -details rule show >&2 2>/dev/null || true
 	fi
   test -z "${port_holder}" || kill "${port_holder}" 2>/dev/null || true
   test -z "${pid_a}" || kill "${pid_a}" 2>/dev/null || true
