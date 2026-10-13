@@ -22,6 +22,8 @@
   NodeSpec editor and a local helper for building Fabric with pinned Babel.
 - Extend regression coverage for systemd failures, dual-stack endpoint selection,
   Durable cold recovery, kernel ownership and repeated membership changes.
+- Build releases with Go 1.27.2 and update the Go networking dependencies to
+  their current security revisions.
 
 ### Upgrade from 0.5.1
 
