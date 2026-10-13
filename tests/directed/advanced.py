@@ -87,17 +87,15 @@ def restart(r, node):
 
 def observer(r):
     if r.kind == 'observer-loss':
-        # First gate proves the listener was prepared and actual measurement
-        # packets reached it. Remove it, then interrupt after a received sample.
-        delete_table(r, 0, 'observer_gate')
-        r.ns(0, 'tc', 'qdisc', 'add', 'dev', 'wan', 'root', 'netem', 'delay', '500ms')
+        # Keep measurement UDP blocked from the first packet. Installing this
+        # gate after a prepared log races the sends, and delaying the entire
+        # bootstrap WAN also delays routed control to the fallback observer.
         await_event(r, lambda: bool(r.find_events(2, 'velvet-udp-observe', 'prepared', 0)), 'observer 0 ready')
-        table(r, 0, 'observer_gate', f'meta l4proto udp {MAGIC}')
         delete_table(r, 1, 'observer_gate')
         wait_for(r, lambda: hits(r, 0, 'observer_gate') > 0 and
                  bool(r.find_events(2, 'velvet-udp-observe', 'measured', 1)), 90,
                  'measurement loss did not fall back to second observer')
-        r.ns(0, 'tc', 'qdisc', 'del', 'dev', 'wan', 'root')
+        r.record('observer-measurement-loss-verified', dropped=hits(r, 0, 'observer_gate'), fallback=1)
         delete_table(r, 0, 'observer_gate')
     elif r.kind == 'observer-nat':
         wait_for(r, lambda: r.pair_finished(2, 3) and
