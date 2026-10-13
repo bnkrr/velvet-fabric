@@ -553,6 +553,17 @@ def scenario(case):
             print(f"failure evidence retained in {runtime}", file=sys.stderr)
 
 
+def interrupted(signum, _frame):
+    # SSH disconnects and test-runner cancellation must still execute the
+    # scenario's finally block, including its independent Babel children.
+    for stopped_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(stopped_signal, signal.SIG_IGN)
+    raise KeyboardInterrupt(f"interrupted by signal {signum}")
+
+
+for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(signum, interrupted)
+
 selected = sys.argv[3:] or [case for case in CASES if not CASES[case].get("long_failure")]
 unknown = set(selected) - CASES.keys()
 if unknown:
