@@ -32,7 +32,10 @@ class DirectedTopology(Topology):
 
     def static_links(self, node):
         links = super().static_links(node)
-        return {name: peer for name, peer in links.items() if peer in self.components()[node]}
+        if not self.groups:
+            return links
+        group = next(group for group in self.groups if node in group)
+        return {name: peer for name, peer in links.items() if peer in group}
 
     def components(self):
         return ({n: next(set(g) for g in self.groups if n in g) for n in self.active}

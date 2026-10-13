@@ -31,10 +31,22 @@ jobs:
       - run: go test -race ./...
       - name: Check endless E2E verifier negative controls
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/endless -v
+      - name: Check directed fault scenarios
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/directed -v
       - name: Check portable VM wrappers
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/vm -v
       - name: Check local binary helper
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/build -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Check offline configuration generator against velvetctl
+        run: |
+          go build -o "$RUNNER_TEMP/velvetctl" ./cmd/velvetctl
+          VELVET_CONFIG_CTL="$RUNNER_TEMP/velvetctl" node --test tests/web/config.test.cjs
       - name: Fuzz VFP frames
-        run: go test ./internal/vfp/message -run '^$' -fuzz '^FuzzMessageDecode$' -fuzztime=5s -parallel=2
+        run: |
+          go test ./internal/vfp/message -run '^$' -fuzz '^FuzzMessageDecode$' -fuzztime=5s -parallel=2
+          go test ./internal/vfp/message -run '^$' -fuzz '^FuzzDurableDecode$' -fuzztime=5s -parallel=2
+          go test ./internal/vfp/probe -run '^$' -fuzz '^FuzzPublicProbeEnvelope$' -fuzztime=5s -parallel=2
       - run: CGO_ENABLED=0 go build ./cmd/...

@@ -45,6 +45,14 @@ class CoverageTests(unittest.TestCase):
         self.assertIn(1, t.required(0))
         self.assertIn(3, t.required(2))
 
+    def test_without_fault_groups_reachability_follows_actual_bootstrap_graph(self):
+        t = DirectedTopology([('eim', 'eif', 'preserve')] * 2)
+        self.assertEqual(t.components()[2], {0, 1, 2, 3})
+        t.boot[1], t.boot[3] = None, 1
+        self.assertEqual(t.components(), {0: {0, 2}, 2: {0, 2}, 1: {1, 3}, 3: {1, 3}})
+        self.assertEqual(t.required(2), {0})
+        self.assertEqual(t.required(3), {1})
+
     def test_observer_resource_checks_reject_leaked_sockets_and_unbounded_growth(self):
         snapshot = dict(fds=50, probe_listeners=[], routed_inbound=[])
         assert_quiescent(snapshot, 14)
