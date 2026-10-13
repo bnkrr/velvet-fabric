@@ -16,8 +16,9 @@ jobs:
   linux-netns:
     name: Linux netns fabric
     runs-on: ubuntu-24.04
-    # Includes both production five-minute QUERY recovery cycles.
-    timeout-minutes: 60
+    # The 41-case NAT suite alone takes about 42 minutes with production timers.
+    # Leave room for builds, Core tests and both cold-rejoin scenarios.
+    timeout-minutes: 90
     steps:
       - name: Check out velvet-fabric
         uses: actions/checkout@v7
