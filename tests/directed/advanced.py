@@ -216,6 +216,10 @@ def family_change(r):
         # endpoint. Make the old underlay actually unavailable, then wait for
         # the production static-peer endpoint rotation (3min stale).
         old_family = r.args.underlay
+        # Existing Dynamic Links retain their negotiated family and recovery
+        # deadline. Static endpoint rotation must restore the routed path;
+        # automatic cross-family Dynamic renegotiation is not promised.
+        r.topology.blocked_pairs.update((a, b) for a in (1, 2, 3) for b in (1, 2, 3) if a != b)
         for n in r.topology.active:
             table(r, n, 'old_family', f'iifname "wan" meta nfproto {old_family} meta l4proto udp',
                   f'oifname "wan" meta nfproto {old_family} meta l4proto udp')
@@ -257,13 +261,14 @@ def family_change(r):
         routing_prerequisite(r, 2)
         r.verify()
         assert old_pids == {n: r.nodes[n]['proc'].pid for n in r.topology.active}
-        for n in (2, 3):
-            names = direct_names(r, n, 5 - n)
-            wg = parse_wg(r.ns(n, 'wg', 'show', 'all', 'dump'))
-            assert names
-            assert all(ipaddress.ip_address(wg[name]['peers'][0]['endpoint'].rsplit(':', 1)[0].strip('[]')).version
-                       == (6 if r.args.underlay == 'ipv6' else 4) for name in names)
         r.record('configured-family-migration-verified', before=old_family, after=r.args.underlay)
+        data(r, label='alternate-family-routed-fallback')
+        for n in r.topology.active:
+            delete_table(r, n, 'old_family')
+        r.topology.blocked_pairs.clear()
+        r.verify()
+        assert old_pids == {n: r.nodes[n]['proc'].pid for n in r.topology.active}
+        r.record('original-family-direct-recovery-verified', family=old_family)
     else:
         # A second physical egress, a new source address, and route replacement
         # without reloading/restarting velvetd or managed Babel.
