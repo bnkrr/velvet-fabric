@@ -67,14 +67,20 @@ def routing_prerequisite(r, node, peer=0):
 def restart(r, node):
     old = r.nodes[node]
     old_pid = old['proc'].pid
+    # Stage faults intentionally precede full topology convergence, so the
+    # periodic observer may not have sampled Babel yet. Pin it before killing
+    # Fabric, while its control socket can still identify the independent PID.
+    babel_pid = r.command(node)['runtime']['babel'].get('pid')
+    assert babel_pid, 'managed Babel missing before Fabric crash'
+    r.resources(node, 'babel', babel_pid)
     old['proc'].kill()
     old['proc'].wait(timeout=5)
     old['thread'].join(timeout=3)
     # Preserve namespace, addresses, NAT mappings, UUID/state and old kernel
     # interfaces. This is an actual velvetd crash, not a delete/re-add event.
-    babel_pid = old['resources']['babel']['pid']
-    assert Path(f'/proc/{babel_pid}').exists(), 'Fabric crash stopped independent Babel'
+    r.resources(node, 'babel', babel_pid)
     r.start_daemon(node)
+    r.nodes[node]['resources']['babel'] = old['resources']['babel']
     assert r.nodes[node]['proc'].pid != old_pid
     r.record('crash-restarted', node=node, old_pid=old_pid, new_pid=r.nodes[node]['proc'].pid)
 

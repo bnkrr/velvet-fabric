@@ -1,10 +1,13 @@
 """Negative controls for coverage claims and partition expectations."""
 from itertools import product
 import copy
+import os
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 from cases import catalog, PROFILES, pair_requirements
 from run import DirectedTopology
-from advanced import await_event
+from advanced import await_event, restart
 from resources import assert_quiescent, classify_socket
 from scenarios import delete_table
 from model import NotConverged, audit, prefix, process_fd_limit
@@ -141,6 +144,29 @@ class CoverageTests(unittest.TestCase):
             finally:
                 delete_table(runner, None, 'partition', 'bridge')
         self.assertEqual((runner.deadline, runner.stop_signal), (1, 15))
+
+    def test_early_crash_records_babel_before_killing_fabric(self):
+        # Fault injection runs before the first topology audit. No sampled
+        # resources exist yet, although Babel already routes the control path.
+        old = {'proc': Mock(pid=100), 'thread': Mock(), 'resources': {}}
+        runner = SimpleNamespace(nodes={2: old}, record=Mock())
+        runner.command = Mock(return_value={'runtime': {'babel': {'pid': os.getpid()}}})
+
+        def resources(node, role, pid):
+            runner.nodes[node]['resources'].setdefault(role, {'pid': pid})
+
+        def kill():
+            runner.command.assert_called_once_with(2)
+            self.assertEqual(old['resources']['babel']['pid'], os.getpid())
+
+        def start(node):
+            runner.nodes[node] = {'proc': Mock(pid=101), 'resources': {}}
+
+        runner.resources, runner.start_daemon = resources, start
+        old['proc'].kill.side_effect = kill
+        restart(runner, 2)
+        old['proc'].kill.assert_called_once()
+        self.assertEqual(runner.nodes[2]['resources']['babel']['pid'], os.getpid())
 
 
 if __name__ == '__main__':
