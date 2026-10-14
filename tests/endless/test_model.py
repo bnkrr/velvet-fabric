@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from model import Topology, PendingLinks, NotConverged, audit, parse_wg, prefix, is_babel_check, nat_heartbeat_fresh
-from nat import admits, decode, encode, mapping_key, checksum
+from nat import admits, decode, encode, mapping_key, checksum, prepare_fd_limit
 from coverage_model import Coverage
 from netns import Runner
 from check_commit import CommitRunner
@@ -240,6 +240,18 @@ class OracleTests(unittest.TestCase):
 
 
 class NATTests(unittest.TestCase):
+    def test_insufficient_hard_limit_fails_before_packet_setup(self):
+        with patch('nat.resource.getrlimit', return_value=(1024, 1024)), patch('nat.resource.setrlimit') as change:
+            with self.assertRaisesRegex(RuntimeError, 'hard limit is 1024'):
+                prepare_fd_limit()
+            change.assert_not_called()
+
+    def test_larger_or_unlimited_soft_limit_is_preserved(self):
+        for soft in (8192, -1):
+            with patch('nat.resource.getrlimit', return_value=(soft, -1)), patch('nat.resource.setrlimit') as change:
+                prepare_fd_limit()
+                change.assert_not_called()
+
     def test_mapping_dimensions(self):
         local = ('10.0.0.2', 30000)
         peers = [('192.0.2.1', 10), ('192.0.2.1', 20), ('192.0.2.2', 10)]

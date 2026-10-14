@@ -130,6 +130,11 @@ synthetic evidence or knowledge of expected connectivity**. Each mapping expires
 after 180 idle seconds. Mapping count and destination history per mapping are
 bounded at 4096; overflow fails the fixture. Allocation collisions fall back to
 a free kernel port and thus need not preserve the original allocation pattern.
+The translator raises its own file-descriptor soft limit to 4160 when needed,
+within the inherited hard limit; an insufficient hard limit fails at startup.
+This does not change the limits of velvetd or Babel. `check_nat.py` verifies real
+traffic through more than 1024 retained mappings in IPv4, IPv6 and dual mode,
+starting each capacity-test translator with a soft limit of 1024.
 
 This is a controlled packet-level NAT emulator, not a claim that Linux SNAT or
 every commercial router exhibits all these profiles. The existing deterministic

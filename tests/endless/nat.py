@@ -10,6 +10,7 @@ import argparse
 import ipaddress
 import json
 import random
+import resource
 import selectors
 import signal
 import socket
@@ -20,6 +21,19 @@ from pathlib import Path
 MAPPINGS = ('eim', 'adm', 'apdm')
 FILTERS = ('eif', 'adf', 'apdf')
 ALLOCATIONS = ('preserve', 'offset', 'sequential', 'random')
+MAPPING_CAPACITY = 4096
+
+
+def prepare_fd_limit():
+    # Each mapping owns a UDP socket. Detached runners may inherit systemd's
+    # 1024 soft limit even when the hard limit permits the advertised capacity.
+    required = MAPPING_CAPACITY + 64  # LAN, selector, stdio and status writes.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= required:
+        return
+    if hard != resource.RLIM_INFINITY and hard < required:
+        raise RuntimeError(f'NAT fixture requires RLIMIT_NOFILE >= {required}; hard limit is {hard}')
+    resource.setrlimit(resource.RLIMIT_NOFILE, (required, hard))
 
 
 def checksum(data):
@@ -147,7 +161,7 @@ class Translator:
             key = (wan, key)  # Mapping state is independent per egress.
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= 4096:
+            if len(self.entries) >= MAPPING_CAPACITY:
                 raise RuntimeError('NAT fixture mapping capacity exceeded')
             entry = {'socket': self.allocate(local, wan), 'local': local, 'destinations': set(),
                      'client_mac': client_mac, 'router_mac': router_mac}
@@ -219,6 +233,7 @@ def main():
     if args.other_wan and any(ipaddress.ip_address(a).version != ipaddress.ip_address(args.wan[0]).version
                               for a in (args.other_wan, args.primary_destination)):
         parser.error('NAT egress addresses must share the address family')
+    prepare_fd_limit()
     translator = Translator(args.wan, args.mapping, args.filter, args.allocation, args.seed,
                             idle_timeout=args.idle_timeout, other_wan=args.other_wan,
                             primary_destination=args.primary_destination)

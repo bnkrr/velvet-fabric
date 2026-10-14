@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Root-only black-box validation of all 36 NAT profiles, IPv4 and IPv6."""
+import argparse
 import ctypes
 import itertools
 import json
 import os
 from pathlib import Path
+import resource
 import socket
 import subprocess as sp
 import tempfile
@@ -36,7 +38,12 @@ def socket_in(namespace, address, port):
     return sock
 
 
-def family_check(family, directory):
+def lower_fd_limit():
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
+
+
+def family_check(family, directory, capacity_only=False):
     families = (family,) if isinstance(family, int) else family
     token = uuid.uuid4().hex[:8]
     names = {n: f'vfn-{token}-{n}' for n in ('c', 'r', 'o')}
@@ -76,12 +83,17 @@ def family_check(family, directory):
             sockets.extend((client, client2, *observers))
             clients[family] = client, client2, observers
         results = []
-        for mapping, filtering, allocation in itertools.product(('eim', 'adm', 'apdm'), ('eif', 'adf', 'apdf'), ('preserve', 'offset', 'sequential', 'random')):
+        capacity_profile = ('apdm', 'apdf', 'random')
+        profiles = [capacity_profile] if capacity_only else itertools.product(
+            ('eim', 'adm', 'apdm'), ('eif', 'adf', 'apdf'), ('preserve', 'offset', 'sequential', 'random'))
+        for mapping, filtering, allocation in profiles:
+            capacity = (mapping, filtering, allocation) == capacity_profile
             status = directory / 'status.json'
             status.unlink(missing_ok=True)
             process = sp.Popen(['ip', 'netns', 'exec', names['r'], 'python3', str(Path(__file__).with_name('nat.py')),
                 *[part for family in families for part in ('--wan', wans[family][0])], '--mapping', mapping, '--filter', filtering, '--allocation', allocation,
-                '--seed', '7', '--status', str(status)], stdout=sp.DEVNULL, stderr=sp.PIPE)
+                '--seed', '7', '--status', str(status)], stdout=sp.DEVNULL, stderr=sp.PIPE,
+                preexec_fn=lower_fd_limit if capacity else None)
             try:
                 until = time.monotonic() + 5
                 while not status.exists():
@@ -122,6 +134,28 @@ def family_check(family, directory):
                     payload, source = observers[0].recvfrom(100)
                     assert payload == b'other-local' and source[1] not in ports
                     results.append({'underlay': 'dual' if len(families) == 2 else f'ipv{family}', 'family': family, 'mapping': mapping, 'filter': filtering, 'allocation': allocation, 'ports': ports})
+                    if capacity:
+                        # Unique local endpoints retain real mappings after the
+                        # client sockets close. The child starts at soft=1024;
+                        # every packet and reply must still cross the translator.
+                        for index in range(1100):
+                            with socket_in(names['c'], lans[family][1], 32000 + index) as probe:
+                                message = f'capacity-{family}-{index}'.encode()
+                                probe.sendto(message, observers[0].getsockname()[:2])
+                                payload, translated = observers[0].recvfrom(100)
+                                assert payload == message and translated[0] == wan[0]
+                                observers[0].sendto(message, translated)
+                                assert probe.recvfrom(100)[0] == message
+                if capacity:
+                    expected = 1104 * len(families)
+                    until = time.monotonic() + 5
+                    while json.loads(status.read_text())['entries'] < expected:
+                        assert process.poll() is None and time.monotonic() < until, 'capacity mappings missing'
+                        time.sleep(0.02)
+                    fds = len(list(Path(f'/proc/{process.pid}/fd').iterdir()))
+                    assert fds > 1024, 'capacity regression did not exceed inherited FD limit'
+                    for row in results[-len(families):]:
+                        row.update(capacity_entries=expected, capacity_fds=fds)
             finally:
                 process.terminate()
                 process.wait(timeout=3)
@@ -138,11 +172,14 @@ def family_check(family, directory):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--capacity-only', action='store_true', help='only test mappings beyond a 1024 FD soft limit')
+    args = parser.parse_args()
     if os.geteuid() != 0: raise SystemExit('root required')
     with tempfile.TemporaryDirectory(prefix='velvet-nat-check-') as directory:
-        results = [row for families in (4, 6, (4, 6)) for row in family_check(families, Path(directory))]
+        results = [row for families in (4, 6, (4, 6)) for row in family_check(families, Path(directory), args.capacity_only)]
         print(json.dumps(results))
-        print(f'PASS: {len(results)} real UDP mapping/filter/allocation profiles, including single/dual-stack translators and reply checksums')
+        print(f'PASS: {len(results)} real UDP mapping/filter/allocation profiles, including single/dual-stack translators, reply checksums and >1024 mappings')
 
 
 if __name__ == '__main__': main()
