@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0
+## 0.6.1
 
 - Preserve committed WireGuard Links across Fabric stops, crashes and reloads,
   then adopt their validated kernel state on restart. Short VFP PONG loss marks
@@ -25,6 +25,8 @@
   NodeSpec editor and a local helper for building Fabric with pinned Babel.
 - Extend regression coverage for systemd failures, dual-stack endpoint selection,
   Durable cold recovery, kernel ownership and repeated membership changes.
+- Stage systemd acceptance tests in a root-owned runtime directory, retaining
+  home isolation even when the checkout belongs to an unprivileged user.
 - Build releases with Go 1.27.2 and update the Go networking dependencies to
   their current security revisions.
 

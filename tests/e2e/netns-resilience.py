@@ -99,9 +99,9 @@ def setup():
         cp = R / f'{n}.json'
         cp.write_text(json.dumps(cfg))
         cp.chmod(384)
-        body = (T / 'velvetd.service').read_text().replace('ProtectHome=true', 'ProtectHome=false').replace(' velvet-recovery.timer', '').replace('/usr/bin/velvetd', str(R / 'velvetd')).replace('/etc/velvet/node.json', str(cp)).replace('ReadWritePaths=/etc/velvet', '').replace('WatchdogSec=60s', 'WatchdogSec=12s').replace('[Service]', f'[Service]\nNetworkNamespacePath=/run/netns/{P}-{n}').replace('--babel-systemd', '--babel-systemd --reconcile-interval 2s --recovery-window 45s --recovery-stable 10s')
+        body = (T / 'velvetd.service').read_text().replace(' velvet-recovery.timer', '').replace('/usr/bin/velvetd', str(R / 'velvetd')).replace('/etc/velvet/node.json', str(cp)).replace('ReadWritePaths=/etc/velvet', '').replace('WatchdogSec=60s', 'WatchdogSec=12s').replace('[Service]', f'[Service]\nNetworkNamespacePath=/run/netns/{P}-{n}').replace('--babel-systemd', '--babel-systemd --reconcile-interval 2s --recovery-window 45s --recovery-stable 10s')
         install_unit(unit(n), body)
-        b = (T / 'velvet-babel@.service').read_text().replace('ProtectHome=true', 'ProtectHome=false').replace('/usr/bin/velvetd', str(R / 'velvetd')).replace('[Service]', f'[Service]\nNetworkNamespacePath=/run/netns/{P}-{n}')
+        b = (T / 'velvet-babel@.service').read_text().replace('/usr/bin/velvetd', str(R / 'velvetd')).replace('[Service]', f'[Service]\nNetworkNamespacePath=/run/netns/{P}-{n}')
         install_unit(bu(n), b.replace('%i', cfg['node']['uid']['uuid']))
     run('systemctl', 'daemon-reload')
     run('systemctl', 'start', *[unit(n) for n in nodes])
@@ -213,7 +213,7 @@ def test():
     wait(lambda: pid(bu('c')) > 0)
     log('PASS: explicit Babel disable/re-enable and cleanup/startup mutual exclusion')
     install_unit(unit('c') + '.d/no-restart.conf', '[Service]\nRestart=no\n')
-    body = (T / 'velvet-recovery.service').read_text().replace('ProtectHome=true', 'ProtectHome=false').replace('/usr/bin/velvetd', str(R / 'velvetd')).replace('/etc/velvet/node.json', str(R / 'c.json')).replace('[Service]', f'[Service]\nNetworkNamespacePath=/run/netns/{P}-c')
+    body = (T / 'velvet-recovery.service').read_text().replace('/usr/bin/velvetd', str(R / 'velvetd')).replace('/etc/velvet/node.json', str(R / 'c.json')).replace('[Service]', f'[Service]\nNetworkNamespacePath=/run/netns/{P}-c')
     install_unit(P + '-recovery.service', body)
     install_unit(P + '-recovery.timer', '[Unit]\nDescription=Temporary recovery test\n[Timer]\nOnActiveSec=1s\nOnUnitActiveSec=2s\nAccuracySec=1s\n')
     run('systemctl', 'daemon-reload')
@@ -297,14 +297,28 @@ def interrupted(signum, _frame):
 preflight()
 signal.signal(signal.SIGTERM, interrupted)
 signal.signal(signal.SIGINT, interrupted)
-try:
-    setup()
-    dynamic_test() if DYNAMIC else test()
-except BaseException:
-    for n in configs:
-        log(ns(n, 'ip', '-6', 'route', 'show', 'table', '20000', check=False))
-        log(ns(n, 'ip', 'route', 'show', 'table', '20001', check=False))
-        log(run('journalctl', '-u', unit(n), '-u', bu(n), '-n', '25', '--no-pager', check=False))
-    raise
-finally:
-    cleanup()
+# Services retain ProtectHome and their restricted capability set. A CI checkout
+# can live under another user's private home, which these services cannot read.
+# Stage only runtime inputs on an executable, root-owned filesystem; /run may
+# be mounted noexec. Keep this directory alive through service cleanup.
+source = R
+with tempfile.TemporaryDirectory(prefix='velvet-resilience-', dir='/var/lib') as directory:
+    R = pathlib.Path(directory)
+    T = R / 'packaging/systemd'
+    T.mkdir(parents=True)
+    for name in ('velvetd', 'babel-rs'):
+        shutil.copyfile(source / name, R / name)
+        (R / name).chmod(0o755)
+    for name in ('velvetd.service', 'velvet-babel@.service', 'velvet-recovery.service'):
+        shutil.copyfile(source / 'packaging/systemd' / name, T / name)
+    try:
+        setup()
+        dynamic_test() if DYNAMIC else test()
+    except BaseException:
+        for n in configs:
+            log(ns(n, 'ip', '-6', 'route', 'show', 'table', '20000', check=False))
+            log(ns(n, 'ip', 'route', 'show', 'table', '20001', check=False))
+            log(run('journalctl', '-u', unit(n), '-u', bu(n), '-n', '25', '--no-pager', check=False))
+        raise
+    finally:
+        cleanup()

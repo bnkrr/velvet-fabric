@@ -377,7 +377,7 @@ by interface name. Each Link retains its own subnet routes. Removing the chosen
 Link or revoking its adjacency lets another committed Link take over; control
 session loss alone preserves the choice.
 
-Fabric 0.6.0 targets Babel 0.7.0, including its FIB recovery support; older
+Fabric 0.6.1 targets Babel 0.7.0, including its FIB recovery support; older
 Babel 0.6.0 releases lack it. Babel defaults to clear
 on normal exit and a 240-second startup recovery window after a crash. It adopts
 old owned IPv4/IPv6 routes until fresh routes confirm them or their original
