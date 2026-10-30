@@ -94,7 +94,7 @@ multi-hop Fabric path.
 The managed integration, local build helper and privileged CI share the full
 Babel commit in `tests/babel-revision`. Local wrappers export that commit by
 default; `VELVET_BABEL_SOURCE=working-tree` explicitly tests paired development
-changes. Fabric 0.7.0 uses Babel 0.8.0's independent protocol policies and export
+changes. Fabric 0.7.1 uses Babel 0.8.1's independent protocol policies and export
 filters. Resilience also requires its FIB recovery configuration and status API.
 `manager_test.go` covers the structured `[[interfaces]]`/`match` configuration, static names and dynamic
 interface patterns, explicit wired policy, top-level shutdown budget, origins

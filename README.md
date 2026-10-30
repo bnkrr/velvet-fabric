@@ -389,7 +389,7 @@ by interface name. Each Link retains its own subnet routes. Removing the chosen
 Link or revoking its adjacency lets another committed Link take over; control
 session loss alone preserves the choice.
 
-Fabric 0.7.0 requires Babel 0.8.0 for declarative import/announcement and
+Fabric 0.7.1 requires Babel 0.8.1 for declarative import/announcement and
 per-view filter support. `tests/babel-revision` pins the compatible source
 commit used by CI and the VM wrappers. Older binaries reject these fields.
 Babel defaults to clear
