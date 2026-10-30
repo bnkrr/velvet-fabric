@@ -10,8 +10,8 @@ Use [a.json](a.json), [b.json](b.json), and [c.json](c.json) with the shared
 - A and C have explicit routes to each other's node loopback. Direct-neighbor
   loopbacks are installed from established Links.
 
-Babel is absent. `fabric.routes` carries return/infrastructure paths;
-`domains.internet.routes` carries outbound paths. All three nodes must run
+Babel is absent. `fabric.static_routes` carries infrastructure paths;
+`domains.internet.static_routes` carries outbound and Access return paths. All three nodes must run
 `velvetd`; Access and upstream delivery are configured separately.
 
 ```sh

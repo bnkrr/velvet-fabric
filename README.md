@@ -124,7 +124,7 @@ A minimal NodeSpec for node `a` is:
 
 ```json
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "<base64-32-byte-fabric-psk>",
@@ -139,7 +139,7 @@ A minimal NodeSpec for node `a` is:
       "name": "b",
       "public_key": "<node-b-wireguard-public-key>",
       "endpoints": ["192.0.2.2:51002"],
-      "listen_port": 51001
+      "listen_ports": 51001
     }
   ]
 }
@@ -184,7 +184,7 @@ Additional peer fields are optional:
 
 ```json
 {
-  "listen_port": 51001,
+  "listen_ports": 51001,
   "link_addresses": ["10.77.0.0/30", "fd77::/126"],
   "persistent_keepalive_seconds": 25,
   "interface_name": "vl-a-b"
@@ -199,13 +199,12 @@ discovers the actual remote address using link-local UDP multicast, and runs
 VFP over TCP port 58420. The lower discovered IPv6 address initiates TCP;
 neither endpoint configures or predicts the remote control address.
 
-UDP ports have three explicit modes: `listen_port: 0` lets the system choose
-(the default), `listen_port: 42000` fixes one port, and
-`port_range: {"first": 40000, "last": 49999}` selects an inclusive range.
-There is no implicit range. These fields are mutually exclusive at the same
-level; `node` supplies the default for automatic Links and Peers, and an
-explicit Peer choice overrides it, including an explicit zero. Fixed Peer
-ports can lie outside the node range. WG, primary probes, auxiliary probes and
+UDP ports have three modes: `listen_ports: 0` lets the system choose
+(the default), `listen_ports: 42000` fixes one port, and
+`listen_ports: [40000, 49999]` selects an inclusive range, not two discrete
+ports. Set it on each `peers[]` entry for Static Links and independently under
+`dynamic_links` for automatic Links. There is no node-level port setting or
+inheritance between these choices. WG, primary probes, auxiliary probes and
 observers share reservations; range exhaustion never falls back outside it.
 The effective VFP UDP port is excluded from WG allocation; a fixed choice or
 single-port range equal to it is invalid. Link-local discovery and liveness
@@ -267,74 +266,87 @@ not grant ownership of unrelated kernel objects.
 
 ## Core routing
 
-The Fabric routing table carries node and infrastructure reachability.
-`fabric.routing_table_id` defaults to `20000`. Static Fabric routes are grouped
-by their locally named next-hop Peer:
+NodeSpec uses `velvet.io/v1alpha2`. The parser accepts only the current schema;
+unknown and historical fields are rejected rather than silently interpreted.
+Regenerate old NodeSpecs or convert them separately: rename `routes` to
+`static_routes` and Domain `table_id` to `source_table_id`, move Access return
+announcements into their owning Domain, and set `listen_ports` on each Peer
+or under `dynamic_links`. There are no node-level port defaults.
+`fabric.routing_table_id` defaults to `20000` and is the node's shared table
+for infrastructure and admitted ordinary Access return routes.
+`fabric.static_routes` accepts infrastructure destinations within the configured
+Loopback/Link pools, grouped by the locally named next-hop Peer:
 
 ```json
 {
   "fabric": {
-    "routes": {
-      "b": [
-        "fd78:1234:5678::3/128",
-        {"prefix": "fd78:1234:5678::4/128", "metric": 10}
-      ]
+    "static_routes": {
+      "b": ["fd78:1234:5678::3/128", {"prefix": "fd78:1234:5678::4/128", "metric": 10}]
     }
   }
 }
 ```
 
-A Domain is a source-selected routing view. Every Domain has its own table and
-every configured source prefix installs a `from` rule selecting that table and
-a `to` rule selecting the Fabric table for return traffic. Fabric destination
-rules run before Domain source rules. Configure the complete source set on
-every participating forwarding node, with the same canonical prefix per family.
-This allows different source populations to use different exits while sharing
-the same Fabric topology:
+Each Domain is an independent business routing view. Configure a Domain only
+on nodes that participate in its forwarding; an absent/empty `domains` map
+participates only in infrastructure. Every participating node needs the same
+complete, ordered `source_prefixes`. Access/source prefixes must be nonoverlapping,
+unique across Domains, disjoint from infrastructure pools, and cannot contain `/0`.
+Exit announcements may overlap, including default routes in several Domains.
 
 ```json
 {
   "domains": {
     "production": {
-      "table_id": 20001,
-      "source_prefixes": ["10.100.1.0/24"],
-      "routes": {"b": ["192.168.20.0/24"]},
-      "announcements": ["0.0.0.0/0"]
+      "source_table_id": 20001,
+      "source_prefixes": ["10.100.1.0/24", "10.100.2.0/24"],
+      "static_routes": {"b": ["10.100.2.0/24", "192.168.20.0/24"]},
+      "announcements": ["10.100.1.0/24", "0.0.0.0/0"]
     }
   }
 }
 ```
 
-An announcement declares that the local node can deliver the prefix outside
-Velvet Core. Velvet installs a `throw` route in the managed view so lookup can
-continue to the external delivery route. Without Babel, announcements remain
-local and are not propagated. With Babel enabled, Fabric announcements become
-ordinary Babel origins and Domain announcements become RFC 9079
-source-specific origins.
+`source_table_id` is the stable Access-to-Core lookup interface. All source
+prefixes install `from` rules to this table; NAT Access may enter the same table
+using its own fwmark rule. Table IDs are local identifiers, independent of rule
+priorities: shared destination selectors use priority 20000 and Domain source
+selectors use 20001. The first prefix per address family is the canonical Babel
+source; other same-family prefixes are local aliases using the same table and
+exit paths. Every node must choose the same canonical prefix for that Domain.
 
-For each address family, the first source prefix in a Domain is its canonical
-RFC 9079 source. Additional source prefixes are aliases selecting the same
-Linux route view.
+A destination equal to or contained in a Domain source prefix is an Access return
+route; other destinations are business exits. Both `static_routes` and
+`announcements` use this classification. A static return is installed in the
+shared Fabric table and its owning Domain view. A static exit goes only to that
+Domain's source table. Static routes are not automatically redistributed.
 
-Access prefixes are ordinary return destinations: declare them in
-`fabric.announcements` on the node providing local Access delivery. Keep business
-exits in `domains.<name>.announcements`. Without Babel, configure remote Access
-paths in `fabric.routes.<peer>` and business paths in `domains.<name>.routes.<peer>`;
-announcements still provide local delivery through `throw` routes. With Babel,
-the same announcements supply the next hops dynamically. Access interfaces and
-their local delivery routes remain externally managed.
+An announcement declares existing local delivery outside Core. Local Access
+announcements are ordinary Babel origins; exits are source-specific origins
+using the canonical source per family. Both belong in the Domain, including
+local Access prefixes. There is no `fabric.announcements`: node Loopback and
+negotiated Link origins are automatic. Local delivery is represented with throw
+routes; Access interfaces, LAN delivery, NAT and firewall rules remain managed
+by Access or the host.
 
-Routing admission comes from local configuration, not learned prefixes. There
-is no catch-all Fabric lookup: packets outside the configured source and
-destination selectors continue through the host's existing policy rules.
-An arbitrary learned ordinary prefix outside those selectors does not create
-a new destination rule. Explicit broad selectors, including `/0`, broaden this
-scope. Fabric destination matches take precedence over Domain routes, rather
-than comparing prefix lengths across the two tables.
+Babel candidate admission allows ordinary infrastructure routes and ordinary
+returns contained in locally configured Domain source prefixes. Source-specific
+candidates must match a configured canonical source. Ordinary routes outside
+these scopes, including ordinary default routes, are rejected. Each source view
+inherits only infrastructure and its own Domain's returns; sharing a node or the
+Fabric table does not import another Domain's business routes. Domain changes
+reevaluate existing candidates and remove revoked finite projections. Babel may
+retain unreachable withdrawal holds until their protocol lifetime expires.
+Fabric explicitly generates `policy.import`, `policy.announce`, and independent
+`export.views[].filter` rules using source/destination prefix matches. Changing
+a table's contents does not implicitly change protocol participation. No VFP or Babel
+wire extensions are involved, and cross-Plan route importing is not provided.
 
-Configurations that previously announced Access pools under a Domain should
-move those announcements to `fabric.announcements`, and move static return
-routes to `fabric.routes`. External return-selection rules are no longer needed.
+Velvet owns the Linux selectors (`manage_rules = false` in managed Babel), while
+Babel still selects and installs dynamic routes. Permanent low-priority unreachable
+routes cover managed return prefixes and each source table's default. Valid
+static or Babel paths win; losing a remote path cannot fall through to the host's
+main/default route. Unmanaged host traffic retains the host's existing policy.
 
 ## Dynamic routing
 
@@ -363,9 +375,9 @@ The integration targets the exact Babel commit in `tests/babel-revision`. Config
 `/run/velvet-babel/<uuid>/babel-rs.ctl`. Configured static interfaces and committed
 automatic interfaces enter Babel; tentative automatic interfaces do not.
 Control-session loss preserves admission; deleting a Link removes admission.
-Generated wired cost is 96. Fabric loopback host announcement metrics must be
-multiples of 96, leaving the priority gap needed by neighbor fallbacks; ordinary
-business announcements keep their existing metric range.
+Generated wired cost is 96 and automatic Loopback origins have metric zero,
+leaving the priority gap needed by neighbor fallbacks. Domain announcements
+retain their configured metric range.
 
 Within the same table and prefix, explicit static routes precede finite Babel
 routes, then automatic neighbor loopback fallback routes (priority 131008),
@@ -377,13 +389,15 @@ by interface name. Each Link retains its own subnet routes. Removing the chosen
 Link or revoking its adjacency lets another committed Link take over; control
 session loss alone preserves the choice.
 
-Fabric 0.6.1 targets Babel 0.7.0, including its FIB recovery support; older
-Babel 0.6.0 releases lack it. Babel defaults to clear
+Fabric 0.7.0 requires Babel 0.8.0 for declarative import/announcement and
+per-view filter support. `tests/babel-revision` pins the compatible source
+commit used by CI and the VM wrappers. Older binaries reject these fields.
+Babel defaults to clear
 on normal exit and a 240-second startup recovery window after a crash. It adopts
 old owned IPv4/IPv6 routes until fresh routes confirm them or their original
 deadline expires; repeated crashes do not renew the deadline. Optional retain
 exit is implemented in Babel but Fabric leaves the default clear policy enabled.
-Install the compatible Babel release separately, or build the pinned revision. Remote
+Install a compatible Babel build separately. Remote
 Babel timers still apply; this is not a guarantee of uninterrupted forwarding.
 
 `babel-rs` uses UDP/6696 and `ff02::1:6` on every managed WireGuard interface.

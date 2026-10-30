@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.7.0
+
+- Scope business routes to their owning Domain. Access return prefixes use
+  ordinary Babel routes and the shared Fabric return table; exits use
+  source-specific routes. Each Domain table receives shared infrastructure and
+  its own routes, with unreachable guards to prevent unintended fallthrough.
+- Compile explicit Babel import and announcement policies independently of
+  per-table export filters. Require Babel 0.8.0; `tests/babel-revision` records
+  the exact compatible commit.
+- Make kernel rule priorities independent of table IDs and mirror committed
+  neighbor routes into Domain tables for source-based and fwmark Access.
+- Replace historical NodeSpec routing and port fields with explicit
+  `static_routes`, `source_table_id` and per-Link `listen_ports` settings. Update
+  examples and the offline configuration editor to the same schema.
+- Add dual-stack Domain isolation and policy reload regressions. Correct the
+  endless Access verifier to accept only independently validated retained
+  neighbor fallbacks while rejecting stale learned routes and dead best paths.
+
+### Upgrade from 0.6.1
+
+Install Babel 0.8.0 alongside Fabric 0.7.0. Older Babel versions cannot parse
+the generated policy configuration. Back up NodeSpec and persistent state,
+then regenerate the configuration or apply these changes before restarting:
+
+| Previous field | Current configuration |
+| --- | --- |
+| `fabric.routes` | `fabric.static_routes`, restricted to configured infrastructure pools |
+| `fabric.announcements` | Move each business announcement into its owning `domains.<name>.announcements` |
+| `domains.<name>.table_id` | `domains.<name>.source_table_id` |
+| `domains.<name>.routes` | `domains.<name>.static_routes` |
+| Node or Peer `listen_port` / `port_range` | Explicit `listen_ports` on each Peer and under `dynamic_links` |
+
+`listen_ports` accepts `0` for system allocation, one fixed port, or an inclusive
+`[first, last]` range. Node-level defaults and derived static listen ports no
+longer apply; set fixed ports explicitly where peers need predictable listeners.
+Historical fields are rejected, even though NodeSpec still uses
+`velvet.io/v1alpha2`. Validate with `velvetctl resolve --config node.json`.
+
+Declare the same Domain source scope on participating transit nodes. Prefixes
+contained within that scope are Access returns; other Domain destinations are
+business exits. Move business static routes out of the Fabric infrastructure
+section as well. Access provisioning, firewall policy and exit NAT remain host
+responsibilities. See [Core routing](README.md#core-routing) for the complete
+forwarding contract. Mixed-version rolling upgrades are not promised.
+
 ## 0.6.1
 
 - Preserve committed WireGuard Links across Fabric stops, crashes and reloads,

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	APIVersion            = "velvet.io/v1alpha1"
+	APIVersion            = "velvet.io/v1alpha2"
 	Kind                  = "NodeSpec"
 	DefaultVFPPort        = 58420
 	DefaultRoutingTableID = 20000
@@ -45,14 +45,13 @@ type NodeSpec struct {
 }
 
 type FabricSpec struct {
-	PSK              string         `json:"psk"`
-	LinkPrefixV4     string         `json:"link_prefix_v4,omitempty"`
-	LinkPrefixV6     string         `json:"link_prefix_v6,omitempty"`
-	LoopbackPrefixV6 string         `json:"loopback_prefix_v6"`
-	VFPPort          *int           `json:"vfp_port,omitempty"`
-	RoutingTableID   *int           `json:"routing_table_id,omitempty"`
-	Routes           Routes         `json:"routes,omitempty"`
-	Announcements    []Announcement `json:"announcements,omitempty"`
+	PSK              string `json:"psk"`
+	LinkPrefixV4     string `json:"link_prefix_v4,omitempty"`
+	LinkPrefixV6     string `json:"link_prefix_v6,omitempty"`
+	LoopbackPrefixV6 string `json:"loopback_prefix_v6"`
+	VFPPort          *int   `json:"vfp_port,omitempty"`
+	RoutingTableID   *int   `json:"routing_table_id,omitempty"`
+	StaticRoutes     Routes `json:"static_routes,omitempty"`
 }
 
 type BabelSpec struct {
@@ -61,6 +60,7 @@ type BabelSpec struct {
 }
 
 type DynamicLinksSpec struct {
+	ListenPorts            *ListenPorts `json:"listen_ports,omitempty"`
 	RecoveryTimeoutSeconds *int         `json:"recovery_timeout_seconds,omitempty"`
 	Durable                *DurableSpec `json:"durable,omitempty"`
 	Mode                   string       `json:"mode"`
@@ -74,11 +74,9 @@ const (
 )
 
 type Node struct {
-	ListenPort        *int       `json:"listen_port,omitempty"`
-	PortRange         *PortRange `json:"port_range,omitempty"`
-	UID               NodeUID    `json:"uid"`
-	PrivateKey        string     `json:"private_key"`
-	LoopbackAddressV6 string     `json:"loopback_address_v6,omitempty"`
+	UID               NodeUID `json:"uid"`
+	PrivateKey        string  `json:"private_key"`
+	LoopbackAddressV6 string  `json:"loopback_address_v6,omitempty"`
 }
 
 type NodeUID struct {
@@ -87,14 +85,13 @@ type NodeUID struct {
 }
 
 type Peer struct {
-	PortRange                  *PortRange `json:"port_range,omitempty"`
-	Name                       string     `json:"name"`
-	PublicKey                  string     `json:"public_key"`
-	Endpoints                  []string   `json:"endpoints"`
-	ListenPort                 *int       `json:"listen_port,omitempty"`
-	LinkAddresses              []string   `json:"link_addresses,omitempty"`
-	PersistentKeepaliveSeconds *int       `json:"persistent_keepalive_seconds,omitempty"`
-	InterfaceName              string     `json:"interface_name,omitempty"`
+	ListenPorts                *ListenPorts `json:"listen_ports,omitempty"`
+	Name                       string       `json:"name"`
+	PublicKey                  string       `json:"public_key"`
+	Endpoints                  []string     `json:"endpoints"`
+	LinkAddresses              []string     `json:"link_addresses,omitempty"`
+	PersistentKeepaliveSeconds *int         `json:"persistent_keepalive_seconds,omitempty"`
+	InterfaceName              string       `json:"interface_name,omitempty"`
 }
 
 // Routes groups destination routes by the locally configured next-hop Peer.
@@ -114,10 +111,40 @@ type Announcement struct {
 }
 
 type DomainSpec struct {
-	TableID        int            `json:"table_id"`
+	SourceTableID  int            `json:"source_table_id"`
 	SourcePrefixes []string       `json:"source_prefixes"`
-	Routes         Routes         `json:"routes,omitempty"`
+	StaticRoutes   Routes         `json:"static_routes,omitempty"`
 	Announcements  []Announcement `json:"announcements,omitempty"`
+}
+
+// IsAccessPrefix classifies both paths and announcements. An aggregate such
+// as /0 is an exit, never a return route just because it overlaps an Access.
+func (d DomainSpec) IsAccessPrefix(prefix netip.Prefix) bool {
+	for _, raw := range d.SourcePrefixes {
+		if source, err := netip.ParsePrefix(raw); err == nil && prefixContained(prefix, []netip.Prefix{source}) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f FabricSpec) InfrastructurePrefixes() []netip.Prefix {
+	var prefixes []netip.Prefix
+	for _, raw := range []string{f.LoopbackPrefixV6, f.LinkPrefixV4, f.LinkPrefixV6} {
+		if prefix, err := netip.ParsePrefix(raw); err == nil {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	return prefixes
+}
+
+func prefixContained(prefix netip.Prefix, parents []netip.Prefix) bool {
+	for _, parent := range parents {
+		if parent.Addr().Is4() == prefix.Addr().Is4() && parent.Bits() <= prefix.Bits() && parent.Contains(prefix.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Route) UnmarshalJSON(data []byte) error {
@@ -306,11 +333,13 @@ func (s *NodeSpec) Validate() error {
 		}
 	}
 	validateLoopback("loopback_address_v6", s.Node.LoopbackAddressV6, loopV6, loopV6Err)
-	if err := ValidatePorts(s.Node.ListenPort, s.Node.PortRange); err != nil {
-		problems = append(problems, "node: "+err.Error())
+	if s.DynamicLinks != nil {
+		if err := s.DynamicLinks.ListenPorts.Validate(); err != nil {
+			problems = append(problems, "dynamic_links: "+err.Error())
+		}
 	}
-	if err := ChoosePorts(s.Node.ListenPort, s.Node.PortRange).validateVFPPort(s.Fabric.EffectiveVFPPort()); err != nil {
-		problems = append(problems, "node: "+err.Error())
+	if err := s.DynamicPorts().validateVFPPort(s.Fabric.EffectiveVFPPort()); err != nil {
+		problems = append(problems, "dynamic_links: "+err.Error())
 	}
 	if s.DynamicLinks != nil && s.DynamicLinks.Durable != nil {
 		if err := s.DynamicLinks.Durable.Validate(); err != nil {
@@ -347,7 +376,7 @@ func (s *NodeSpec) Validate() error {
 			}
 			seenEndpoints[endpoint] = struct{}{}
 		}
-		if err := ValidatePorts(peer.ListenPort, peer.PortRange); err != nil {
+		if err := peer.ListenPorts.Validate(); err != nil {
 			problems = append(problems, where+": "+err.Error())
 		}
 		choice := s.PeerPorts(peer)
@@ -356,7 +385,7 @@ func (s *NodeSpec) Validate() error {
 		}
 		if choice.Port > 0 {
 			if other, ok := ports[choice.Port]; ok {
-				problems = append(problems, fmt.Sprintf("%s.listen_port is already used by peer %q", where, other))
+				problems = append(problems, fmt.Sprintf("%s.listen_ports is already used by peer %q", where, other))
 			}
 			ports[choice.Port] = peer.Name
 		}
@@ -594,52 +623,37 @@ func validateRouting(s *NodeSpec, peerNames map[string]struct{}) []string {
 	if s.DynamicLinks != nil && s.DynamicLinks.RecoveryTimeoutSeconds != nil && (*s.DynamicLinks.RecoveryTimeoutSeconds < 30 || *s.DynamicLinks.RecoveryTimeoutSeconds > 604800) {
 		problems = append(problems, "dynamic_links.recovery_timeout_seconds must be between 30 and 604800")
 	}
-	if s.Babel.IsEnabled() {
-		pool, err := netip.ParsePrefix(s.Fabric.LoopbackPrefixV6)
-		if err == nil {
-			for _, a := range s.Fabric.Announcements {
-				prefix, parseErr := netip.ParsePrefix(a.Prefix)
-				if parseErr == nil && prefix.Bits() == 128 && pool.Contains(prefix.Addr()) && a.Metric != nil && *a.Metric%96 != 0 {
-					problems = append(problems, "fabric loopback host announcement metric must be a multiple of 96 when Babel is enabled")
-				}
-			}
-		}
-	}
+	pools := s.Fabric.InfrastructurePrefixes()
 	tables := map[int]string{s.Fabric.EffectiveRoutingTableID(): "fabric.routing_table_id"}
-	fabricRoutes, routeProblems := validateRoutes("fabric.routes", s.Fabric.Routes, peerNames)
+	fabricRoutes, routeProblems := validateRoutes("fabric.static_routes", s.Fabric.StaticRoutes, peerNames)
 	problems = append(problems, routeProblems...)
-	fabricAnnouncements, announcementProblems := validateAnnouncements("fabric.announcements", s.Fabric.Announcements)
-	problems = append(problems, announcementProblems...)
-	for prefix := range fabricAnnouncements {
-		if peer, exists := fabricRoutes[prefix]; exists {
-			problems = append(problems, fmt.Sprintf("fabric.announcements conflicts at %s with a route through peer %q", prefix, peer))
+	for prefix := range fabricRoutes {
+		if !prefixContained(prefix, pools) {
+			problems = append(problems, fmt.Sprintf("fabric.static_routes prefix %s is outside the infrastructure pools", prefix))
 		}
 	}
-
 	type sourceOwner struct {
 		domain string
 		prefix netip.Prefix
 	}
-	var sourcePrefixes []sourceOwner
-	domainNames := make([]string, 0, len(s.Domains))
+	var sources []sourceOwner
+	names := make([]string, 0, len(s.Domains))
 	for name := range s.Domains {
-		domainNames = append(domainNames, name)
+		names = append(names, name)
 	}
-	sort.Strings(domainNames)
-	for _, name := range domainNames {
+	sort.Strings(names)
+	for _, name := range names {
 		domain := s.Domains[name]
 		where := "domains." + name
 		if !peerNamePattern.MatchString(name) {
 			problems = append(problems, where+" name is invalid")
 		}
-		if err := validateTableID(domain.TableID); err != nil {
-			problems = append(problems, where+".table_id "+err.Error())
-		} else if domain.TableID <= s.Fabric.EffectiveRoutingTableID() {
-			problems = append(problems, where+".table_id must be greater than fabric.routing_table_id")
-		} else if owner, exists := tables[domain.TableID]; exists {
-			problems = append(problems, fmt.Sprintf("%s.table_id duplicates %s", where, owner))
+		if err := validateTableID(domain.SourceTableID); err != nil {
+			problems = append(problems, where+".source_table_id "+err.Error())
+		} else if owner, exists := tables[domain.SourceTableID]; exists {
+			problems = append(problems, fmt.Sprintf("%s.source_table_id duplicates %s", where, owner))
 		} else {
-			tables[domain.TableID] = where + ".table_id"
+			tables[domain.SourceTableID] = where + ".source_table_id"
 		}
 		if len(domain.SourcePrefixes) == 0 {
 			problems = append(problems, where+".source_prefixes must not be empty")
@@ -650,18 +664,31 @@ func validateRouting(s *NodeSpec, peerNames map[string]struct{}) []string {
 				problems = append(problems, fmt.Sprintf("%s.source_prefixes[%d] %v", where, i, err))
 				continue
 			}
-			for _, previous := range sourcePrefixes {
+			if prefix.Bits() == 0 {
+				problems = append(problems, where+".source_prefixes must not contain /0")
+			}
+			for _, pool := range pools {
+				if prefixesOverlap(prefix, pool) {
+					problems = append(problems, fmt.Sprintf("%s.source_prefixes[%d] overlaps infrastructure pool %s", where, i, pool))
+				}
+			}
+			for _, previous := range sources {
 				if prefixesOverlap(prefix, previous.prefix) {
 					problems = append(problems, fmt.Sprintf("%s.source_prefixes[%d] overlaps domain %q prefix %s", where, i, previous.domain, previous.prefix))
 					break
 				}
 			}
-			sourcePrefixes = append(sourcePrefixes, sourceOwner{domain: name, prefix: prefix})
+			sources = append(sources, sourceOwner{name, prefix})
 		}
-		routes, routeProblems := validateRoutes(where+".routes", domain.Routes, peerNames)
+		routes, routeProblems := validateRoutes(where+".static_routes", domain.StaticRoutes, peerNames)
 		problems = append(problems, routeProblems...)
 		announcements, announcementProblems := validateAnnouncements(where+".announcements", domain.Announcements)
 		problems = append(problems, announcementProblems...)
+		for prefix := range routes {
+			if !containsFamily(domain.SourcePrefixes, prefix.Addr().Is4()) {
+				problems = append(problems, fmt.Sprintf("%s.static_routes prefix %s has no same-family source_prefix", where, prefix))
+			}
+		}
 		for prefix := range announcements {
 			if !containsFamily(domain.SourcePrefixes, prefix.Addr().Is4()) {
 				problems = append(problems, fmt.Sprintf("%s.announcements prefix %s has no same-family source_prefix", where, prefix))

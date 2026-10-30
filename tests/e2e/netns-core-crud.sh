@@ -174,7 +174,7 @@ ip -n "${ns_c}" link set service0 up
 
 cat >"${runtime}/a.json" <<EOF
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "${fabric_psk}",
@@ -182,26 +182,45 @@ cat >"${runtime}/a.json" <<EOF
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
     "routing_table_id": 20000,
-    "routes": {"b": ["fd78:1234:5678::3/128"]},
-    "announcements": ["10.100.1.0/24"]
+    "static_routes": {
+      "b": [
+        "fd78:1234:5678::3/128"
+      ]
+    }
   },
   "node": {
-    "uid": {"name": "a", "uuid": "10000000-0000-4000-8000-000000000001"},
+    "uid": {
+      "name": "a",
+      "uuid": "10000000-0000-4000-8000-000000000001"
+    },
     "private_key": "${a_private}",
     "loopback_address_v6": "fd78:1234:5678::1"
   },
-  "peers": [{
-    "name": "b",
-    "public_key": "${b_public}",
-    "endpoints": ["192.0.2.2:51002"],
-    "listen_port": 51001,
-    "interface_name": "vl-a-b"
-  }],
+  "peers": [
+    {
+      "name": "b",
+      "public_key": "${b_public}",
+      "endpoints": [
+        "192.0.2.2:51002"
+      ],
+      "interface_name": "vl-a-b",
+      "listen_ports": 51001
+    }
+  ],
   "domains": {
     "production": {
-      "table_id": 20001,
-      "source_prefixes": ["10.100.1.0/24"],
-      "routes": {"b": ["192.168.20.0/24"]}
+      "source_prefixes": [
+        "10.100.1.0/24"
+      ],
+      "source_table_id": 20001,
+      "static_routes": {
+        "b": [
+          "192.168.20.0/24"
+        ]
+      },
+      "announcements": [
+        "10.100.1.0/24"
+      ]
     }
   }
 }
@@ -209,18 +228,20 @@ EOF
 
 cat >"${runtime}/b.json" <<EOF
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "${fabric_psk}",
     "link_prefix_v4": "10.240.0.0/16",
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
-    "routing_table_id": 20000,
-    "routes": {"a": ["10.100.1.0/24"]}
+    "routing_table_id": 20000
   },
   "node": {
-    "uid": {"name": "b", "uuid": "10000000-0000-4000-8000-000000000002"},
+    "uid": {
+      "name": "b",
+      "uuid": "10000000-0000-4000-8000-000000000002"
+    },
     "private_key": "${b_private}",
     "loopback_address_v6": "fd78:1234:5678::2"
   },
@@ -228,24 +249,35 @@ cat >"${runtime}/b.json" <<EOF
     {
       "name": "a",
       "public_key": "${a_public}",
-      "endpoints": ["192.0.2.1:51001"],
-      "listen_port": 51002,
-      "interface_name": "vl-b-a"
+      "endpoints": [
+        "192.0.2.1:51001"
+      ],
+      "interface_name": "vl-b-a",
+      "listen_ports": 51002
     },
     {
       "name": "c",
       "public_key": "${c_public}",
-      "endpoints": ["192.0.2.3:51004"],
-      "listen_port": 51003,
-      "interface_name": "vl-b-c"
+      "endpoints": [
+        "192.0.2.3:51004"
+      ],
+      "interface_name": "vl-b-c",
+      "listen_ports": 51003
     }
   ],
   "domains": {
     "production": {
-      "table_id": 20001,
-      "source_prefixes": ["10.100.1.0/24"],
-      "routes": {
-        "c": ["192.168.20.0/24"]
+      "source_prefixes": [
+        "10.100.1.0/24"
+      ],
+      "source_table_id": 20001,
+      "static_routes": {
+        "c": [
+          "192.168.20.0/24"
+        ],
+        "a": [
+          "10.100.1.0/24"
+        ]
       }
     }
   }
@@ -254,7 +286,7 @@ EOF
 
 cat >"${runtime}/c.json" <<EOF
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "${fabric_psk}",
@@ -262,25 +294,45 @@ cat >"${runtime}/c.json" <<EOF
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
     "routing_table_id": 20000,
-    "routes": {"b": ["fd78:1234:5678::1/128", "10.100.1.0/24"]}
+    "static_routes": {
+      "b": [
+        "fd78:1234:5678::1/128"
+      ]
+    }
   },
   "node": {
-    "uid": {"name": "c", "uuid": "10000000-0000-4000-8000-000000000003"},
+    "uid": {
+      "name": "c",
+      "uuid": "10000000-0000-4000-8000-000000000003"
+    },
     "private_key": "${c_private}",
     "loopback_address_v6": "fd78:1234:5678::3"
   },
-  "peers": [{
-    "name": "b",
-    "public_key": "${b_public}",
-    "endpoints": ["192.0.2.2:51003"],
-    "listen_port": 51004,
-    "interface_name": "vl-c-b"
-  }],
+  "peers": [
+    {
+      "name": "b",
+      "public_key": "${b_public}",
+      "endpoints": [
+        "192.0.2.2:51003"
+      ],
+      "interface_name": "vl-c-b",
+      "listen_ports": 51004
+    }
+  ],
   "domains": {
     "production": {
-      "table_id": 20001,
-      "source_prefixes": ["10.100.1.0/24"],
-      "announcements": ["192.168.20.0/24"]
+      "source_prefixes": [
+        "10.100.1.0/24"
+      ],
+      "announcements": [
+        "192.168.20.0/24"
+      ],
+      "source_table_id": 20001,
+      "static_routes": {
+        "b": [
+          "10.100.1.0/24"
+        ]
+      }
     }
   }
 }
@@ -327,7 +379,7 @@ ip -n "${ns_a}" rule add priority 32000 to 203.0.113.0/24 lookup 20000 protocol 
 
 cat >"${runtime}/a-updated.json" <<EOF
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "${fabric_psk}",
@@ -335,20 +387,31 @@ cat >"${runtime}/a-updated.json" <<EOF
     "link_prefix_v6": "fd77::/48",
     "loopback_prefix_v6": "fd78:1234:5678::/48",
     "routing_table_id": 21000,
-    "routes": {"b": ["fd78:1234:5678::3/128"]}
+    "static_routes": {
+      "b": [
+        "fd78:1234:5678::3/128"
+      ]
+    }
   },
   "node": {
-    "uid": {"name": "a", "uuid": "10000000-0000-4000-8000-000000000001"},
+    "uid": {
+      "name": "a",
+      "uuid": "10000000-0000-4000-8000-000000000001"
+    },
     "private_key": "${a_private}",
     "loopback_address_v6": "fd78:1234:5678::1"
   },
-  "peers": [{
-    "name": "b",
-    "public_key": "${b_public}",
-    "endpoints": ["192.0.2.2:51002"],
-    "listen_port": 51001,
-    "interface_name": "vl-a-b-new"
-  }]
+  "peers": [
+    {
+      "name": "b",
+      "public_key": "${b_public}",
+      "endpoints": [
+        "192.0.2.2:51002"
+      ],
+      "interface_name": "vl-a-b-new",
+      "listen_ports": 51001
+    }
+  ]
 }
 EOF
 

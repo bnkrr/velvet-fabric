@@ -48,9 +48,7 @@ func DeriveBootstrap(fabricPSK []byte, localPrivate, peerPublic wgtypes.Key, loc
 		ListenPort:    0,
 		LocalAddress:  DeriveLinkLocal(fabricPSK, uid, interfaceName),
 	}
-	if peer.ListenPort != nil {
-		result.ListenPort = *peer.ListenPort
-	}
+	result.ListenPort = peer.ListenPorts.Choice().Port
 	key, err := deriveWGLinkPSK(fabricPSK, localPublic, peerPublic)
 	if err != nil {
 		return Bootstrap{}, err

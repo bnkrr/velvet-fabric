@@ -22,7 +22,7 @@ test('editor schema covers every current Go NodeSpec JSON field', () => {
   const contracts = {
     NodeSpec:C.schema, FabricSpec:C.schema.fabric, Node:C.schema.node, NodeUID:C.schema.node.uid,
     Peer:C.schema.peers[0], BabelSpec:C.schema.babel, DynamicLinksSpec:C.schema.dynamic_links,
-    DurableSpec:C.schema.dynamic_links.durable, PortRange:C.schema.node.port_range,
+    DurableSpec:C.schema.dynamic_links.durable, PortRange:{first:"number",last:"number"},
     DomainSpec:C.schema.domains.$map,
     Route:{prefix:'string',metric:'number'}, Announcement:{prefix:'string',metric:'number'}
   };
@@ -74,18 +74,18 @@ for (const dynamic of [false, true]) test(`preset matches actual ${dynamic ? 'dy
 test('import preserves complete optional fields and explicit zeroes', async () => {
   const s = plain((await fixture)[0]);
   Object.assign(s.fabric, {link_prefix_v4:'10.240.0.0/16',link_prefix_v6:'fd77::/48',vfp_port:58421});
-  Object.assign(s.node, {port_range:{first:40000,last:49999}});
-  Object.assign(s.peers[0], {listen_port:0,persistent_keepalive_seconds:0,link_addresses:['10.240.0.0/30','fd77::/126']});
-  s.fabric.routes.b = [{prefix:'fd78:abcd::3/128',metric:0}];
-  s.fabric.announcements = [{prefix:'10.100.20.0/24',metric:0}];
-  s.dynamic_links = {mode:'active',recovery_timeout_seconds:1800,allow_candidate_prefixes:['0.0.0.0/0','::/0'],durable:{soft_limit:0,stable_seconds:1}};
+
+  Object.assign(s.peers[0], {listen_ports:0,persistent_keepalive_seconds:0,link_addresses:['10.240.0.0/30','fd77::/126']});
+  s.fabric.static_routes.b = [{prefix:'fd78:abcd::3/128',metric:0}];
+  s.domains.internet.announcements = [{prefix:'10.100.20.0/24',metric:0}];
+  s.dynamic_links = {listen_ports:[40000,49999],mode:'active',recovery_timeout_seconds:1800,allow_candidate_prefixes:['0.0.0.0/0','::/0'],durable:{soft_limit:0,stable_seconds:1}};
   s.babel = {enabled:false,executable:'/usr/local/bin/babel-rs'};
   assert.deepEqual(plain(C.imported(s)), s);
   assert.deepEqual(await errors([s]), []);
-  assert.equal(C.effectivePorts(s,s.peers[0]).listen_port,0);
-  delete s.peers[0].listen_port;
-  assert.deepEqual(plain(C.effectivePorts(s,s.peers[0]).port_range),s.node.port_range);
-  s.peers[0].port_range = {first:52000,last:52001};
+  assert.equal(C.effectivePorts(s,s.peers[0]),0);
+  delete s.peers[0].listen_ports;
+  assert.equal(C.effectivePorts(s,s.peers[0]),0);
+  s.peers[0].listen_ports = [52000,52001];
   assert.deepEqual(await errors([s]), []);
 });
 
@@ -93,7 +93,7 @@ test('invalid JSON types and unknown fields are not silently discarded', () => {
   for (const value of [null, [], {node:{listen_port:'0'}}, {fabric:{future_field:1}}, {domains:{internet:{source_prefixes:'10.0.0.0/8'}}}, {peers:[{endpoints:null}]}]) {
     assert.throws(() => C.imported(value));
   }
-  const valid = {api_version:'velvet.io/v1alpha1',kind:'NodeSpec',fabric:{},node:{},peers:[]};
+  const valid = {api_version:'velvet.io/v1alpha2',kind:'NodeSpec',fabric:{},node:{},peers:[]};
   assert.equal(C.imported(valid).node.uid.uuid,undefined);
 });
 
@@ -108,23 +108,22 @@ test('address parsing handles canonical prefixes, compressed IPv6 and families',
 const invalidCases = [
   ['missing peers', s => {s.peers=[];}, 'peers'],
   ['same local key', async s => {s.peers[0].public_key=await C.publicKey(s.node.private_key);}, 'public_key'],
-  ['exclusive ports', s => {s.node.listen_port=0;s.node.port_range={first:1,last:2};}, 'node'],
-  ['reversed range', s => {s.node.port_range={first:10,last:2};}, 'port_range'],
-  ['fixed port inheritance collision', s => {s.node.listen_port=12345;delete s.peers[0].listen_port;s.peers.push({...s.peers[0],name:'d',interface_name:'vl-a-d'});}, 'listen_port'],
-  ['unknown next hop', s => {s.fabric.routes={missing:['10.0.0.0/8']};}, 'routes.missing'],
-  ['empty route group', s => {s.fabric.routes.b=[];}, 'routes.b'],
-  ['metric bounds', s => {s.fabric.routes.b=[{prefix:'::/0',metric:-1}];}, 'metric'],
-  ['announcement conflict', s => {s.fabric.routes.b=['10.100.20.0/24'];}, 'announcements'],
+  ['port bounds', s => {s.peers[0].listen_ports=65536;}, 'listen_ports'],
+  ['reversed range', s => {s.peers[0].listen_ports=[10,2];}, 'listen_ports'],
+  ['fixed port collision', s => {s.peers[0].listen_ports=12345;s.peers.push({...s.peers[0],name:'d',interface_name:'vl-a-d'});}, 'listen_ports'],
+  ['unknown next hop', s => {s.fabric.static_routes={missing:['10.0.0.0/8']};}, 'static_routes.missing'],
+  ['empty route group', s => {s.fabric.static_routes.b=[];}, 'static_routes.b'],
+  ['metric bounds', s => {s.fabric.static_routes.b=[{prefix:'::/0',metric:-1}];}, 'metric'],
+  ['announcement conflict', s => {s.domains.internet.static_routes.b=['10.100.20.0/24'];}, 'announcements'],
   ['source overlap', s => {s.domains.internet.source_prefixes.push('10.100.20.0/25');}, 'source_prefixes'],
-  ['canonical duplicate IPv6', s => {s.fabric.routes.b=['fd78:abcd::3/128','fd78:abcd:0:0:0:0:0:3/128'];}, 'routes'],
-  ['table collision', s => {s.domains.internet.table_id=20000;}, 'table_id'],
+  ['canonical duplicate IPv6', s => {s.fabric.static_routes.b=['fd78:abcd::3/128','fd78:abcd:0:0:0:0:0:3/128'];}, 'static_routes'],
+  ['table collision', s => {s.domains.internet.source_table_id=20000;}, 'source_table_id'],
   ['reserved table', s => {s.fabric.routing_table_id=254;}, 'routing_table_id'],
   ['link address outside pool', s => {s.peers[0].link_addresses=['10.0.0.0/30'];}, 'link_addresses'],
   ['wrong announcement family', s => {s.domains.internet.announcements=['::/0'];}, 'announcements'],
   ['allowlist conditional required', s => {s.dynamic_links={mode:'passive'};}, 'allow_candidate_prefixes'],
   ['recovery timeout bounds', s => {s.dynamic_links={mode:'off',recovery_timeout_seconds:29};}, 'recovery_timeout_seconds'],
   ['recovery timeout upper bound', s => {s.dynamic_links={mode:'off',recovery_timeout_seconds:604801};}, 'recovery_timeout_seconds'],
-  ['loopback metric alignment', s => {s.babel={enabled:true};s.fabric.announcements=[{prefix:s.node.loopback_address_v6+'/128',metric:1}];}, 'metric'],
   ['durable bounds', s => {s.dynamic_links={mode:'off',durable:{soft_limit:129}};}, 'soft_limit'],
   ['Babel enabled required', s => {s.babel={executable:'/bin/babel-rs'};}, 'babel.enabled'],
   ['Babel absolute path', s => {s.babel={enabled:true,executable:'babel-rs'};}, 'executable'],
@@ -137,7 +136,7 @@ for (const [name, change, pathFragment] of invalidCases) test(`validation: ${nam
 test('cross-node identity and Fabric mismatch errors, independent of local table IDs', async () => {
   const specs=plain(await fixture);
   specs[1].fabric.routing_table_id=19000;
-  specs[1].domains.internet.table_id=19001;
+  specs[1].domains.internet.source_table_id=19001;
   assert.deepEqual(await errors(specs),[]);
   specs[1].node.uid.uuid=specs[0].node.uid.uuid;
   specs[1].fabric.psk=C.randomKey();
@@ -169,13 +168,13 @@ test('generated configs accepted by velvetctl resolve', {skip:!process.env.VELVE
   try {
     const complete=plain((await fixture)[0]);
     Object.assign(complete.fabric,{link_prefix_v4:'10.240.0.0/16',link_prefix_v6:'fd77::/48',vfp_port:58421});
-    complete.node.port_range={first:40000,last:49999};
-    Object.assign(complete.peers[0],{listen_port:0,persistent_keepalive_seconds:0,link_addresses:['10.240.0.0/30','fd77::/126']});
-    complete.fabric.routes.b=[{prefix:'fd78:abcd::3/128',metric:0}];
-    complete.fabric.announcements=[{prefix:'10.100.20.0/24',metric:0}];
-    complete.dynamic_links={mode:'active',recovery_timeout_seconds:1800,allow_candidate_prefixes:['0.0.0.0/0','::/0'],durable:{soft_limit:0,stable_seconds:1}};
+
+    Object.assign(complete.peers[0],{listen_ports:0,persistent_keepalive_seconds:0,link_addresses:['10.240.0.0/30','fd77::/126']});
+    complete.fabric.static_routes.b=[{prefix:'fd78:abcd::3/128',metric:0}];
+    complete.domains.internet.announcements=[{prefix:'10.100.20.0/24',metric:0}];
+    complete.dynamic_links={listen_ports:[40000,49999],mode:'active',recovery_timeout_seconds:1800,allow_candidate_prefixes:['0.0.0.0/0','::/0'],durable:{soft_limit:0,stable_seconds:1}};
     complete.babel={enabled:true,executable:'/usr/local/bin/babel-rs'};
-    const peerRange=plain(complete);delete peerRange.peers[0].listen_port;peerRange.peers[0].port_range={first:52000,last:52999};
+    const peerRange=plain(complete);peerRange.peers[0].listen_ports=[52000,52999];
     const all=[...await C.examples(false),...await C.examples(true),complete,peerRange];
     for (const [i,s] of all.entries()) {
       const file=path.join(tmp,`${i}-${s.node.uid.name}.json`);

@@ -121,7 +121,7 @@ for node, metadata in NODES.items():
                 "name": peer,
                 "public_key": public_keys[peer],
                 "endpoints": [f"{NODES[peer]['underlay']}:{ports[(peer, node)]}"],
-                "listen_port": ports[(node, peer)],
+                "listen_ports": ports[(node, peer)],
                 "interface_name": f"vl-{node}-{peer}",
             }
         )
@@ -136,14 +136,6 @@ for node, metadata in NODES.items():
             f"fd78:abcd::{target_metadata['index']}/128",
         )
 
-    fabric_announcements = []
-    for plan in PLANS.values():
-        for prefix, owner in plan["sources"].items():
-            if owner == node:
-                fabric_announcements.append(prefix)
-            else:
-                group_route(fabric_routes, next_hop(node, owner), prefix)
-
     domains = {}
     for plan_name, plan in PLANS.items():
         members = plan["members"]
@@ -151,27 +143,31 @@ for node, metadata in NODES.items():
             continue
         routes: dict[str, list[str]] = {}
         announcements: list[str] = []
+        for prefix, owner in plan["sources"].items():
+            if owner == node:
+                announcements.append(prefix)
+            else:
+                group_route(routes, next_hop(node, owner, members), prefix)
         for prefix, owner in plan["targets"].items():
             if owner == node:
                 announcements.append(prefix)
             else:
                 group_route(routes, next_hop(node, owner, members), prefix)
         domains[plan_name] = {
-            "table_id": plan["table"],
+            "source_table_id": plan["table"],
             "source_prefixes": list(plan["sources"]),
-            "routes": routes,
+            "static_routes": routes,
             "announcements": announcements,
         }
 
     value = {
-        "api_version": "velvet.io/v1alpha1",
+        "api_version": "velvet.io/v1alpha2",
         "kind": "NodeSpec",
         "fabric": {
             "psk": fabric_psk,
             "loopback_prefix_v6": "fd78:abcd::/48",
             "routing_table_id": 20000,
-            "routes": fabric_routes,
-            "announcements": fabric_announcements,
+            "static_routes": fabric_routes,
         },
         "node": {
             "uid": {

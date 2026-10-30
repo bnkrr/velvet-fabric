@@ -7,7 +7,7 @@ Use [a.json](a.json), [b.json](b.json), and [c.json](c.json) with the shared
 - C announces the default exit `0.0.0.0/0` in Domain `internet`.
 - B configures the same Domain source set and forwards both directions.
 
-There are no explicit `routes` fields. Managed Babel learns the outbound,
+There are no explicit `static_routes` fields. Managed Babel learns the outbound,
 return and node-loopback paths. The A–B and B–C WireGuard peers remain
 configured explicitly; this example does not enable Dynamic Links.
 

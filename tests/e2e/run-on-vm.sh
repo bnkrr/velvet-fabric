@@ -5,10 +5,10 @@ cd "${repo_root}"
 selection=${1:-all}
 case ${selection} in
   --help|-h)
-    echo "usage: $0 [all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|cold-rejoin|resilience|resilience-dynamic|nat [CASE...]]"
+    echo "usage: $0 [all|netns|resilience-all|static|ports|crud|static-core|dynamic|domains|domains-static|examples|cold-rejoin|resilience|resilience-dynamic|nat [CASE...]]"
     echo 'VM/build configuration: tests/VM.md'
     exit 0 ;;
-  all|netns|resilience-all|static|ports|crud|static-core|dynamic|examples|cold-rejoin|resilience|resilience-dynamic) ;;
+  all|netns|resilience-all|static|ports|crud|static-core|dynamic|domains|domains-static|examples|cold-rejoin|resilience|resilience-dynamic) ;;
   nat)
     for nat_case in "${@:2}"; do
       case ${nat_case} in
@@ -44,6 +44,8 @@ commands = {
     'crud': ['sh', root + '/tests/e2e/netns-core-crud.sh', velvet],
     'static-core': ['sh', root + '/tests/e2e/netns-wg-admin-core.sh', velvet],
     'dynamic': ['sh', root + '/tests/e2e/netns-dynamic.sh', velvet, babel, ctl],
+    'domains': ['python3', root + '/tests/e2e/netns-domains.py', velvet, babel, ctl],
+    'domains-static': ['python3', root + '/tests/e2e/netns-domains.py', velvet, babel, ctl, '--mode', 'static'],
     'examples': ['python3', root + '/tests/e2e/netns-examples.py', velvet, babel, ctl],
     'cold-rejoin': ['python3', root + '/tests/directed/suite.py', velvet, babel, '--case', 'cold-rejoin', '--family', 'both', '--artifacts', root + '/cold-rejoin'],
     'resilience': ['python3', root + '/tests/e2e/netns-resilience.py', root],

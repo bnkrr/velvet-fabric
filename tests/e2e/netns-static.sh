@@ -80,7 +80,7 @@ ip -n "${ns_a}" -6 rule add priority 32003 to 2001:db8:dead::/48 lookup 20000 pr
 
 cat > "${runtime}/a.json" <<EOF
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "${fabric_psk}",
@@ -91,7 +91,7 @@ cat > "${runtime}/a.json" <<EOF
     "name": "b",
     "public_key": "${b_public}",
     "endpoints": ["192.0.2.2:51002"],
-    "listen_port": 51001,
+    "listen_ports": 51001,
     "persistent_keepalive_seconds": 5
   }]
 }
@@ -99,7 +99,7 @@ EOF
 
 cat > "${runtime}/b.json" <<EOF
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "${fabric_psk}",
@@ -110,7 +110,7 @@ cat > "${runtime}/b.json" <<EOF
     "name": "a",
     "public_key": "${a_public}",
     "endpoints": ["192.0.2.1:51001"],
-    "listen_port": 51002,
+    "listen_ports": 51002,
     "interface_name": "vl-b-custom"
   }]
 }
@@ -123,8 +123,8 @@ root = pathlib.Path(sys.argv[1])
 a = json.loads((root / 'a.json').read_text())
 b = json.loads((root / 'b.json').read_text())
 a['peers'][0]['endpoints'] = []
-b['node']['port_range'] = {'first': 40000, 'last': 40031}
-b['peers'][0]['listen_port'] = 0
+b['dynamic_links'] = {'mode': 'off', 'listen_ports': [40000,40031]}
+b['peers'][0]['listen_ports'] = 0
 (root / 'a.json').write_text(json.dumps(a, indent=2))
 (root / 'b.json').write_text(json.dumps(b, indent=2))
 PYPORTS

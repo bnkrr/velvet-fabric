@@ -94,10 +94,12 @@ multi-hop Fabric path.
 The managed integration, local build helper and privileged CI share the full
 Babel commit in `tests/babel-revision`. Local wrappers export that commit by
 default; `VELVET_BABEL_SOURCE=working-tree` explicitly tests paired development
-changes. Resilience requires the new FIB recovery configuration and status API.
+changes. Fabric 0.7.0 uses Babel 0.8.0's independent protocol policies and export
+filters. Resilience also requires its FIB recovery configuration and status API.
 `manager_test.go` covers the structured `[[interfaces]]`/`match` configuration, static names and dynamic
 interface patterns, explicit wired policy, top-level shutdown budget, origins
-and export views. The real netns suites exercise Babel's own config validator,
+and explicit protocol policies independent of per-view source/destination
+filters. The real netns suites exercise Babel's own config validator,
 control readiness/reload, interface attachment, route export and restart.
 
 `shutdown_test.go` exercises an actual child process with an unavailable
@@ -115,11 +117,21 @@ host through B and C's NAT. It checks both forwarding directions, local Access
 delivery, node loopbacks and route/rule ownership. Run it with
 `tests/e2e/run-on-vm.sh examples`.
 
-The static Core and dynamic suites configure Access return prefixes in the
-Fabric view and business exits in Domain views. No external return-selection
-rules are installed: Velvet owns both source selection and destination return
-selection. The dynamic suite also checks dual-stack Access traffic and host
-routing isolation when ordinary split-default routes are learned and withdrawn.
+The static Core and dynamic suites declare Access returns and exits under
+their owning Domain. Ordinary returns use the shared Fabric table and only the
+owning source view; exits use that Domain's canonical source. No external
+return-selection rules are installed: Velvet owns source and destination
+selectors, while managed Babel owns dynamic routes.
+
+`tests/e2e/run-on-vm.sh domains-static` and `domains` run the five-node restricted
+Domain fixture. p1 takes a three-hop member path although a two-hop path through
+a nonmember exists; p2 uses the short path. Independent dual-stack clients
+exercise native and pre-SNAT fwmark Access through the same default exit.
+The tests inspect both directions and reject foreign returns in each source
+view. The Babel variant removes a Domain on the only p1 transit path, verifies
+finite-route withdrawal and no-path termination while p2 remains usable (Babel
+unreachable withdrawal holds may remain), then restores
+it and checks recovery. All namespaces and daemon state are test-owned.
 
 `e2e/netns-udp-nat.py` runs real velvetd, pinned Babel, VFP, UDP and kernel WG
 with a public static bootstrap observer and either directly addressed WAN

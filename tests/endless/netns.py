@@ -269,14 +269,14 @@ class Runner:
                 if peer == node:
                     continue
                 peers.append({'name': f'in-{peer}', 'public_key': self.pubs[peer],
-                    'listen_port': 52000 + peer, 'endpoints': self.receiver_endpoints(node, peer),
+                    'listen_ports': 52000 + peer, 'endpoints': self.receiver_endpoints(node, peer),
                     'interface_name': f'vl-in-{peer:02d}', 'persistent_keepalive_seconds': 1})
         bootstrap = self.topology.boot[node]
         if bootstrap is not None:
             peers.append({'name': 'bootstrap', 'public_key': self.pubs[bootstrap],
-                'listen_port': 51000 + node, 'endpoints': self.bootstrap_endpoints(node, bootstrap),
+                'listen_ports': 51000 + node, 'endpoints': self.bootstrap_endpoints(node, bootstrap),
                 'interface_name': f'vl-boot-{bootstrap:02d}', 'persistent_keepalive_seconds': 1})
-        spec = {'api_version': 'velvet.io/v1alpha1', 'kind': 'NodeSpec',
+        spec = {'api_version': 'velvet.io/v1alpha2', 'kind': 'NodeSpec',
             'fabric': {'psk': self.psk, 'loopback_prefix_v6': 'fd78:e2ee::/48', 'routing_table_id': 20000},
             'node': {'uid': {'name': f'n{node}', 'uuid': self.uids[node]},
                      'private_key': self.keys[node], 'loopback_address_v6': address(node)},
@@ -285,7 +285,7 @@ class Runner:
                 underlay_prefix(family) for family in
                 ((self.topology.discovery_family[node],) if self.topology.mixed and node not in self.topology.transit
                  else families(self.args.underlay))]}}
-        spec['node'].update(self.automatic_ports(node))
+        spec['dynamic_links'].update(self.automatic_ports(node))
         spec['dynamic_links']['durable'] = {'stable_seconds': getattr(self.args, 'durable_stable_seconds', 1800)}
         if self.access:
             from access import configure
@@ -295,8 +295,8 @@ class Runner:
     def automatic_ports(self, node):
         mode = getattr(self.args, 'automatic_ports', 'system')
         if mode == 'range' or (mode == 'mixed' and node % 2):
-            return {'port_range': {'first': 40000, 'last': 40999}}
-        return {'listen_port': 0}
+            return {'listen_ports': [40000,40999]}
+        return {'listen_ports': 0}
 
     def durable_records(self, node):
         path = Path('/var/lib/velvet') / self.uids[node] / 'durable.json'
@@ -657,7 +657,10 @@ class Runner:
             # inside the same bounded convergence window, not as an assumed
             # unaffected direct path inherited from the old full-mesh fixture.
             try:
-                pairs = audit(self.topology, self.observe())
+                observations = self.observe()
+                pairs = audit(self.topology, observations)
+                if self.access:
+                    self.access.audit(observations)
                 probed.update(self.probes(pairs))
                 if good_since is None:
                     good_since = time.monotonic()

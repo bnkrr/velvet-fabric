@@ -234,15 +234,15 @@ def scenario(case):
             peers = []
             for peer in (("a", "b", "d") if node == "c" and mode == "observer-fallback" else ("a", "b") if node == "c" else ("c",)):
                 if {node, peer} == {"c", "d"}:
-                    peers.append({"name": peer, "public_key": pubs[peer], "interface_name": f"vl-{node}-{peer}", "listen_port": 52003 if node == "c" else 53003, "endpoints": ["192.0.2.2:53003" if node == "c" else "192.0.2.1:52003"], "persistent_keepalive_seconds": 1})
+                    peers.append({"name": peer, "public_key": pubs[peer], "interface_name": f"vl-{node}-{peer}", "listen_ports": 52003 if node == "c" else 53003, "endpoints": ["192.0.2.2:53003" if node == "c" else "192.0.2.1:52003"], "persistent_keepalive_seconds": 1})
                     continue
                 leaf = peer if node == "c" else node
                 number = 1 if leaf == "a" else 2
                 peers.append({"name": peer, "public_key": pubs[peer], "interface_name": f"vl-{node}-{peer}",
-                              "listen_port": 52000+number if node == "c" else 51000+number,
+                              "listen_ports": 52000+number if node == "c" else 51000+number,
                               "endpoints": [endpoint(wan_addresses[leaf], 51000+number) if node == "c" else endpoint(wan_addresses["c"], 52000+number)],
                               "persistent_keepalive_seconds": 1})
-            spec = {"api_version": "velvet.io/v1alpha1", "kind": "NodeSpec",
+            spec = {"api_version": "velvet.io/v1alpha2", "kind": "NodeSpec",
                     "fabric": {"psk": psk, "loopback_prefix_v6": "fd78:7777::/48", "routing_table_id": 20000},
                     "node": {"uid": {"name": node, "uuid": uid}, "private_key": keys[node], "loopback_address_v6": f"fd78:7777::{index}"},
                     "peers": peers, "babel": {"enabled": True, "executable": BABEL}}
@@ -253,9 +253,9 @@ def scenario(case):
             if node in ("a", "b") and config.get("durable_test"):
                 spec["dynamic_links"]["durable"] = {"stable_seconds": 2}
                 if config["ports"] == "range":
-                    spec["node"]["port_range"] = {"first": 40000, "last": 40031}
+                    spec["dynamic_links"]["listen_ports"] = [40000,40031]
                 elif config["ports"] == "fixed":
-                    spec["node"]["listen_port"] = 42000 + index
+                    spec["dynamic_links"]["listen_ports"] = 42000 + index
             if node == "b" and config.get("retry_fault", "").startswith("policy-"):
                 spec["dynamic_links"]["mode"] = "off"
             if node == "a" and config.get("retry_fault") == "retry-blackout":

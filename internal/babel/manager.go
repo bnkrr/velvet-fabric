@@ -318,6 +318,9 @@ func Render(plan *reconcile.BabelPlan, linkOrigins map[string][]netip.Prefix) []
 		}
 		fmt.Fprintf(&output, "metric = %d\n\n", origin.Metric)
 	}
+	// Protocol participation is explicit and independent of table installation.
+	writeRouteFilter(&output, "policy.import", plan.ImportPrefixes, plan.ImportSources)
+	writeRouteFilter(&output, "policy.announce", plan.ImportPrefixes, plan.ImportSources)
 	output.WriteString("[export]\n")
 	fmt.Fprintf(&output, "protocol = %d\n", plan.Protocol)
 	fmt.Fprintf(&output, "device_only = %t\n", plan.DeviceOnly)
@@ -325,13 +328,31 @@ func Render(plan *reconcile.BabelPlan, linkOrigins map[string][]netip.Prefix) []
 	for _, view := range plan.Views {
 		output.WriteString("[[export.views]]\n")
 		fmt.Fprintf(&output, "table = %d\n", view.TableID)
+		var sources []netip.Prefix
 		if view.Source.IsValid() {
 			fmt.Fprintf(&output, "source = %s\n", strconv.Quote(view.Source.String()))
 			fmt.Fprintf(&output, "rule_priority = %d\n", view.RulePriority)
+			sources = []netip.Prefix{view.Source}
 		}
-		output.WriteByte('\n')
+		writeRouteFilter(&output, "export.views.filter", view.ReturnPrefixes, sources)
 	}
 	return output.Bytes()
+}
+
+// Business scopes compile to Babel's generic source/destination match rules.
+func writeRouteFilter(output *bytes.Buffer, path string, returns, sources []netip.Prefix) {
+	fmt.Fprintf(output, "[%s]\ndefault = \"deny\"\n", path)
+	for _, prefix := range normalizePrefixes(returns) {
+		zero := "::/0"
+		if prefix.Addr().Is4() {
+			zero = "0.0.0.0/0"
+		}
+		fmt.Fprintf(output, "[[%s.rules]]\naction = \"allow\"\nsource = { prefix = %s, match = \"exact\" }\ndestination = { prefix = %s, match = \"within\" }\n", path, strconv.Quote(zero), strconv.Quote(prefix.String()))
+	}
+	for _, source := range normalizePrefixes(sources) {
+		fmt.Fprintf(output, "[[%s.rules]]\naction = \"allow\"\nsource = { prefix = %s, match = \"exact\" }\n", path, strconv.Quote(source.String()))
+	}
+	output.WriteByte('\n')
 }
 
 func normalizePrefixes(prefixes []netip.Prefix) []netip.Prefix {

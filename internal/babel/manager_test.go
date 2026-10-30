@@ -41,6 +41,37 @@ func TestRenderManagedConfig(t *testing.T) {
 	}
 }
 
+func TestProtocolAdmissionDoesNotDependOnTableFilters(t *testing.T) {
+	first := netip.MustParsePrefix("192.0.2.0/24")
+	second := netip.MustParsePrefix("198.51.100.0/24")
+	plan := &reconcile.BabelPlan{
+		ImportPrefixes: []netip.Prefix{first, second},
+		ImportSources:  []netip.Prefix{first},
+		Views:          []reconcile.BabelView{{TableID: 201, ReturnPrefixes: []netip.Prefix{first}}},
+	}
+	before := string(Render(plan, nil))
+	for _, field := range []string{
+		"[policy.import]\ndefault = \"deny\"",
+		"[policy.announce]\ndefault = \"deny\"",
+		`source = { prefix = "0.0.0.0/0", match = "exact" }`,
+		`destination = { prefix = "198.51.100.0/24", match = "within" }`,
+		`source = { prefix = "192.0.2.0/24", match = "exact" }`,
+		"[export.views.filter]\ndefault = \"deny\"",
+	} {
+		if !strings.Contains(before, field) {
+			t.Fatalf("missing generic policy field %q", field)
+		}
+	}
+	if strings.Contains(before, "ordinary_prefixes") {
+		t.Fatal("obsolete Babel-specific whitelist emitted")
+	}
+	plan.Views[0].ReturnPrefixes = []netip.Prefix{second}
+	after := string(Render(plan, nil))
+	if strings.SplitN(before, "[export]", 2)[0] != strings.SplitN(after, "[export]", 2)[0] {
+		t.Fatal("table filter changed protocol participation")
+	}
+}
+
 func TestRuntimeRoutingAdmissionAndWithdrawal(t *testing.T) {
 	dir := t.TempDir()
 	manager := New(&reconcile.BabelPlan{ConfigPath: filepath.Join(dir, "babel.toml"), StatePath: filepath.Join(dir, "state"), Interfaces: []string{"vl-static"}}, nil)

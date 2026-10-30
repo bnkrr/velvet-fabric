@@ -280,7 +280,7 @@ wait_route8() {
     route=$(ip -n "$(namespace ea)" -6 route show table 20000 exact fd78:abcd::8/128 proto 203 2>/dev/null || true)
     default4=$(ip -n "$(namespace ea)" route show table 20000 exact 128.0.0.0/1 proto 203 2>/dev/null || true)
     default6=$(ip -n "$(namespace ea)" -6 route show table 20000 exact ::/1 proto 203 2>/dev/null || true)
-    if { test "${presence}" = present && test -n "${route}" && test -n "${default4}" && test -n "${default6}"; } ||
+    if { test "${presence}" = present && test -n "${route}" && test -z "${default4}${default6}"; } ||
        { test "${presence}" = absent && test -z "${route}${default4}${default6}"; }; then return; fi
     attempt=$((attempt + 1))
     # A graceful retraction normally converges immediately.  The upper bound

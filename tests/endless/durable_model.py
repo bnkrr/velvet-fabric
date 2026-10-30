@@ -114,10 +114,11 @@ class DurableAudit:
             for name, link in obs['wg'].items():
                 if not name.startswith('vdl-') or not link['port']:
                     continue
-                span = choice.get('port_range')
-                if span and not span['first'] <= link['port'] <= span['last']:
+                ports = choice.get('listen_ports',0)
+                span = ports if isinstance(ports,list) else None
+                if span and not span[0] <= link['port'] <= span[1]:
                     raise AssertionError('automatic WG listen port escaped configured range')
-                if choice.get('listen_port', 0) and link['port'] != choice['listen_port']:
+                if isinstance(ports,int) and ports and link['port'] != ports:
                     raise AssertionError('automatic WG listen port escaped fixed choice')
         for (node, remote), value in current.items():
             reverse = current.get((remote, node))

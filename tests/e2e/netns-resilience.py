@@ -90,7 +90,7 @@ def setup():
         ns(n, 'ip', 'addr', 'add', f'10.88.0.{i}/32', 'dev', 'lo')
         ns(n, 'sysctl', '-qw', 'net.ipv4.conf.all.rp_filter=0', 'net.ipv4.conf.default.rp_filter=0', 'net.ipv4.ip_unprivileged_port_start=1024')
         peers = [dict(name=b, public_key=pubs[b], listen_port=ports[n, b], endpoints=[f'192.0.2.{nodes.index(b) + 1}:{ports[b, n]}'], interface_name=f'vl-{n}-{b}') for b in nodes if b != n and (not DYNAMIC or n == 'c' or b == 'c')]
-        cfg = dict(api_version='velvet.io/v1alpha1', kind='NodeSpec', fabric=dict(psk=psk, loopback_prefix_v6='fd78:ac10::/48', announcements=[f'10.88.0.{i}/32']), node=dict(uid=dict(uuid=str(uuid.uuid4()), name=n), private_key=keys[n], loopback_address_v6=f'fd78:ac10::{i}'), peers=peers, babel=dict(enabled=True, executable=str(R / 'babel-rs')), dynamic_links=dict(mode='active' if DYNAMIC and n != 'c' else 'off', allow_candidate_prefixes=['192.0.2.0/24'], recovery_timeout_seconds=60), domains=dict(business=dict(table_id=20001, source_prefixes=['10.88.0.0/24'])))
+        cfg = dict(api_version='velvet.io/v1alpha2', kind='NodeSpec', fabric=dict(psk=psk, loopback_prefix_v6='fd78:ac10::/48', announcements=[f'10.88.0.{i}/32']), node=dict(uid=dict(uuid=str(uuid.uuid4()), name=n), private_key=keys[n], loopback_address_v6=f'fd78:ac10::{i}'), peers=peers, babel=dict(enabled=True, executable=str(R / 'babel-rs')), dynamic_links=dict(mode='active' if DYNAMIC and n != 'c' else 'off', allow_candidate_prefixes=['192.0.2.0/24'], recovery_timeout_seconds=60), domains=dict(business=dict(table_id=20001, source_prefixes=['10.88.0.0/24'])))
         if not DYNAMIC:
             # NodeSpec allows privileged VFP ports. Exercise the packaged
             # service's bind capability; the dynamic scenario uses the default.

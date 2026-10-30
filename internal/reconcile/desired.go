@@ -98,17 +98,19 @@ type RulePlan struct {
 }
 
 type BabelPlan struct {
-	ServiceName string
-	Executable  string
-	ConfigPath  string
-	ControlPath string
-	StatePath   string
-	Interfaces  []string
-	Origins     []BabelOrigin
-	Views       []BabelView
-	Protocol    uint8
-	DeviceOnly  bool
-	ManageRules bool
+	ServiceName    string
+	Executable     string
+	ConfigPath     string
+	ControlPath    string
+	StatePath      string
+	Interfaces     []string
+	Origins        []BabelOrigin
+	Views          []BabelView
+	ImportPrefixes []netip.Prefix
+	ImportSources  []netip.Prefix
+	Protocol       uint8
+	DeviceOnly     bool
+	ManageRules    bool
 }
 
 type BabelOrigin struct {
@@ -118,9 +120,10 @@ type BabelOrigin struct {
 }
 
 type BabelView struct {
-	TableID      int
-	Source       netip.Prefix
-	RulePriority int
+	ReturnPrefixes []netip.Prefix
+	TableID        int
+	Source         netip.Prefix
+	RulePriority   int
 }
 
 func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
@@ -145,14 +148,14 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 		return nil, fmt.Errorf("derive loopbacks: %w", err)
 	}
 	desired := &DesiredState{
-		Ports:   spec.ChoosePorts(nodeSpec.Node.ListenPort, nodeSpec.Node.PortRange),
+		Ports:   nodeSpec.DynamicPorts(),
 		Durable: spec.EffectiveDurable(nodeSpec.DynamicLinks),
 		UID:     nodeSpec.Node.UID, UUID: uid, FabricPSK: fabricPSK,
 		LinkPoolV4: link4, LinkPoolV6: link6, LoopbackPoolV6: loop6,
 		LoopbackV6: localLoop6, VFPPort: nodeSpec.Fabric.EffectiveVFPPort(),
 		FabricTableID:      nodeSpec.Fabric.EffectiveRoutingTableID(),
 		LoopbackOwnerAlias: "velvet:loopback:" + uid.String(),
-		Forwarding:         len(nodeSpec.Fabric.Routes) > 0 || len(nodeSpec.Domains) > 0 || nodeSpec.Babel.IsEnabled(),
+		Forwarding:         len(nodeSpec.Fabric.StaticRoutes) > 0 || len(nodeSpec.Domains) > 0 || nodeSpec.Babel.IsEnabled(),
 		PrivateKey:         privateKey,
 	}
 	if nodeSpec.DynamicLinks != nil {
@@ -177,7 +180,7 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 			return nil, fmt.Errorf("peer %q: %w", peer.Name, err)
 		}
 		if other, exists := ports[bootstrap.ListenPort]; exists && bootstrap.ListenPort != 0 {
-			return nil, fmt.Errorf("peer %q and peer %q use listen port %d; set a listen_port override", peer.Name, other, bootstrap.ListenPort)
+			return nil, fmt.Errorf("peer %q and peer %q use listen port %d; set different listen_ports", peer.Name, other, bootstrap.ListenPort)
 		}
 		ports[bootstrap.ListenPort] = peer.Name
 		var keepalive *time.Duration
@@ -206,75 +209,103 @@ func BuildDesiredState(nodeSpec *spec.NodeSpec) (*DesiredState, error) {
 	return desired, nil
 }
 
+// Kernel rule priorities are independent of the user-visible table IDs.
+const FabricRulePriority = 20000
+const DomainRulePriority = 20001
+const UnreachableMetric uint32 = 2147483647
+
+func sortedDomainNames(nodeSpec *spec.NodeSpec) []string {
+	names := make([]string, 0, len(nodeSpec.Domains))
+	for name := range nodeSpec.Domains {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sourcePrefixes(domain spec.DomainSpec) []netip.Prefix {
+	result := make([]netip.Prefix, 0, len(domain.SourcePrefixes))
+	for _, raw := range domain.SourcePrefixes {
+		result = append(result, netip.MustParsePrefix(raw))
+	}
+	return result
+}
+
 func compileRouting(desired *DesiredState, nodeSpec *spec.NodeSpec, links map[string]LinkPlan) error {
-	routeKeys := make(map[string]struct{})
-	ruleKeys := make(map[string]struct{})
+	routeKeys, ruleKeys := map[string]bool{}, map[string]bool{}
 	addRoute := func(route RoutePlan) {
-		key := fmt.Sprintf("%d|%s", route.TableID, route.Prefix)
-		if _, exists := routeKeys[key]; exists {
-			return
+		metric := uint32(0)
+		if route.Metric != nil {
+			metric = *route.Metric
 		}
-		routeKeys[key] = struct{}{}
-		desired.Routes = append(desired.Routes, route)
+		key := fmt.Sprintf("%d|%s|%d|%d", route.TableID, route.Prefix, route.Type, metric)
+		if !routeKeys[key] {
+			routeKeys[key] = true
+			desired.Routes = append(desired.Routes, route)
+		}
 	}
 	addRule := func(rule RulePlan) {
 		key := fmt.Sprintf("%d|%s|%s", rule.TableID, rule.Source, rule.Destination)
-		if _, exists := ruleKeys[key]; exists {
-			return
+		if !ruleKeys[key] {
+			ruleKeys[key] = true
+			desired.Rules = append(desired.Rules, rule)
 		}
-		ruleKeys[key] = struct{}{}
-		desired.Rules = append(desired.Rules, rule)
 	}
-	addDestinationRule := func(table int, prefix netip.Prefix) {
-		addRule(RulePlan{TableID: table, Priority: table, Destination: prefix})
+	guard := func(table int, prefix netip.Prefix) {
+		metric := UnreachableMetric
+		addRoute(RoutePlan{TableID: table, Prefix: prefix, Type: RouteUnreachable, Metric: &metric})
 	}
-
-	if err := compilePeerRoutes(nodeSpec.Fabric.Routes, desired.FabricTableID, links, addRoute, addDestinationRule); err != nil {
+	names := sortedDomainNames(nodeSpec)
+	tables := []int{desired.FabricTableID}
+	for _, name := range names {
+		tables = append(tables, nodeSpec.Domains[name].SourceTableID)
+	}
+	for _, pool := range nodeSpec.Fabric.InfrastructurePrefixes() {
+		addRule(RulePlan{TableID: desired.FabricTableID, Priority: FabricRulePriority, Destination: pool})
+		for _, table := range tables {
+			guard(table, pool)
+		}
+	}
+	// Shared infrastructure is available in every Domain; business return paths
+	// are copied only into the Domain that owns their destination prefix.
+	if err := compilePeerRoutes(nodeSpec.Fabric.StaticRoutes, desired.FabricTableID, links, func(route RoutePlan) {
+		for _, table := range tables {
+			item := route
+			item.TableID = table
+			addRoute(item)
+		}
+	}); err != nil {
 		return err
 	}
-	for _, pool := range []netip.Prefix{desired.LinkPoolV4, desired.LinkPoolV6, desired.LoopbackPoolV6} {
-		if !pool.IsValid() {
-			continue
-		}
-		addDestinationRule(desired.FabricTableID, pool)
-		addRoute(RoutePlan{TableID: desired.FabricTableID, Prefix: pool, Type: RouteUnreachable})
-	}
-
-	domainNames := make([]string, 0, len(nodeSpec.Domains))
-	for name := range nodeSpec.Domains {
-		domainNames = append(domainNames, name)
-	}
-	sort.Strings(domainNames)
-	for _, name := range domainNames {
+	for _, name := range names {
 		domain := nodeSpec.Domains[name]
-		for _, raw := range domain.SourcePrefixes {
-			prefix, err := netip.ParsePrefix(raw)
-			if err != nil {
-				return fmt.Errorf("domain %q source prefix: %w", name, err)
-			}
-			addRule(RulePlan{TableID: domain.TableID, Priority: domain.TableID, Source: prefix})
-			// Return traffic selects the ordinary Fabric view regardless of its
-			// source. Admission stays tied to local configuration, not learned routes.
-			addDestinationRule(desired.FabricTableID, prefix)
+		for _, prefix := range sourcePrefixes(domain) {
+			addRule(RulePlan{TableID: domain.SourceTableID, Priority: DomainRulePriority, Source: prefix})
+			addRule(RulePlan{TableID: desired.FabricTableID, Priority: FabricRulePriority, Destination: prefix})
+			guard(desired.FabricTableID, prefix)
+			guard(domain.SourceTableID, prefix)
 		}
-		if err := compilePeerRoutes(domain.Routes, domain.TableID, links, addRoute, nil); err != nil {
+		for _, canonical := range canonicalSources(domain.SourcePrefixes) {
+			zero := netip.PrefixFrom(netip.IPv6Unspecified(), 0)
+			if canonical.Addr().Is4() {
+				zero = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
+			}
+			guard(domain.SourceTableID, zero)
+		}
+		if err := compilePeerRoutes(domain.StaticRoutes, domain.SourceTableID, links, func(route RoutePlan) {
+			addRoute(route)
+			if domain.IsAccessPrefix(route.Prefix) {
+				route.TableID = desired.FabricTableID
+				addRoute(route)
+			}
+		}); err != nil {
 			return fmt.Errorf("domain %q: %w", name, err)
 		}
-	}
-	for _, announcement := range nodeSpec.Fabric.Announcements {
-		prefix, _ := netip.ParsePrefix(announcement.Prefix)
-		addRoute(RoutePlan{TableID: desired.FabricTableID, Prefix: prefix, Type: RouteThrow})
-		addDestinationRule(desired.FabricTableID, prefix)
-		for _, name := range domainNames {
-			addRoute(RoutePlan{TableID: nodeSpec.Domains[name].TableID, Prefix: prefix, Type: RouteThrow})
-		}
-	}
-	for _, name := range domainNames {
-		domain := nodeSpec.Domains[name]
 		for _, announcement := range domain.Announcements {
-			prefix, _ := netip.ParsePrefix(announcement.Prefix)
-			if hasAddressFamily(domain.SourcePrefixes, prefix.Addr().Is4()) {
-				addRoute(RoutePlan{TableID: domain.TableID, Prefix: prefix, Type: RouteThrow})
+			prefix := netip.MustParsePrefix(announcement.Prefix)
+			addRoute(RoutePlan{TableID: domain.SourceTableID, Prefix: prefix, Type: RouteThrow})
+			if domain.IsAccessPrefix(prefix) {
+				addRoute(RoutePlan{TableID: desired.FabricTableID, Prefix: prefix, Type: RouteThrow})
 			}
 		}
 	}
@@ -288,36 +319,42 @@ func compileBabel(desired *DesiredState, nodeSpec *spec.NodeSpec) *BabelPlan {
 	}
 	runtimeRoot := filepath.Join("/run/velvet-babel", desired.UUID.String())
 	stateRoot := filepath.Join("/var/lib/velvet", desired.UUID.String())
+	ordinary := append([]netip.Prefix(nil), nodeSpec.Fabric.InfrastructurePrefixes()...)
+	names := sortedDomainNames(nodeSpec)
+	for _, name := range names {
+		ordinary = append(ordinary, sourcePrefixes(nodeSpec.Domains[name])...)
+	}
 	plan := &BabelPlan{
-		Executable:  executable,
-		ConfigPath:  filepath.Join(stateRoot, "babel-rs.toml"),
-		ControlPath: filepath.Join(runtimeRoot, "babel-rs.ctl"),
-		StatePath:   filepath.Join(stateRoot, "babel-rs-state.toml"),
-		Protocol:    BabelDynamicProtocol, DeviceOnly: true, ManageRules: false,
-		Views: []BabelView{{TableID: desired.FabricTableID}},
+		Executable: executable, ConfigPath: filepath.Join(stateRoot, "babel-rs.toml"), ControlPath: filepath.Join(runtimeRoot, "babel-rs.ctl"), StatePath: filepath.Join(stateRoot, "babel-rs-state.toml"),
+		Protocol: BabelDynamicProtocol, DeviceOnly: true, ManageRules: false,
+		ImportPrefixes: ordinary,
+		Views:          []BabelView{{TableID: desired.FabricTableID, ReturnPrefixes: ordinary}},
 	}
-	// Runtime adds committed automatic interfaces; configured static selectors
-	// retain their configuration-based startup admission.
 	plan.Origins = append(plan.Origins, BabelOrigin{Destination: netip.PrefixFrom(desired.LoopbackV6, 128)})
-	for _, announcement := range nodeSpec.Fabric.Announcements {
-		prefix, _ := netip.ParsePrefix(announcement.Prefix)
-		plan.Origins = append(plan.Origins, BabelOrigin{Destination: prefix, Metric: announcementMetric(announcement)})
-	}
-	domainNames := make([]string, 0, len(nodeSpec.Domains))
-	for name := range nodeSpec.Domains {
-		domainNames = append(domainNames, name)
-	}
-	sort.Strings(domainNames)
-	for _, name := range domainNames {
+	for _, name := range names {
 		domain := nodeSpec.Domains[name]
-		canonical := canonicalSources(domain.SourcePrefixes)
-		for _, source := range canonical {
-			plan.Views = append(plan.Views, BabelView{TableID: domain.TableID, Source: source, RulePriority: domain.TableID})
-			for _, announcement := range domain.Announcements {
-				destination, _ := netip.ParsePrefix(announcement.Prefix)
-				if destination.Addr().Is4() == source.Addr().Is4() {
-					plan.Origins = append(plan.Origins, BabelOrigin{Destination: destination, Source: source, Metric: announcementMetric(announcement)})
+		allowed := append([]netip.Prefix(nil), nodeSpec.Fabric.InfrastructurePrefixes()...)
+		allowed = append(allowed, sourcePrefixes(domain)...)
+		for _, canonical := range canonicalSources(domain.SourcePrefixes) {
+			plan.ImportSources = append(plan.ImportSources, canonical)
+			var family []netip.Prefix
+			for _, prefix := range allowed {
+				if prefix.Addr().Is4() == canonical.Addr().Is4() {
+					family = append(family, prefix)
 				}
+			}
+			plan.Views = append(plan.Views, BabelView{TableID: domain.SourceTableID, Source: canonical, RulePriority: DomainRulePriority, ReturnPrefixes: family})
+			for _, announcement := range domain.Announcements {
+				prefix := netip.MustParsePrefix(announcement.Prefix)
+				if !domain.IsAccessPrefix(prefix) && prefix.Addr().Is4() == canonical.Addr().Is4() {
+					plan.Origins = append(plan.Origins, BabelOrigin{Destination: prefix, Source: canonical, Metric: announcementMetric(announcement)})
+				}
+			}
+		}
+		for _, announcement := range domain.Announcements {
+			prefix := netip.MustParsePrefix(announcement.Prefix)
+			if domain.IsAccessPrefix(prefix) {
+				plan.Origins = append(plan.Origins, BabelOrigin{Destination: prefix, Metric: announcementMetric(announcement)})
 			}
 		}
 	}
@@ -339,16 +376,6 @@ func canonicalSources(raw []string) []netip.Prefix {
 	return result
 }
 
-func hasAddressFamily(raw []string, ipv4 bool) bool {
-	for _, value := range raw {
-		prefix, _ := netip.ParsePrefix(value)
-		if prefix.Addr().Is4() == ipv4 {
-			return true
-		}
-	}
-	return false
-}
-
 func announcementMetric(value spec.Announcement) uint16 {
 	if value.Metric == nil {
 		return 0
@@ -356,7 +383,7 @@ func announcementMetric(value spec.Announcement) uint16 {
 	return uint16(*value.Metric)
 }
 
-func compilePeerRoutes(routes spec.Routes, tableID int, links map[string]LinkPlan, addRoute func(RoutePlan), addDestinationRule func(int, netip.Prefix)) error {
+func compilePeerRoutes(routes spec.Routes, tableID int, links map[string]LinkPlan, addRoute func(RoutePlan)) error {
 	peerNames := make([]string, 0, len(routes))
 	for name := range routes {
 		peerNames = append(peerNames, name)
@@ -378,9 +405,6 @@ func compilePeerRoutes(routes spec.Routes, tableID int, links map[string]LinkPla
 				metric = &value
 			}
 			addRoute(RoutePlan{TableID: tableID, Prefix: prefix, Type: RouteViaPeer, PeerName: peerName, InterfaceName: link.InterfaceName, Metric: metric})
-			if addDestinationRule != nil {
-				addDestinationRule(tableID, prefix)
-			}
 		}
 	}
 	return nil

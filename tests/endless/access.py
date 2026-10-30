@@ -3,7 +3,7 @@ import ipaddress
 import json
 import subprocess as sp
 
-from model import NotConverged, parse_wg, prefix as loopback_prefix
+from model import NotConverged, is_retained_fallback, parse_wg, prefix as loopback_prefix
 from underlay import families
 
 
@@ -24,10 +24,9 @@ def service_prefix(node, family):
 
 
 def configure(spec, node, size):
-    spec['fabric']['announcements'] = [source_prefix(node, f) for f in (4, 6)]
-    spec['domains'] = {'access': {'table_id': 20001,
+    spec['domains'] = {'access': {'source_table_id': 20001,
         'source_prefixes': [source_prefix(n, f) for f in (4, 6) for n in range(size)],
-        'announcements': [service_prefix(node, f) for f in (4, 6)]}}
+        'announcements': [source_prefix(node,f) for f in (4,6)] + [service_prefix(node, f) for f in (4, 6)]}}
 
 
 def has_return_rule(rules, prefix):
@@ -45,11 +44,24 @@ def has_return_rule(rules, prefix):
     return False
 
 
-def check_routes(routes, expected, label):
-    actual = {str(ipaddress.ip_network(route['dst'], strict=False))
-              for route in routes if route.get('type', 'unicast') == 'unicast'}
-    if actual != set(expected):
-        raise NotConverged(f'{label}: Access routes differ: {actual} != {set(expected)}')
+def check_routes(routes, expected, label, retained=None):
+    retained, expected, actual = retained or {}, set(expected), {}
+    for route in routes:
+        if route.get('type', 'unicast') != 'unicast':
+            continue
+        key = str(ipaddress.ip_network(route['dst'], strict=False))
+        if route.get('dev') in retained:
+            if not is_retained_fallback(route, retained):
+                raise NotConverged(f'{label}: invalid route on retained Link: {route}')
+            if key not in expected:
+                continue  # A departed neighbor may keep its exact fallback.
+        actual.setdefault(key, []).append(route)
+    if set(actual) != expected:
+        raise NotConverged(f'{label}: Access routes differ: {set(actual)} != {expected}')
+    for key, options in actual.items():
+        best = min(route.get('metric', 0) for route in options)
+        if any(route.get('dev') in retained for route in options if route.get('metric', 0) == best):
+            raise NotConverged(f'{label}: retained dead fallback is best path to {key}')
 
 
 class Access:
@@ -131,11 +143,6 @@ class Access:
             access_routes = [x for x in fabric if x.get('dst') in known]
             reachable = r.topology.components()[node] - {node}
             check_routes(access_routes, [source_prefix(n, f) for n in reachable], f'node {node}/v{f} return')
-            # Domain views also import ordinary Fabric reachability.
-            domain_expected = [prefix(n, f) for n in reachable for prefix in (source_prefix, service_prefix)]
-            if f == 6:
-                domain_expected += [loopback_prefix(n) for n in reachable]
-            check_routes(domain, domain_expected, f'node {node}/v{f} domain')
             data['families'][f] = {'rules': rules, 'fabric': access_routes, 'domain': domain}
         # Both underlay families must stay outside the Domain selectors.
         for family in families(r.args.underlay):
@@ -146,6 +153,19 @@ class Access:
         obs['access'] = data
         known6 = {source_prefix(n, 6) for n in range(r.topology.size)}
         obs['fib'] = [x for x in obs['fib'] if x.get('dst') not in known6]
+
+    def audit(self, observations):
+        # Run after model.audit validates retained WG identity, commitment and
+        # kernel incarnation. Domain views mirror the same neighbor fallbacks.
+        components = self.r.topology.components()
+        for node, obs in observations.items():
+            reachable = components[node] - {node}
+            for f in (4, 6):
+                expected = [prefix(n, f) for n in reachable for prefix in (source_prefix, service_prefix)]
+                if f == 6:
+                    expected += [loopback_prefix(n) for n in reachable]
+                check_routes(obs['access']['families'][f]['domain'], expected,
+                             f'node {node}/v{f} domain', obs['retained_peers'])
 
     def probe(self, source, target):
         r = self.r

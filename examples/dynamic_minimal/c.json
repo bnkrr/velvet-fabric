@@ -1,5 +1,5 @@
 {
-  "api_version": "velvet.io/v1alpha1",
+  "api_version": "velvet.io/v1alpha2",
   "kind": "NodeSpec",
   "fabric": {
     "psk": "<FABRIC_PSK>",
@@ -20,19 +20,19 @@
       "endpoints": [
         "192.0.2.2:51003"
       ],
-      "listen_port": 51004,
-      "interface_name": "vl-c-b"
+      "interface_name": "vl-c-b",
+      "listen_ports": 51004
     }
   ],
   "domains": {
     "internet": {
-      "table_id": 20001,
       "source_prefixes": [
         "10.100.20.0/24"
       ],
       "announcements": [
         "0.0.0.0/0"
-      ]
+      ],
+      "source_table_id": 20001
     }
   },
   "babel": {

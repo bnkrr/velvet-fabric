@@ -1,6 +1,8 @@
 package spec
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -16,27 +18,55 @@ type PortChoice struct {
 	Range PortRange
 }
 
-func ValidatePorts(port *int, span *PortRange) error {
-	if port != nil && span != nil {
-		return errors.New("listen_port and port_range are mutually exclusive")
+// ListenPorts accepts a single port (0 means system allocated) or an inclusive
+// two-element range. Static and automatic Links each have their own choice.
+type ListenPorts PortChoice
+
+func (p *ListenPorts) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	var choice ListenPorts
+	if len(data) > 0 && data[0] == '[' {
+		var ports []int
+		if err := json.Unmarshal(data, &ports); err != nil || len(ports) != 2 {
+			return errors.New("listen_ports must be an integer or exactly two integers [first,last]")
+		}
+		choice.Range = PortRange{First: ports[0], Last: ports[1]}
+		if ports[0] < 1 || ports[1] > 65535 || ports[0] > ports[1] {
+			return errors.New("listen_ports range requires 1 <= first <= last <= 65535")
+		}
+	} else if err := json.Unmarshal(data, &choice.Port); err != nil {
+		return errors.New("listen_ports must be an integer or exactly two integers [first,last]")
 	}
-	if port != nil && (*port < 0 || *port > 65535) {
-		return errors.New("listen_port must be between 0 and 65535")
+	if err := choice.Validate(); err != nil {
+		return err
 	}
-	if span != nil && (span.First < 1 || span.Last > 65535 || span.First > span.Last) {
-		return errors.New("port_range requires 1 <= first <= last <= 65535")
-	}
+	*p = choice
 	return nil
 }
 
-func ChoosePorts(port *int, span *PortRange) PortChoice {
-	if port != nil {
-		return PortChoice{Port: *port}
+func (p ListenPorts) MarshalJSON() ([]byte, error) {
+	if p.Range != (PortRange{}) {
+		return json.Marshal([2]int{p.Range.First, p.Range.Last})
 	}
-	if span != nil {
-		return PortChoice{Range: *span}
+	return json.Marshal(p.Port)
+}
+
+func (p *ListenPorts) Choice() PortChoice {
+	if p == nil {
+		return PortChoice{}
 	}
-	return PortChoice{}
+	return PortChoice(*p)
+}
+
+func (p *ListenPorts) Validate() error {
+	choice := p.Choice()
+	if choice.Port < 0 || choice.Port > 65535 {
+		return errors.New("listen_ports must be between 0 and 65535")
+	}
+	if choice.Range != (PortRange{}) && (choice.Port != 0 || choice.Range.First < 1 || choice.Range.Last > 65535 || choice.Range.First > choice.Range.Last) {
+		return errors.New("listen_ports range requires 1 <= first <= last <= 65535")
+	}
+	return nil
 }
 
 func (p PortChoice) validateVFPPort(vfpPort int) error {
@@ -47,10 +77,14 @@ func (p PortChoice) validateVFPPort(vfpPort int) error {
 }
 
 func (s *NodeSpec) PeerPorts(peer Peer) PortChoice {
-	if peer.ListenPort != nil || peer.PortRange != nil {
-		return ChoosePorts(peer.ListenPort, peer.PortRange)
+	return peer.ListenPorts.Choice()
+}
+
+func (s *NodeSpec) DynamicPorts() PortChoice {
+	if s.DynamicLinks == nil {
+		return PortChoice{}
 	}
-	return ChoosePorts(s.Node.ListenPort, s.Node.PortRange)
+	return s.DynamicLinks.ListenPorts.Choice()
 }
 
 type DurableSpec struct {

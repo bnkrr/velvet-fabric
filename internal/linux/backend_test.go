@@ -165,6 +165,28 @@ func TestRoutesMatchOwnershipAndShape(t *testing.T) {
 	}
 }
 
+func TestAdjacentInfrastructureIsAvailableAtSourceTableEntry(t *testing.T) {
+	state := &reconcile.DesiredState{FabricTableID: 20000, LoopbackV6: netip.MustParseAddr("fd78::1"), Rules: []reconcile.RulePlan{
+		{TableID: 100, Source: netip.MustParsePrefix("10.100.1.0/24")},
+		{TableID: 100, Source: netip.MustParsePrefix("10.100.2.0/24")},
+	}}
+	routes := materializedLinkRoutes(state, 7, []netip.Prefix{netip.MustParsePrefix("10.240.0.0/30")}, []netip.Addr{netip.MustParseAddr("fd78::2")})
+	if len(routes) != 4 {
+		t.Fatalf("adjacent routes not shared exactly once: %#v", routes)
+	}
+	for _, table := range []int{100, 20000} {
+		count := 0
+		for _, route := range routes {
+			if route.Table == table {
+				count++
+			}
+		}
+		if count != 2 {
+			t.Fatalf("table %d: expected both subnet and neighbor fallback", table)
+		}
+	}
+}
+
 func TestRulesMatchIncludesOwnershipAndSelectors(t *testing.T) {
 	source := &net.IPNet{IP: net.ParseIP("10.100.1.0"), Mask: net.CIDRMask(24, 32)}
 	base := netlink.NewRule()

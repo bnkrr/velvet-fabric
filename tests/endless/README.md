@@ -65,9 +65,9 @@ keys/interface per member, recreated with that member during churn. Both IPv4
 and IPv6 clients traverse the real WG Access tunnel to remote node services;
 services also initiate probes back to clients. Velvet owns only the Domain and
 Fabric routing policies: the fixture adds no return selector or NAT workaround.
-Client prefixes are ordinary Fabric announcements; service prefixes are Domain
-announcements. The verifier checks managed destination selectors, live route
-sets, real return-table selection, WG identities/AllowedIPs and handshakes,
+Client and service prefixes are Domain announcements; managed return selectors
+also export client reachability to the Fabric table. The verifier checks managed
+destination selectors, live route sets, real return-table selection, WG identities/AllowedIPs and handshakes,
 exclusion of Access from Babel, and ordinary host routing isolation. Each
 verified member pair must also pass both Access directions in both families;
 `access_probes` counts successful Access pings. Client namespaces are included
@@ -286,6 +286,9 @@ The independent model requires:
   Removed destinations must leave no learned unicast route behind. An exact
   protocol-202 neighbor fallback may remain on a previously materialized Link;
   it must never win selection for a reachable destination over a live path.
+  The same rule applies to the Domain table used by WG Access: only the exact
+  neighbor prefix, protocol, metric and validated retained interface qualify;
+  stale learned routes and fallback ties with live routes still fail.
 - Remote overlay routes never leak into `main`; the local connected loopback and
   ordinary NAT-client underlay default route are allowed.
 - Real IPv6 loopback pings rotate over ordered reachable pairs; every pair must

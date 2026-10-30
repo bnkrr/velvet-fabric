@@ -114,20 +114,18 @@ const VelvetConfig = (() => {
     const key = await keyPair();
     const fabric = {psk: shared?.psk || randomKey(), loopback_prefix_v6: shared?.loopback_prefix_v6 || 'fd78:abcd::/48'};
     for (const k of ['link_prefix_v4', 'link_prefix_v6', 'vfp_port']) if (shared && own(shared, k)) fabric[k] = shared[k];
-    return {api_version: 'velvet.io/v1alpha1', kind: 'NodeSpec', fabric,
+    return {api_version: 'velvet.io/v1alpha2', kind: 'NodeSpec', fabric,
       node: {uid: {name, uuid: uuid()}, private_key: key.privateKey}, peers: []};
   }
-  function effectivePorts(spec, peer) {
-    return own(peer, 'listen_port') || own(peer, 'port_range') ? peer : (spec.node || {});
-  }
+  function effectivePorts(spec, peer) { return peer.listen_ports ?? 0; }
   async function connect(a, b, aPort, bPort, aEndpoint = '', bEndpoint = '') {
     const [ap, bp] = await Promise.all([publicKey(a.node.private_key), publicKey(b.node.private_key)]);
     const alias = (s, fallback) => s.node.uid?.name || fallback;
     const an = alias(a, 'nodea'), bn = alias(b, 'nodeb');
     if (a === b || ap === bp) throw Error('请选择两个不同身份的节点');
     if (a.peers.some(p => p.name === bn) || b.peers.some(p => p.name === an)) throw Error('Peer 名称已存在，请在现有 Peer 中编辑或使用不同别名');
-    a.peers.push({name: bn, public_key: bp, endpoints: bEndpoint ? [bEndpoint] : [], listen_port: aPort});
-    b.peers.push({name: an, public_key: ap, endpoints: aEndpoint ? [aEndpoint] : [], listen_port: bPort});
+    a.peers.push({name: bn, public_key: bp, endpoints: bEndpoint ? [bEndpoint] : [], listen_ports: aPort});
+    b.peers.push({name: an, public_key: ap, endpoints: aEndpoint ? [aEndpoint] : [], listen_ports: bPort});
   }
   async function examples(dynamic) {
     const psk = randomKey();
@@ -135,38 +133,39 @@ const VelvetConfig = (() => {
     nodes.forEach((s, i) => {
       s.fabric.routing_table_id = 20000;
       s.node.loopback_address_v6 = `fd78:abcd::${i + 1}`;
-      s.domains = {internet: {table_id: 20001, source_prefixes: ['10.100.20.0/24']}};
+      s.domains = {internet: {source_table_id: 20001, source_prefixes: ['10.100.20.0/24']}};
       if (dynamic) s.babel = {enabled: true, executable: '/usr/local/bin/babel-rs'};
     });
     await connect(nodes[0], nodes[1], 51001, 51002, '192.0.2.1:51001', '192.0.2.2:51002');
     await connect(nodes[1], nodes[2], 51003, 51004, '192.0.2.2:51003', '192.0.2.3:51004');
     nodes.forEach(s => s.peers.forEach(p => p.interface_name = `vl-${s.node.uid.name}-${p.name}`));
-    nodes[0].fabric.announcements = ['10.100.20.0/24'];
+    nodes[0].domains.internet.announcements = ['10.100.20.0/24'];
     nodes[2].domains.internet.announcements = ['0.0.0.0/0'];
     if (!dynamic) {
-      nodes[0].fabric.routes = {b: ['fd78:abcd::3/128']};
-      nodes[1].fabric.routes = {a: ['10.100.20.0/24']};
-      nodes[2].fabric.routes = {b: ['10.100.20.0/24', 'fd78:abcd::1/128']};
-      nodes[0].domains.internet.routes = {b: ['0.0.0.0/0']};
-      nodes[1].domains.internet.routes = {c: ['0.0.0.0/0']};
+      nodes[0].fabric.static_routes = {b: ['fd78:abcd::3/128']};
+      nodes[1].domains.internet.static_routes = {a: ['10.100.20.0/24']};
+      nodes[2].fabric.static_routes = {b: ['fd78:abcd::1/128']};
+      nodes[2].domains.internet.static_routes = {b: ['10.100.20.0/24']};
+      nodes[0].domains.internet.static_routes = {b: ['0.0.0.0/0']};
+      nodes[1].domains.internet.static_routes.c = ['0.0.0.0/0'];
     }
     return nodes;
   }
   // Shape validation is also used before importing data into the form.
   const T = {string: 'string', number: 'number', bool: 'boolean'};
-  const range = {first: T.number, last: T.number};
+  const listenPorts = {$ports: true};
   const route = {$entry: true};
   const routes = {$map: [route]};
-  const domain = {table_id: T.number, source_prefixes: [T.string], routes, announcements: [route]};
+  const domain = {source_table_id: T.number, source_prefixes: [T.string], static_routes: routes, announcements: [route]};
   const schema = {
     api_version: T.string, kind: T.string,
     fabric: {psk: T.string, loopback_prefix_v6: T.string, link_prefix_v4: T.string, link_prefix_v6: T.string,
-      vfp_port: T.number, routing_table_id: T.number, routes, announcements: [route]},
-    node: {uid: {name: T.string, uuid: T.string}, private_key: T.string, loopback_address_v6: T.string, listen_port: T.number, port_range: range},
-    peers: [{name: T.string, public_key: T.string, endpoints: [T.string], listen_port: T.number, port_range: range,
+      vfp_port: T.number, routing_table_id: T.number, static_routes: routes},
+    node: {uid: {name: T.string, uuid: T.string}, private_key: T.string, loopback_address_v6: T.string},
+    peers: [{name: T.string, public_key: T.string, endpoints: [T.string], listen_ports: listenPorts,
       link_addresses: [T.string], persistent_keepalive_seconds: T.number, interface_name: T.string}],
     babel: {enabled: T.bool, executable: T.string},
-    dynamic_links: {mode: T.string, recovery_timeout_seconds: T.number, allow_candidate_prefixes: [T.string], durable: {soft_limit: T.number, stable_seconds: T.number}},
+    dynamic_links: {listen_ports: listenPorts, mode: T.string, recovery_timeout_seconds: T.number, allow_candidate_prefixes: [T.string], durable: {soft_limit: T.number, stable_seconds: T.number}},
     domains: {$map: domain}
   };
   function shape(value, rule = schema, path = '', errors = []) {
@@ -175,6 +174,8 @@ const VelvetConfig = (() => {
     } else if (Array.isArray(rule)) {
       if (!Array.isArray(value)) errors.push(`${path}: 应为数组`);
       else value.forEach((v, i) => shape(v, rule[0], `${path}[${i}]`, errors));
+    } else if (rule.$ports) {
+      if (!(Number.isSafeInteger(value) || Array.isArray(value) && value.length === 2 && value.every(Number.isSafeInteger))) errors.push(`${path}: 应为整数或两个整数的闭区间 [first,last]`);
     } else if (rule.$entry && typeof value === 'string') {
       // Scalar route/announcement shorthand.
     } else if (!value || typeof value !== 'object' || Array.isArray(value)) errors.push(`${path || 'NodeSpec'}: 应为对象`);
@@ -256,16 +257,17 @@ const VelvetConfig = (() => {
         return q;
       };
       const table = (v, p) => { number(v, p, 1, 4294967295, true); if ([253,254,255].includes(v)) error(p, '不能使用 Linux 保留表 253/254/255'); };
-      const ports = (o, p) => {
-        number(o.listen_port, p + '.listen_port', 0, 65535);
-        if (o.port_range !== undefined) {
-          if (o.listen_port !== undefined) error(p, 'listen_port 与 port_range 不能同时配置');
-          number(o.port_range.first, p + '.port_range.first', 1, 65535, true);
-          number(o.port_range.last, p + '.port_range.last', 1, 65535, true);
-          if (o.port_range.first > o.port_range.last) error(p + '.port_range', '起始端口不能大于结束端口');
-        }
+      const ports = (o,p) => {
+        const v=o.listen_ports;
+        if (v === undefined) return;
+        if (Array.isArray(v)) {
+          if (v.length!==2) { error(p+'.listen_ports','需要两个整数 [first,last]'); return; }
+          number(v[0],p+'.listen_ports[0]',1,65535,true); number(v[1],p+'.listen_ports[1]',1,65535,true);
+          if(v[0]>v[1]) error(p+'.listen_ports','起始端口不能大于结束端口');
+          if(v[0]===v[1] && v[0]===(s.fabric?.vfp_port ?? 58420)) error(p+'.listen_ports','不能占用 fabric.vfp_port');
+        } else { number(v,p+'.listen_ports',0,65535,true); if(v===(s.fabric?.vfp_port ?? 58420)) error(p+'.listen_ports','不能占用 fabric.vfp_port'); }
       };
-      if (s.api_version !== 'velvet.io/v1alpha1') error('api_version', '必须为 velvet.io/v1alpha1');
+      if (s.api_version !== 'velvet.io/v1alpha2') error('api_version', '必须为 velvet.io/v1alpha2');
       if (s.kind !== 'NodeSpec') error('kind', '必须为 NodeSpec');
       const f = s.fabric || {}, node = s.node || {}, uid = node.uid || {}, peers = s.peers || [];
       key(f.psk, 'fabric.psk'); key(node.private_key, 'node.private_key');
@@ -296,7 +298,7 @@ const VelvetConfig = (() => {
           loopbacks.set(k, n);
         }
       }
-      ports(node, 'node');
+      ports(s.dynamic_links || {}, 'dynamic_links');
       const names = new Set(), interfaces = new Set(), usedPorts = new Set();
       if (!peers.length) error('peers', '当前 NodeSpec 至少需要一个静态 Peer');
       for (let i = 0; i < peers.length; i++) {
@@ -313,9 +315,9 @@ const VelvetConfig = (() => {
           if (/^(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|\[2001:db8:)/i.test(endpoint)) warn(path + '.endpoints', '这是文档示例地址；部署前换为真实可达端点');
         }
         ports(p, path); const choice = effectivePorts(s, p);
-        if (choice.listen_port > 0) {
-          if (usedPorts.has(choice.listen_port)) error(path + '.listen_port', '有效固定端口与另一 Peer 冲突（含继承的节点默认值）');
-          usedPorts.add(choice.listen_port);
+        if (Number.isInteger(choice) && choice > 0) {
+          if (usedPorts.has(choice)) error(path + '.listen_ports', '固定端口与另一 Peer 冲突');
+          usedPorts.add(choice);
         }
         number(p.persistent_keepalive_seconds, path + '.persistent_keepalive_seconds', 0, 65535);
         let name = p.interface_name;
@@ -346,12 +348,14 @@ const VelvetConfig = (() => {
           if (typeof v === 'object') number(v.metric, p + '.metric', 0, 65534);
           return q;
         };
-        for (const [peer, entries] of Object.entries(o.routes || {})) {
-          const p = `${path}.routes.${peer}`;
+        for (const [peer, entries] of Object.entries(o.static_routes || {})) {
+          const p = `${path}.static_routes.${peer}`;
           if (!names.has(peer)) error(p, '下一跳必须引用本节点的静态 Peer 别名');
           if (!entries.length) error(p, '路由组不能为空');
           entries.forEach((v, i) => {
             const q = entry(v, `${p}[${i}]`); if (!q) return;
+            if(path==='fabric' && ![pool,...Object.values(pools)].some(x => contains(x,q))) error(p,'Fabric 静态路由只能位于基础设施地址池内');
+            if(sources && !sources.some(x=>x?.size===q.size)) error(p,'Domain 必须有同地址族的 source_prefix');
             if (seen.has(q.id)) error(p, '同一路由视图中的目的前缀重复'); seen.add(q.id);
           });
         }
@@ -359,7 +363,6 @@ const VelvetConfig = (() => {
         (o.announcements || []).forEach((v, i) => {
           const p = `${path}.announcements[${i}]`, q = entry(v, p); if (!q) return;
           if (seen.has(q.id)) error(p, '与同一视图中的静态路由冲突');
-          if (path === 'fabric' && s.babel?.enabled && q.bits === 128 && contains(pool, q) && typeof v === 'object' && v.metric !== undefined && v.metric % 96 !== 0) error(p + '.metric', 'Fabric loopback 主机声明的 metric 必须是 96 的倍数');
           if (announced.has(q.id)) error(p, '声明前缀重复'); announced.add(q.id);
           if (sources && !sources.some(x => x?.size === q.size)) error(p, 'Domain 必须有同地址族的 source_prefix');
         });
@@ -369,12 +372,13 @@ const VelvetConfig = (() => {
       for (const [name, d] of Object.entries(s.domains || {})) {
         const path = `domains.${name}`;
         if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) error(path, 'Domain 名称格式无效');
-        table(d.table_id, path + '.table_id');
-        if (d.table_id <= ft || tables.has(d.table_id)) error(path + '.table_id', '必须大于 Fabric 表 ID，且在本节点内唯一'); tables.add(d.table_id);
+        table(d.source_table_id, path + '.source_table_id');
+        if (tables.has(d.source_table_id)) error(path + '.source_table_id', '必须与 Fabric 表及其他 Domain 表不同'); tables.add(d.source_table_id);
         if (!d.source_prefixes?.length) error(path + '.source_prefixes', '至少填写一个源前缀');
         const sources = (d.source_prefixes || []).map(raw => {
           const q = cidr(raw, path + '.source_prefixes');
           if (q && allSources.some(x => overlaps(q, x))) error(path + '.source_prefixes', '源前缀与本节点已配置前缀重叠（包括同一 Domain）');
+          if(q && (q.bits===0 || [pool,...Object.values(pools)].some(x=>overlaps(q,x)))) error(path+'.source_prefixes','不能为 /0 或与基础设施地址池重叠');
           if (q) allSources.push(q); return q;
         });
         routing(d, path, sources);
@@ -415,7 +419,7 @@ const VelvetConfig = (() => {
         if (!back.length) add(n, path, `${label(remote, r)} 缺少指向本节点的静态 Peer`, true);
         if (back.length === 1) {
           if (!p.endpoints?.length && !back[0].endpoints?.length) add(n, path + '.endpoints', '双方都未配置端点，静态 Link 没有初始发起者', true);
-          const port = effectivePorts(remote, back[0]).listen_port;
+          const choice = effectivePorts(remote, back[0]); const port = Number.isInteger(choice) ? choice : 0;
           if (p.endpoints?.length && !port) add(n, path + '.endpoints', '对端为系统/范围分配端口，请确认填写的端点有固定的外部映射', true);
         }
         if (!!s.babel?.enabled !== !!remote.babel?.enabled) add(n, 'babel.enabled', `相邻节点 ${label(remote, r)} 的 Babel 开关不同，无法在此 Link 交换 Babel 路由`, true);
@@ -499,21 +503,21 @@ if (typeof document !== 'undefined') (() => {
     return input(label, o[key], value => { if (value === undefined) delete o[key]; else o[key] = value; }, opt);
   }
   function removeEmpty(o, key) { if (!o[key]?.length) delete o[key]; }
-  function portFields(o, path, peer = false) {
-    const mode = o.port_range !== undefined ? 'range' : o.listen_port === undefined ? '' : o.listen_port === 0 ? 'system' : 'fixed';
-    let html = input('UDP 端口模式', mode, value => {
-      delete o.listen_port; delete o.port_range;
-      if (value === 'range') o.port_range = {first: 40000, last: 49999};
-      if (value === 'fixed') o.listen_port = 51001;
-      if (value === 'system') o.listen_port = 0;
+  function portFields(o,path) {
+    const v=o.listen_ports, mode=Array.isArray(v)?'range':v===undefined?'':v===0?'system':'fixed';
+    let html=input('UDP 端口模式',mode,value=>{
+      delete o.listen_ports;
+      if(value==='range') o.listen_ports=[40000,49999];
+      if(value==='fixed') o.listen_ports=51001;
+      if(value==='system') o.listen_ports=0;
       render();
-    }, {path, choices: [['',peer ? '未设置：继承节点默认' : '未设置：系统分配'], ['system','显式 0：系统分配'], ['fixed','固定端口'], ['range','端口范围']]});
-    if (mode === 'fixed') html += field(o, 'listen_port', '监听端口', {type:'number',required:true,path:path+'.listen_port'});
-    if (mode === 'range') html += field(o.port_range,'first','起始端口',{type:'number',required:true,path:path+'.port_range.first'}) + field(o.port_range,'last','结束端口（含）',{type:'number',required:true,path:path+'.port_range.last'});
+    },{path,choices:[['','系统分配'],['system','系统分配（显式配置）'],['fixed','固定端口'],['range','端口范围']]});
+    if(mode==='fixed') html+=field(o,'listen_ports','监听端口',{type:'number',required:true,path:path+'.listen_ports'});
+    if(mode==='range') for(const [i,label] of [[0,'起始端口'],[1,'结束端口（含）']]) html+=input(label,o.listen_ports[i],v=>o.listen_ports[i]=v,{type:'number',required:true,path:path+'.listen_ports['+i+']'});
     return html;
   }
   function routeEditor(owner, path, announcements = false) {
-    const key = announcements ? 'announcements' : 'routes';
+    const key = announcements ? 'announcements' : 'static_routes';
     let html = '';
     const groups = announcements ? [['', owner[key] || []]] : Object.entries(owner[key] || {});
     for (const [peer, entries] of groups) entries.forEach((entry, i) => {
@@ -525,18 +529,18 @@ if (typeof document !== 'undefined') (() => {
         const names = [...new Set([peer,...current().peers.map(x => x.name)])];
         html += input('下一跳 Peer', peer, value => {
           if (value === peer) return;
-          if (!Object.hasOwn(owner.routes,value)) owner.routes[value]=[];
-          owner.routes[value].push(entries.splice(i,1)[0]);
-          if (!entries.length) delete owner.routes[peer]; render();
+          if (!Object.hasOwn(owner.static_routes,value)) owner.static_routes[value]=[];
+          owner.static_routes[value].push(entries.splice(i,1)[0]);
+          if (!entries.length) delete owner.static_routes[peer]; render();
         }, {required:true,path:p,choices:names.map(x => [x,x || '请选择 Peer'])});
       }
       html += input('目的网络前缀', get().prefix, v => set('prefix',v ?? ''), {required:true,path:p+'.prefix',placeholder:'10.100.20.0/24'});
       html += input(announcements ? 'Babel origin metric（可选）' : '静态 metric（可选）', get().metric, v => set('metric',v), {type:'number',path:p+'.metric',placeholder:announcements ? '默认 0' : '省略：由内核选择'});
-      html += '</div>' + action('删除此项', () => { entries.splice(i,1); if (announcements) removeEmpty(owner,key); else if (!entries.length) delete owner.routes[peer]; render(); }, 'danger') + '</div>';
+      html += '</div>' + action('删除此项', () => { entries.splice(i,1); if (announcements) removeEmpty(owner,key); else if (!entries.length) delete owner.static_routes[peer]; render(); }, 'danger') + '</div>';
     });
     html += action(announcements ? '添加本地声明' : '添加静态路由', () => {
       if (announcements) { owner.announcements ??= []; owner.announcements.push(''); }
-      else { owner.routes ??= {}; const p = current().peers[0]?.name || ''; if (!Object.hasOwn(owner.routes,p)) owner.routes[p]=[]; owner.routes[p].push(''); }
+      else { owner.static_routes ??= {}; const p = current().peers[0]?.name || ''; if (!Object.hasOwn(owner.static_routes,p)) owner.static_routes[p]=[]; owner.static_routes[p].push(''); }
       render();
     });
     return html;
@@ -551,7 +555,7 @@ if (typeof document !== 'undefined') (() => {
     let h = `<section><div class="row"><h2>节点 ${esc(C.label(s,state.selected))}</h2>${action('删除节点', () => {
       if (!confirm('删除当前节点？其他节点中指向它的 Peer 和路由将保留，请自行检查。')) return;
       state.nodes.splice(state.selected,1); state.selected = Math.max(0,state.selected-1); render();
-    }, 'danger')}</div><p class="hint">* 必填；留空的可选字段不写入 JSON。api_version 固定为 velvet.io/v1alpha1，kind 为 NodeSpec。</p><div class="grid">`;
+    }, 'danger')}</div><p class="hint">* 必填；留空的可选字段不写入 JSON。api_version 固定为 velvet.io/v1alpha2，kind 为 NodeSpec。</p><div class="grid">`;
     h += field(n.uid,'name','节点名',{path:'node.uid.name',placeholder:'最多 5 个小写字母/数字'});
     h += field(n.uid,'uuid','UUID（可选）',{path:'node.uid.uuid',hint:'建议生成后保持不变；省略时由首次加载生成。'});
     h += field(n,'private_key','WireGuard 私钥',{required:true,secret:true,path:'node.private_key',wide:true});
@@ -565,7 +569,7 @@ if (typeof document !== 'undefined') (() => {
       document.querySelectorAll('input[data-field]').forEach(e => { if (e.type === 'password') { e.type = 'text'; e.dataset.secret = 'yes'; } else if (e.dataset.secret) { e.type = 'password'; delete e.dataset.secret; } });
     })}</div><p class="hint">本节点公钥：<span id="public-key" class="mono">正在计算…</span></p><div class="grid">`;
     h += field(n,'loopback_address_v6','Loopback IPv6 覆盖（可选）',{path:'node.loopback_address_v6',placeholder:'省略：由 UUID 和 Fabric 参数派生'});
-    h += portFields(n,'node'); h += '</div></section>';
+    h += '</div></section>';
     h += '<section><h2>Fabric</h2><div class="grid">';
     h += field(f,'psk','共享 PSK',{required:true,secret:true,path:'fabric.psk',wide:true});
     h += field(f,'loopback_prefix_v6','Loopback IPv6 前缀',{required:true,path:'fabric.loopback_prefix_v6',placeholder:'fd78:abcd::/48'});
@@ -598,7 +602,7 @@ if (typeof document !== 'undefined') (() => {
       h += `<div class="item"><div class="row"><h3>Peer ${i+1}</h3>${action('删除 Peer', () => { s.peers.splice(i,1); render(); },'danger')}</div><div class="grid">`;
       h += input('本地 Peer 别名',p.name,v => {
         const old=p.name; p.name=v ?? '';
-        for (const o of [s.fabric,...Object.values(s.domains || {})]) if (o.routes && Object.hasOwn(o.routes,old) && !Object.hasOwn(o.routes,p.name)) { o.routes[p.name]=o.routes[old]; delete o.routes[old]; }
+        for (const o of [s.fabric,...Object.values(s.domains || {})]) if (o.static_routes && Object.hasOwn(o.static_routes,old) && !Object.hasOwn(o.static_routes,p.name)) { o.static_routes[p.name]=o.static_routes[old]; delete o.static_routes[old]; }
       },{required:true,path:path+'.name'});
       h += field(p,'public_key','对端公钥',{required:true,path:path+'.public_key'});
       h += field(p,'endpoints','对端端点（每行一个，可留空）',{type:'list',path:path+'.endpoints',wide:true,placeholder:'192.0.2.2:51002\n[2001:db8::2]:51002'});
@@ -614,14 +618,12 @@ if (typeof document !== 'undefined') (() => {
       if (v === '') delete s.babel; else s.babel={...s.babel,enabled:v==='true'}; render();
     },{path:'babel.enabled',choices:[['','未配置：仅静态路由'],['false','显式禁用 Babel'],['true','启用 Babel 动态路由']]});
     if (s.babel) h += field(s.babel,'executable','目标节点 Babel 程序路径（可选）',{path:'babel.executable',placeholder:'省略：从目标节点 PATH 查找'});
-    h += '</div><h3>Fabric 本地声明</h3><p class="hint">在实际交付 Access/LAN 前缀的节点声明，例如 10.100.20.0/24。静态模式下声明仍用于本地交付；Babel 模式下还会传播。</p>';
-    h += routeEditor(f,'fabric',true);
-    h += '<h3 style="margin-top:16px">Fabric 静态路由</h3><p class="hint">Access 回程和远端节点 loopback 的下一跳。Babel 启用时通常可以省略。</p>' + routeEditor(f,'fabric');
+    h += '</div><h3>Fabric 静态路由</h3><p class="hint">仅配置基础设施地址池内的远端 Loopback 或 Link 路径。业务出口与 Access 回程在所属 Domain 中配置。</p>'+routeEditor(f,'fabric');
     h += '</section><section><h2>Domains</h2><p class="hint">按源前缀选择业务路由。每个参与转发的节点应配置完整源集合，同一地址族的第一项是 canonical source。出口在所属 Domain 中声明目的前缀，如 0.0.0.0/0。</p>';
     for (const [name,d] of Object.entries(s.domains || {})) {
       const path='domains.'+name;
       h += `<div class="item"><div class="row"><h3>${esc(name)}</h3>${action('删除 Domain', () => { delete s.domains[name]; render(); },'danger')}</div><div class="grid">`;
-      h += field(d,'table_id','路由表 ID',{type:'number',required:true,path:path+'.table_id'});
+      h += field(d,'source_table_id','源路由表 ID',{type:'number',required:true,path:path+'.source_table_id'});
       h += field(d,'source_prefixes','源前缀（每行一个，顺序保留）',{type:'list',required:true,path:path+'.source_prefixes',wide:true});
       h += '</div><div class="toolbar">' + action('重命名', () => {
         const next=prompt('Domain 名称',name); if (!next || next===name) return;
@@ -630,16 +632,16 @@ if (typeof document !== 'undefined') (() => {
       }) + action('将源集合复制到其他节点', () => {
         for (const x of state.nodes) if (x !== s) {
           x.domains ??= {};
-          if (!Object.hasOwn(x.domains,name)) x.domains[name]={table_id:d.table_id,source_prefixes:[]};
+          if (!Object.hasOwn(x.domains,name)) x.domains[name]={source_table_id:d.source_table_id,source_prefixes:[]};
           x.domains[name].source_prefixes=C.clone(d.source_prefixes || []);
         }
         notice('已复制 Domain 源集合；目标节点现有的路由、声明和表 ID 保留。新 Domain 使用当前表 ID，请检查冲突。'); render();
-      }) + '</div><h3>本地出口声明</h3>' + routeEditor(d,path,true) + '<h3 style="margin-top:16px">静态业务路由</h3>' + routeEditor(d,path) + '</div>';
+      }) + '</div><h3>本地 Access / 出口声明</h3>' + routeEditor(d,path,true) + '<h3 style="margin-top:16px">静态出口 / 回程路由</h3>' + routeEditor(d,path) + '</div>';
     }
     h += action('添加 Domain', () => {
       s.domains ??= {}; let name='internet', i=2; while (Object.hasOwn(s.domains,name)) name='domain'+i++;
-      const used=new Set(Object.values(s.domains).map(d => d.table_id)); let table=(f.routing_table_id ?? 20000)+1; while (used.has(table) || [253,254,255].includes(table)) table++;
-      s.domains[name]={table_id:table,source_prefixes:[]}; render();
+      const used=new Set(Object.values(s.domains).map(d => d.source_table_id)); let table=(f.routing_table_id ?? 20000)+1; while (used.has(table) || [253,254,255].includes(table)) table++;
+      s.domains[name]={source_table_id:table,source_prefixes:[]}; render();
     }) + '</section>';
     h += '<section><h2>动态建链</h2><p class="hint">与 Babel 动态路由独立。通过已有 Fabric 路径协商新的 WG 直连；启用时必须填写允许的对端 Candidate IP 范围。</p><div class="grid">';
     h += input('动态建链模式',s.dynamic_links?.mode ?? '',v => {
@@ -647,6 +649,7 @@ if (typeof document !== 'undefined') (() => {
     },{path:'dynamic_links.mode',choices:[['','未配置：关闭'],['off','off：关闭'],['passive','passive：只接受'],['active','active：主动发起并接受']]});
     if (s.dynamic_links) {
       const d=s.dynamic_links;
+      h += portFields(d,'dynamic_links');
       h += field(d,'recovery_timeout_seconds','Dynamic Link 恢复超时（秒）',{type:'number',path:'dynamic_links.recovery_timeout_seconds',placeholder:'默认 1800',hint:'范围 30–604800；从最后一次确认计时，重启不会延长。'});
       h += field(d,'allow_candidate_prefixes','允许的 Candidate 前缀（每行一个）',{type:'list',required:['active','passive'].includes(d.mode),path:'dynamic_links.allow_candidate_prefixes',wide:true,hint:'例如 0.0.0.0/0、::/0 表示允许整个对应地址族；可限制为自己的网络范围。'});
       h += '</div><details><summary>Durable Link 设置（可选）</summary><p class="hint">健康动态 Link 自动协商持久化；这里配置策略，不生成运行时 agreement。</p><div class="grid">';
@@ -768,7 +771,7 @@ if (typeof document !== 'undefined') (() => {
   run(async () => {
     try { state.nodes=[await C.createNode('a')]; }
     catch {
-      state.nodes=[{api_version:'velvet.io/v1alpha1',kind:'NodeSpec',fabric:{psk:'',loopback_prefix_v6:'fd78:abcd::/48'},node:{uid:{name:'a'},private_key:''},peers:[]}];
+      state.nodes=[{api_version:'velvet.io/v1alpha2',kind:'NodeSpec',fabric:{psk:'',loopback_prefix_v6:'fd78:abcd::/48'},node:{uid:{name:'a'},private_key:''},peers:[]}];
       notice('浏览器不支持本地 X25519 密钥生成。仍可导入/填写配置；自动生成密钥请使用支持 X25519 的新版浏览器。');
     }
     render();

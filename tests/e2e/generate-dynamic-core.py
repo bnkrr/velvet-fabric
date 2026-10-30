@@ -36,7 +36,7 @@ EDGES = [
 
 DOMAINS = {
     "plan-a": {
-        "table_id": 20030,
+        "source_table_id": 20030,
         # Ordering is semantic: the first prefix per family is Babel's canonical S.
         "source_prefixes": ["10.100.30.0/24", "10.100.32.0/24",
                             "fd30:100:30::/64", "fd30:100:32::/64"],
@@ -48,7 +48,7 @@ DOMAINS = {
         },
     },
     "plan-b": {
-        "table_id": 20031,
+        "source_table_id": 20031,
         "source_prefixes": ["10.100.31.0/24"],
         "origins": {
             "eb": ["10.100.31.0/24"],
@@ -99,38 +99,32 @@ for node, metadata in NODES.items():
                 if {node, peer} == {"r3", "xc"}
                 else [f"{NODES[peer]['underlay']}:{ports[(peer, node)]}"]
             ),
-            "listen_port": ports[(node, peer)],
+            "listen_ports": ports[(node, peer)],
             "interface_name": f"vl-{node}-{peer}",
         }
         for peer in graph[node]
     ]
+    members = {"plan-a": {"ea","eb","r1","r2","xa","xb"}, "plan-b": {"eb","r1","r2","r3","xa","xb","xc"}}
     domains = {
         name: {
-            "table_id": domain["table_id"],
+            "source_table_id": domain["source_table_id"],
             "source_prefixes": domain["source_prefixes"],
             **(
                 {"announcements": [prefix for prefix in domain["origins"][node]
-                                   if prefix not in domain["source_prefixes"]]}
+                                   ]}
                 if node in domain["origins"]
                 else {}
             ),
         }
-        for name, domain in DOMAINS.items()
+        for name, domain in DOMAINS.items() if node in members[name]
     }
     value = {
-        "api_version": "velvet.io/v1alpha1",
+        "api_version": "velvet.io/v1alpha2",
         "kind": "NodeSpec",
         "fabric": {
             "psk": fabric_psk,
             "loopback_prefix_v6": "fd78:abcd::/48",
             "routing_table_id": 20000,
-            # Deliberately broad ordinary origins exercise host routing isolation.
-            "announcements": [
-                prefix
-                for domain in DOMAINS.values()
-                for prefix in domain["origins"].get(node, [])
-                if prefix in domain["source_prefixes"]
-            ] + (["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"] if node == "xc" else []),
         },
         "node": {
             "uid": {

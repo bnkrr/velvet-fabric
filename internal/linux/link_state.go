@@ -156,6 +156,27 @@ func materializedLinkRoutes(state *reconcile.DesiredState, linkIndex int, local 
 			Scope:    netlink.SCOPE_LINK, Protocol: LinkProtocol, Table: state.FabricTableID, Type: unix.RTN_UNICAST,
 		})
 	}
+	// Access can enter a source table directly through fwmark, before the
+	// shared-table destination rules. Its view needs the same adjacent
+	// infrastructure paths even when Babel is disabled.
+	tables := map[int]bool{}
+	for _, rule := range state.Rules {
+		if rule.Source.IsValid() && rule.TableID != state.FabricTableID {
+			tables[rule.TableID] = true
+		}
+	}
+	ordered := make([]int, 0, len(tables))
+	for table := range tables {
+		ordered = append(ordered, table)
+	}
+	sort.Ints(ordered)
+	shared := append([]netlink.Route(nil), result...)
+	for _, table := range ordered {
+		for _, route := range shared {
+			route.Table = table
+			result = append(result, route)
+		}
+	}
 	return result
 }
 

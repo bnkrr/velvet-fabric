@@ -291,6 +291,14 @@ def parse_wg(dump):
     return result
 
 
+def is_retained_fallback(route, retained):
+    """Match only the neighbor fallback of an independently validated Link."""
+    peer = retained.get(route.get('dev'))
+    return (peer is not None and network(route['dst']) == prefix(peer)
+            and str(route.get('protocol')) == '202' and route.get('metric') == 131008
+            and not route.get('gateway') and not route.get('multipath'))
+
+
 def audit(topology, observations):
     """Membership/underlay model is the oracle; WG/FIB/status are observations."""
     owners = {}
@@ -387,6 +395,7 @@ def audit(topology, observations):
             interfaces[name] = remote
             peers.add(remote)
         observation['retained'] = sorted(retained)
+        observation['retained_peers'] = retained
         required = topology.required(node) - set(observation.get('durable_recovery_peers', ()))
         if not required <= peers:
             raise NotConverged(f'node {node}: missing required neighbors {sorted(required - peers)}')
@@ -400,12 +409,7 @@ def audit(topology, observations):
             if route.get('type', 'unicast') != 'unicast':
                 continue
             key = network(route['dst'])
-            is_fallback = (str(route.get('protocol')) == '202' and route.get('metric') == 131008
-                           and key in known and known[key] != node
-                           and route.get('dev') in retained
-                           and retained[route['dev']] == known[key]
-                           and not route.get('gateway') and not route.get('multipath'))
-            if is_fallback:
+            if key in known and known[key] != node and is_retained_fallback(route, retained):
                 # The best path to a live destination must still beat this
                 # retained fallback; an absent destination need not lose it.
                 if known[key] in components[node]:

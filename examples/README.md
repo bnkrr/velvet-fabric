@@ -20,7 +20,7 @@ the A–B–C path, with no A–C WireGuard peer. IPv6 node loopbacks are used f
 Fabric infrastructure; these minimal examples provide IPv4 client access.
 
 All three nodes configure Domain `internet`, table `20001`, and the complete
-source set `10.100.20.0/24`. A announces that pool in `fabric.announcements`;
+source set `10.100.20.0/24`. A announces that pool in `domains.internet.announcements`;
 C announces `0.0.0.0/0` in `domains.internet.announcements`. B has no local
 announcements. Velvet generates `from 10.100.20.0/24 lookup 20001` and
 `to 10.100.20.0/24 lookup 20000` on every node. Unmatched host traffic keeps its

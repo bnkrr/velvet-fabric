@@ -85,6 +85,21 @@ jobs:
           "$PWD/.local/bin/velvetd"
           "$PWD/../babel-rs/target/release/babel-rs"
           "$PWD/.local/bin/velvetctl"
+      - name: Test restricted Domains with static routes
+        working-directory: velvet-fabric
+        run: >-
+          sudo python3 tests/e2e/netns-domains.py
+          "$PWD/.local/bin/velvetd"
+          "$PWD/../babel-rs/target/release/babel-rs"
+          "$PWD/.local/bin/velvetctl"
+          --mode static
+      - name: Test restricted Domains with Babel
+        working-directory: velvet-fabric
+        run: >-
+          sudo python3 tests/e2e/netns-domains.py
+          "$PWD/.local/bin/velvetd"
+          "$PWD/../babel-rs/target/release/babel-rs"
+          "$PWD/.local/bin/velvetctl"
       - name: Test shipped three-node examples
         working-directory: velvet-fabric
         run: >-

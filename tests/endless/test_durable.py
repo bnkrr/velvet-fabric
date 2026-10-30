@@ -169,7 +169,7 @@ class DurableTests(unittest.TestCase):
 
     def test_range_is_enforced_independently(self):
         topology, obs, checker, node, _ = fixture()
-        obs[node]['automatic_ports'] = {'port_range': {'first': 40000, 'last': 40999}}
+        obs[node]['automatic_ports'] = {'listen_ports': [40000,40999]}
         with self.assertRaisesRegex(AssertionError, 'escaped'):
             checker.observe(topology, obs)
 
@@ -257,8 +257,8 @@ class DurableTests(unittest.TestCase):
     def test_explicit_mixed_modes(self):
         runner = Runner.__new__(Runner)
         runner.args = SimpleNamespace(automatic_ports='mixed')
-        self.assertEqual(runner.automatic_ports(0), {'listen_port': 0})
-        self.assertEqual(runner.automatic_ports(1), {'port_range': {'first': 40000, 'last': 40999}})
+        self.assertEqual(runner.automatic_ports(0), {'listen_ports': 0})
+        self.assertEqual(runner.automatic_ports(1), {'listen_ports': [40000,40999]})
 
     def test_off_allows_one_policy_probe_but_rejects_loops_and_initiation(self):
         for kind in ('single-inbound', 'repeated-inbound', 'outbound'):

@@ -108,7 +108,7 @@ def exercise_durable(config, ns, ip, runtime, processes, logs, uuids, daemon, wa
     if config.get('fixed_count') == 1:
         path = runtime / 'b.json'
         spec = json.loads(path.read_text())
-        spec['node']['port_range'] = {'first': 41000, 'last': 41031}
+        spec['dynamic_links']['listen_ports'] = [41000,41031]
         path.write_text(json.dumps(spec))
         # The remap fixture originally has exactly one external port. Move the
         # mapping too, so its old conntrack entry cannot occupy the only tuple

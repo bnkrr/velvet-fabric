@@ -10,7 +10,7 @@ sudo install -d -m 0700 /etc/velvet
 sudo install -m 0644 packaging/systemd/* /etc/systemd/system/
 ```
 
-For dynamic routing, install Babel 0.7.0 separately and set `babel.executable`
+For dynamic routing, install Babel 0.8.0 separately and set `babel.executable`
 in NodeSpec to its absolute installed path. Fabric's packaged unit manages an
 independent `velvet-babel@<node-uuid>.service`; do not enable the standalone
 `babel-rs.service` in the same network namespace.
